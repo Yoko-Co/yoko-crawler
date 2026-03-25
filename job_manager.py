@@ -21,7 +21,7 @@ import structlog
 
 logger = structlog.get_logger()
 
-RESULTS_DIR = Path("/data/results")
+RESULTS_DIR = Path(os.environ.get("YOKO_CRAWL_RESULTS_DIR", "/opt/yoko-crawl/results"))
 
 # Watchdog timeout: CLOSESPIDER_TIMEOUT (7200s) + 5min buffer.
 _WATCHDOG_TIMEOUT = 7500

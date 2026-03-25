@@ -5,6 +5,7 @@ services:
     stop_grace_period: 30s
     environment:
       - YOKO_CRAWL_API_KEY=${YOKO_CRAWL_API_KEY}
+      - YOKO_CRAWL_RESULTS_DIR=/data/results
     volumes:
       - crawl-results:/data/results
     ports:

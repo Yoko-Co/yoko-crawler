@@ -36,25 +36,30 @@ GET  /health       → service status
 
 Each crawl runs as an isolated subprocess. If Scrapy crashes or hits its memory limit, the API stays up. Progress is tracked via atomic JSON status files — no shared memory, no message queues, no database.
 
-## Quick start
+## Quick start (local development)
 
 ```bash
-# Clone and configure
-git clone <repo-url> && cd yoko-crawler
-echo "YOKO_CRAWL_API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')" > .env
+# Install dependencies
+pip install -r requirements.txt
 
-# Run
-docker compose up -d --build
+# Set API key and run
+export YOKO_CRAWL_API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')
+uvicorn main:app --port 8100
 
 # Test
 curl http://localhost:8100/health
 curl -X POST http://localhost:8100/crawl \
-  -H "Authorization: Bearer $(cat .env | cut -d= -f2)" \
+  -H "Authorization: Bearer $YOKO_CRAWL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"domain": "example.com"}'
 ```
 
-For production deployment with TLS and nginx, see [docs/deployment-checklist.md](docs/deployment-checklist.md).
+## Deployment
+
+Two deployment options:
+
+- **[VPS with Caddy + systemd](docs/vps-deployment.md)** — Deploy directly on Ubuntu with Caddy for TLS. Simpler, no containerization overhead.
+- **[Docker with nginx](docs/deployment-checklist.md)** — Containerized deployment with nginx reverse proxy. More isolated, portable.
 
 ## Output format
 
@@ -98,6 +103,7 @@ All configuration is via environment variables and hardcoded defaults:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `YOKO_CRAWL_API_KEY` | Yes | Bearer token (minimum 32 characters) |
+| `YOKO_CRAWL_RESULTS_DIR` | No | Path for result files (default: `/opt/yoko-crawl/results`) |
 
 Spider settings are hardcoded in `run_spider.py` for the intended use case:
 - Max crawl duration: 2 hours

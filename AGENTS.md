@@ -13,7 +13,19 @@ Yoko Crawler — a Python/FastAPI service that runs Scrapy spiders as subprocess
 - **Domain validator** (`domain_validator.py`) — three-layer SSRF prevention (format, async DNS, Scrapy DNS cache)
 - **Auth** (`auth.py`) — Bearer token via `secrets.compare_digest`
 
-## Plans
+## Deployment
 
-- Parent plan (full system): `docs/plans/2026-03-24-feat-site-crawler-service-plan.md`
-- Python service plan: `docs/plans/2026-03-24-feat-python-crawl-service-plan.md`
+The service runs the same Python code in either environment:
+
+### VPS (primary)
+- App code: `/opt/yoko-crawl/app/`
+- Virtualenv: `/opt/yoko-crawl/venv/`
+- Result files: `/opt/yoko-crawl/results/`
+- Reverse proxy: Caddy (automatic TLS)
+- Process manager: systemd (`yoko-crawl.service`)
+- Guide: `docs/vps-deployment.md`
+
+### Docker (alternative)
+- Reverse proxy: nginx (manual TLS via certbot)
+- Result files: `/data/results` (set via `YOKO_CRAWL_RESULTS_DIR` env var)
+- Guide: `docs/deployment-checklist.md`
