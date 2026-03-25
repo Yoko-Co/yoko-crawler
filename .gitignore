@@ -1,0 +1,28 @@
+# Claude local settings
+.claude/settings.local.json
+.claude/todos.local.json
+CLAUDE.md
+
+# Plans (contain proprietary architecture details)
+docs/plans/
+
+# Environment
+.env
+.env.*
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build artifacts
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
