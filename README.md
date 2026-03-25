@@ -1,6 +1,6 @@
 # yoko-crawler
 
-A lightweight Python API service that crawls websites and returns discovered URLs as NDJSON. Built with FastAPI and Scrapy, deployed as a Docker container behind nginx.
+A lightweight Python API service that crawls websites and returns discovered URLs as NDJSON. Built with FastAPI and Scrapy.
 
 ## What it does
 
@@ -17,21 +17,21 @@ GET  /health       → service status
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│  Docker Container                            │
-│                                              │
-│  FastAPI (uvicorn, single worker)            │
-│    → Bearer token auth                       │
-│    → Domain validation + SSRF prevention     │
-│    → Job management (max 3 concurrent)       │
-│                                              │
-│  Scrapy Subprocesses (up to 3)               │
-│    → asyncio.create_subprocess_exec          │
-│    → Atomic status file IPC (every 3s)       │
-│    → NDJSON output streamed back via API     │
-│                                              │
-│  nginx (TLS, rate limiting, security headers)│
-└──────────────────────────────────────────────┘
+  Reverse proxy (Caddy or nginx)
+    → TLS termination
+    → Rate limiting
+           │
+           ▼
+  FastAPI (uvicorn, single worker)
+    → Bearer token auth
+    → Domain validation + SSRF prevention
+    → Job management (max 3 concurrent)
+           │
+           ▼
+  Scrapy Subprocesses (up to 3)
+    → asyncio.create_subprocess_exec
+    → Atomic status file IPC (every 3s)
+    → NDJSON output streamed back via API
 ```
 
 Each crawl runs as an isolated subprocess. If Scrapy crashes or hits its memory limit, the API stays up. Progress is tracked via atomic JSON status files — no shared memory, no message queues, no database.
@@ -93,8 +93,8 @@ The bundled spider (`website_spider.py`) does comprehensive URL discovery:
 
 - **Auth**: Bearer token with constant-time comparison (`secrets.compare_digest`)
 - **SSRF prevention**: Three-layer defense — domain format validation, async DNS resolution against blocked networks (RFC 1918, link-local, cloud metadata, IPv4-mapped IPv6, 6to4, Teredo), and Scrapy DNS cache pinning
-- **Docker hardening**: Non-root user, `cap_drop: ALL`, `read_only: true`, `no-new-privileges`
-- **nginx**: TLS 1.2+, HSTS, rate limiting on POST, `proxy_buffering off` for streaming
+- **Reverse proxy**: Caddy (automatic TLS) or nginx (manual TLS) for rate limiting and security headers
+- **Docker hardening** (when containerized): Non-root user, `cap_drop: ALL`, `read_only: true`, `no-new-privileges`
 
 ## Configuration
 
