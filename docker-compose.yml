@@ -1,0 +1,37 @@
+services:
+  crawl-service:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      - YOKO_CRAWL_API_KEY=${YOKO_CRAWL_API_KEY}
+    volumes:
+      - crawl-results:/data/results
+    ports:
+      - "127.0.0.1:8100:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=50M
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  crawl-results:
