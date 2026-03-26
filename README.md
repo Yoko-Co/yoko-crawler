@@ -85,6 +85,7 @@ The bundled spider (`website_spider.py`) does comprehensive URL discovery:
 - Seeds from robots.txt sitemaps, then follows all internal links
 - Records HTTP status, redirect targets, and referrers
 - Handles pagination archives (traverses without recording each page URL)
+- Skips login/auth URLs (wp-login, OAuth, SSO, SAML, etc.)
 - Issues HEAD requests for non-HTML assets (PDFs, images, etc.)
 - Normalizes URLs and strips tracking parameters (UTM, session IDs, etc.)
 - Respects autothrottle for polite crawling
