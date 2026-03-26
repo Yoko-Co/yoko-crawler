@@ -55,6 +55,11 @@ class WebsiteSpider(scrapy.Spider):
         "auth", "oauth", "oauth2", "sso", "cas", "saml", "adfs",
     }
 
+    # WordPress infrastructure endpoints (machine-only, no redirect value)
+    INFRA_PATH_SEGMENTS = {
+        "wp-json", "xmlrpc.php", "wp-cron.php", "trackback",
+    }
+
     # Query parameters commonly used for tracking, sessions, or cache busting
     UNWANTED_PARAMS = {
         # Tracking / analytics
@@ -157,6 +162,12 @@ class WebsiteSpider(scrapy.Spider):
         path = (urlparse(url).path or "").lower()
         segments = path.split("/")
         return any(seg in self.LOGIN_PATH_SEGMENTS for seg in segments)
+
+    def is_infra_url(self, url: str) -> bool:
+        """Detect WordPress infrastructure endpoints (REST API, XML-RPC, cron, trackback)."""
+        path = (urlparse(url).path or "").lower()
+        segments = path.split("/")
+        return any(seg in self.INFRA_PATH_SEGMENTS for seg in segments)
 
     # ---------- Entry points ----------
 
@@ -317,6 +328,12 @@ class WebsiteSpider(scrapy.Spider):
             self.seen.add(normalized)
             self.crawler.stats.inc_value("login_urls_skipped")
             self.logger.debug("Skipping login/auth URL: %s", normalized)
+            return
+
+        if self.is_infra_url(normalized):
+            self.seen.add(normalized)
+            self.crawler.stats.inc_value("infra_urls_skipped")
+            self.logger.debug("Skipping infrastructure URL: %s", normalized)
             return
 
         if self.is_asset_url(normalized):

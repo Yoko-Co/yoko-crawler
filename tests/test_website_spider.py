@@ -102,3 +102,59 @@ class TestIsLoginUrlFalsePositives:
 
     def test_sso_integration_article(self, spider):
         assert not spider.is_login_url("https://example.com/blog/sso-integration-tips")
+
+
+class TestIsInfraUrl:
+    """Test WordPress infrastructure URL detection."""
+
+    def test_wp_json_posts(self, spider):
+        assert spider.is_infra_url("https://example.com/wp-json/wp/v2/posts/335")
+
+    def test_wp_json_users(self, spider):
+        assert spider.is_infra_url("https://example.com/wp-json/wp/v2/users/32")
+
+    def test_wp_json_oembed(self, spider):
+        assert spider.is_infra_url("https://example.com/wp-json/oembed/1.0/embed")
+
+    def test_wp_json_root(self, spider):
+        assert spider.is_infra_url("https://example.com/wp-json/")
+
+    def test_xmlrpc(self, spider):
+        assert spider.is_infra_url("https://example.com/xmlrpc.php")
+
+    def test_wp_cron(self, spider):
+        assert spider.is_infra_url("https://example.com/wp-cron.php")
+
+    def test_trackback(self, spider):
+        assert spider.is_infra_url("https://example.com/2024/01/my-post/trackback/")
+
+    def test_trackback_root(self, spider):
+        assert spider.is_infra_url("https://example.com/trackback/")
+
+    def test_case_insensitive(self, spider):
+        assert spider.is_infra_url("https://example.com/WP-JSON/wp/v2/posts/1")
+        assert spider.is_infra_url("https://example.com/XMLRPC.PHP")
+
+
+class TestIsInfraUrlFalsePositives:
+    """Ensure legitimate pages are not incorrectly flagged as infra URLs."""
+
+    def test_wp_json_viewer_page(self, spider):
+        assert not spider.is_infra_url("https://example.com/wp-json-viewer")
+
+    def test_xmlrpc_article(self, spider):
+        assert not spider.is_infra_url("https://example.com/blog/xmlrpc-explained")
+
+    def test_trackback_policy(self, spider):
+        assert not spider.is_infra_url("https://example.com/trackback-policy")
+
+    def test_feed_not_filtered(self, spider):
+        """Feed URLs are intentionally NOT infra-filtered (handled by plugin)."""
+        assert not spider.is_infra_url("https://example.com/feed/")
+        assert not spider.is_infra_url("https://example.com/author/ben/feed/")
+        assert not spider.is_infra_url("https://example.com/comments/feed/")
+
+    def test_regular_pages(self, spider):
+        assert not spider.is_infra_url("https://example.com/")
+        assert not spider.is_infra_url("https://example.com/about")
+        assert not spider.is_infra_url("https://example.com/blog/my-post")
