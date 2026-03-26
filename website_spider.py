@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import scrapy
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from w3lib.url import canonicalize_url
@@ -43,6 +45,14 @@ class WebsiteSpider(scrapy.Spider):
         ".zip", ".rar", ".7z", ".tar", ".gz",
         ".mp3", ".wav", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".mkv",
         ".css", ".js", ".woff", ".woff2", ".ttf", ".eot",
+    }
+
+    # URL path segments that indicate login/auth pages (never yield useful content)
+    LOGIN_PATH_SEGMENTS = {
+        "wp-login.php", "wp-admin",
+        "login", "signin", "sign-in", "sign_in",
+        "logout", "signout", "sign-out", "sign_out",
+        "auth", "oauth", "oauth2", "sso", "cas", "saml", "adfs",
     }
 
     # Query parameters commonly used for tracking, sessions, or cache busting
@@ -141,6 +151,12 @@ class WebsiteSpider(scrapy.Spider):
     def is_asset_url(self, url: str) -> bool:
         path = (urlparse(url).path or "").lower()
         return any(path.endswith(ext) for ext in self.ASSET_EXTENSIONS)
+
+    def is_login_url(self, url: str) -> bool:
+        """Detect login/auth URLs by checking path segments against known patterns."""
+        path = (urlparse(url).path or "").lower()
+        segments = path.split("/")
+        return any(seg in self.LOGIN_PATH_SEGMENTS for seg in segments)
 
     # ---------- Entry points ----------
 
@@ -295,6 +311,12 @@ class WebsiteSpider(scrapy.Spider):
             return
         normalized = self.normalize_url(url, exclude_params=self.exclude_params_schedule)
         if normalized in self.seen:
+            return
+
+        if self.is_login_url(normalized):
+            self.seen.add(normalized)
+            self.crawler.stats.inc_value("login_urls_skipped")
+            self.logger.debug("Skipping login/auth URL: %s", normalized)
             return
 
         if self.is_asset_url(normalized):

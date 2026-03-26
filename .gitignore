@@ -5,6 +5,7 @@ CLAUDE.md
 
 # Plans (contain proprietary architecture details)
 docs/plans/
+docs/references/
 
 # Environment
 .env
