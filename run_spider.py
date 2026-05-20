@@ -23,6 +23,18 @@ def main():
     parser.add_argument(
         "--status-file", required=True, help="Path for status JSON file"
     )
+    parser.add_argument(
+        "--format",
+        choices=["jsonlines", "csv"],
+        default="jsonlines",
+        help="Output format (default: jsonlines)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1,
+        help="Minimum seconds between requests (default: 1, try 3-5 for aggressive WAFs)",
+    )
     args = parser.parse_args()
 
     # Defense-in-depth: lightweight domain format check.
@@ -36,7 +48,7 @@ def main():
         settings={
             "FEEDS": {
                 args.output: {
-                    "format": "jsonlines",
+                    "format": args.format,
                     "overwrite": True,
                 }
             },
@@ -51,9 +63,11 @@ def main():
             "CLOSESPIDER_TIMEOUT": 7200,
             "CLOSESPIDER_ITEMCOUNT": 50000,
             "AUTOTHROTTLE_ENABLED": True,
-            "AUTOTHROTTLE_START_DELAY": 1,
-            "AUTOTHROTTLE_MAX_DELAY": 30,
-            "AUTOTHROTTLE_TARGET_CONCURRENCY": 2.0,
+            "AUTOTHROTTLE_START_DELAY": args.delay,
+            "AUTOTHROTTLE_MAX_DELAY": max(30, args.delay * 10),
+            "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0 if args.delay >= 3 else 2.0,
+            "CONCURRENT_REQUESTS": 1 if args.delay >= 3 else 16,
+            "DOWNLOAD_DELAY": args.delay,
             "MEMUSAGE_LIMIT_MB": 384,
             "MEMUSAGE_CHECK_INTERVAL_SECONDS": 30,
             "DNSCACHE_ENABLED": True,
