@@ -63,7 +63,21 @@ Two deployment options:
 
 ## Output format
 
-Results are streamed as [NDJSON](http://ndjsonspec.org/) (one JSON object per line):
+Via the API, results are streamed as [NDJSON](http://ndjsonspec.org/) (one JSON object per line). For local/one-off crawls, you can output CSV directly:
+
+```bash
+python run_spider.py --domain example.com --output results.csv --status-file /dev/null --format csv
+```
+
+Supported formats: `jsonlines` (default), `csv`.
+
+If the target site has an aggressive WAF (e.g. Wordfence), use `--delay` to slow down:
+
+```bash
+python run_spider.py --domain example.com --output results.csv --status-file /dev/null --format csv --delay 5
+```
+
+At `--delay 3` or higher, the crawler switches to serial mode (one request at a time) to avoid triggering rate limits. Default is `1`.
 
 ```json
 {"url": "https://example.com/", "status": 200, "last_modified": "", "redirected_to": "", "referrer": ""}
