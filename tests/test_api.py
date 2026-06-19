@@ -13,7 +13,17 @@ from httpx import ASGITransport, AsyncClient
 os.environ["YOKO_CRAWL_API_KEY"] = "a" * 48
 
 from job_manager import RESULTS_DIR, Job, JobManager
-from main import app
+from main import CrawlRequest, app
+
+
+def test_impersonate_choices_match_canonical_set():
+    """The API Literal must stay in sync with tls_impersonate.IMPERSONATE_CHOICES."""
+    from typing import get_args
+
+    from tls_impersonate import IMPERSONATE_CHOICES
+
+    literal_values = get_args(CrawlRequest.model_fields["impersonate"].annotation)
+    assert set(literal_values) == set(IMPERSONATE_CHOICES)
 
 
 @pytest.fixture
@@ -99,6 +109,48 @@ class TestStartCrawl:
         data = response.json()
         assert "job_id" in data
         assert data["status"] in ("running", "queued")
+
+    async def test_start_crawl_forwards_impersonate(self, client, auth_headers):
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.pid = 12345
+
+        async def mock_wait():
+            mock_process.returncode = 0
+            return 0
+
+        mock_process.wait = mock_wait
+        mock_process.terminate = MagicMock()
+
+        mock_results = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop, \
+             patch(
+                 "job_manager.asyncio.create_subprocess_exec",
+                 return_value=mock_process,
+             ) as mock_exec:
+            mock_loop.return_value.getaddrinfo = AsyncMock(return_value=mock_results)
+            response = await client.post(
+                "/crawl",
+                json={"domain": "example.com", "impersonate": "chrome"},
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 202
+        args = mock_exec.call_args.args
+        assert args[args.index("--impersonate") + 1] == "chrome"
+
+    async def test_invalid_impersonate_returns_flat_422(self, client, auth_headers):
+        response = await client.post(
+            "/crawl",
+            json={"domain": "example.com", "impersonate": "edge"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+        # Custom handler flattens Pydantic errors to {"detail": <string>} for the
+        # WordPress plugin consumer; assert the shape, not Pydantic's default list.
+        body = response.json()
+        assert isinstance(body.get("detail"), str)
 
 
 class TestGetStatus:

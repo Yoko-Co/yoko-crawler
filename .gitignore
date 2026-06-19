@@ -21,6 +21,10 @@ build/
 __pycache__/
 *.pyc
 
+# Crawl output / generated result files
+*.csv
+*.jsonl
+
 # OS files
 .DS_Store
 Thumbs.db

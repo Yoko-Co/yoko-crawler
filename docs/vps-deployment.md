@@ -58,6 +58,7 @@ Copy the service files to the app directory:
 # From your local machine
 scp main.py job_manager.py domain_validator.py auth.py \
     run_spider.py stats_extension.py website_spider.py \
+    tls_impersonate.py \
     requirements.txt \
     root@YOUR_VPS:/opt/yoko-crawl/app/
 ```

@@ -79,6 +79,33 @@ python run_spider.py --domain example.com --output results.csv --status-file /de
 
 At `--delay 3` or higher, the crawler switches to serial mode (one request at a time) to avoid triggering rate limits. Default is `1`.
 
+### Cloudflare and other TLS-fingerprinting WAFs
+
+Some sites (notably those behind **Cloudflare Bot Management**) block on the
+**TLS handshake fingerprint** (JA3/JA4), not the User-Agent or headers. Standard
+Scrapy — like Python `requests` — gets a `403` no matter what UA you send, while
+`curl`/`wget` over HTTP/1.1 pass. `--delay` and `--user-agent` will *not* help
+here; the block is below the HTTP layer.
+
+For these sites, use `--impersonate` to present a real browser's TLS fingerprint
+(via [scrapy-impersonate](https://pypi.org/project/scrapy-impersonate/) /
+`curl_cffi`):
+
+```bash
+python run_spider.py --domain example.com --output results.csv --status-file /dev/null --format csv --impersonate chrome
+```
+
+Choices: `off` (default — standard Scrapy TLS), `chrome`, `firefox`, `safari`,
+or `random` (rotate across the current set). Pinned to current browser versions
+in `tls_impersonate.py`; bump those as `curl_cffi` ships newer targets.
+
+The default User-Agent tracks the pinned Chrome version so it stays consistent
+with the `chrome` TLS fingerprint; override it with `--user-agent` if needed.
+
+> **How to tell which you need:** if a plain crawl returns `403` but
+> `wget --user-agent="…<chrome UA>…" https://site/` returns `200`, it's
+> TLS fingerprinting — use `--impersonate chrome`.
+
 ```json
 {"url": "https://example.com/", "status": 200, "last_modified": "", "redirected_to": "", "referrer": ""}
 {"url": "https://example.com/about", "status": 200, "last_modified": "", "redirected_to": "", "referrer": "https://example.com/"}
@@ -149,6 +176,7 @@ domain_validator.py  # SSRF prevention (format + DNS + range checks)
 auth.py              # Bearer token auth dependency
 run_spider.py        # Subprocess entry point (configures Scrapy)
 stats_extension.py   # Scrapy extension (writes progress to status file)
+tls_impersonate.py   # Downloader middleware: browser TLS fingerprint (curl_cffi)
 website_spider.py    # The actual crawler
 Dockerfile           # python:3.13-slim-bookworm, non-root user
 docker-compose.yml   # Memory limits, healthcheck, security hardening
