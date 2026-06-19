@@ -154,6 +154,7 @@ class TestJobManager:
         job = Job(
             job_id="abc123def456789a",
             domain="example.com",
+            impersonate="chrome",
             status="running",
             started_at=time.time() - 60,
         )
@@ -163,6 +164,7 @@ class TestJobManager:
         assert response["job_id"] == "abc123def456789a"
         assert response["domain"] == "example.com"
         assert response["status"] == "running"
+        assert response["impersonate"] == "chrome"
         assert 59 <= response["elapsed_seconds"] <= 61
 
     def test_startup_sweep(self, tmp_path):

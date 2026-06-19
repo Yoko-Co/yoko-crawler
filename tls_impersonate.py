@@ -21,14 +21,45 @@ CURRENT_TARGETS = {
     "safari": "safari180",
 }
 
+# User-Agent strings matching each pinned target. scrapy-impersonate forwards
+# Scrapy's headers to curl_cffi, which does NOT inject the impersonation UA when
+# headers are supplied -- so we must advertise a UA that matches the TLS
+# fingerprint ourselves (Cloudflare cross-checks UA vs JA3). Keep each entry's
+# version in step with CURRENT_TARGETS for the same family.
+FAMILY_USER_AGENTS = {
+    "chrome": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "firefox": (
+        "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0"
+    ),
+    "safari": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+    ),
+}
+
 # Canonical set of --impersonate / API choices -- single source of truth so the
 # CLI (argparse choices) and API (Pydantic Literal) cannot drift. "off" disables
 # impersonation; the family names map to CURRENT_TARGETS; "random" rotates.
 IMPERSONATE_CHOICES = ("off", *CURRENT_TARGETS.keys(), "random")
 
 
+def user_agent_for(target):
+    """Return a browser UA string matching a curl_cffi target (by family prefix).
+
+    Falls back to the Chrome UA for unrecognized/explicit targets so the request
+    still carries a plausible browser UA.
+    """
+    for family, ua in FAMILY_USER_AGENTS.items():
+        if target.startswith(family):
+            return ua
+    return FAMILY_USER_AGENTS["chrome"]
+
+
 class ImpersonateMiddleware:
-    """Set request.meta['impersonate'] to a current browser target.
+    """Tag each request with a current browser target and a matching User-Agent.
 
     Configured via the IMPERSONATE_TARGET setting: a browser family name
     ("chrome"/"firefox"/"safari"), "random" to rotate across the current set,
@@ -50,3 +81,9 @@ class ImpersonateMiddleware:
     def process_request(self, request, spider):
         # setdefault so an explicit per-request meta override still wins.
         request.meta.setdefault("impersonate", random.choice(self.pool))
+        # Advertise a UA matching whichever fingerprint this request uses, so
+        # UA and JA3 stay consistent (incl. firefox/safari and per-request
+        # "random" rotation). setdefault preserves an explicit --user-agent.
+        request.headers.setdefault(
+            "User-Agent", user_agent_for(request.meta["impersonate"])
+        )

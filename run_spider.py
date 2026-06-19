@@ -13,16 +13,13 @@ from scrapy.crawler import CrawlerProcess
 
 from domain_validator import DomainValidationError, validate_domain_format
 from stats_extension import ProgressWriter
-from tls_impersonate import IMPERSONATE_CHOICES
+from tls_impersonate import FAMILY_USER_AGENTS, IMPERSONATE_CHOICES
 from website_spider import WebsiteSpider
 
 # Default User-Agent for the non-impersonate path. When --impersonate is set,
-# curl_cffi supplies the browser-matching UA instead (see below), so this only
-# applies to standard Scrapy crawls.
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+# ImpersonateMiddleware sets a per-request UA matching the fingerprint instead.
+# Sourced from tls_impersonate so the chrome UA has a single definition.
+DEFAULT_USER_AGENT = FAMILY_USER_AGENTS["chrome"]
 
 
 def main():
@@ -146,12 +143,14 @@ def main():
                 "RETRY_TIMES": 1,
             }
         )
-        # NOTE: keep an explicit browser USER_AGENT set while impersonating.
-        # scrapy-impersonate forwards Scrapy's header dict to curl_cffi, which
-        # does NOT re-add the impersonation UA when headers are supplied -- a
-        # blank UA gets the request 403'd. DEFAULT_USER_AGENT tracks the Chrome
-        # major version pinned in tls_impersonate.CURRENT_TARGETS so the
-        # advertised UA stays consistent with the chrome TLS fingerprint.
+        # Let ImpersonateMiddleware set a per-request UA matching each
+        # fingerprint (chrome/firefox/safari, incl. "random"). Unset the global
+        # USER_AGENT so Scrapy's UserAgentMiddleware doesn't stamp one family's
+        # UA onto every request; an explicit --user-agent still overrides. (A
+        # blank UA with no middleware-supplied UA gets 403'd -- the middleware
+        # is what guarantees a matching UA is present.)
+        if not args.user_agent:
+            settings["USER_AGENT"] = None
 
     process = CrawlerProcess(settings=settings)
     process.crawl(

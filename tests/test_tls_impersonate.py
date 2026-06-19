@@ -2,11 +2,17 @@
 
 from types import SimpleNamespace
 
-from tls_impersonate import CURRENT_TARGETS, ImpersonateMiddleware
+from tls_impersonate import (
+    CURRENT_TARGETS,
+    FAMILY_USER_AGENTS,
+    ImpersonateMiddleware,
+    user_agent_for,
+)
 
 
-def make_request(meta=None):
-    return SimpleNamespace(meta=dict(meta or {}))
+def make_request(meta=None, headers=None):
+    # headers is a plain dict here; Scrapy's real Headers also supports setdefault.
+    return SimpleNamespace(meta=dict(meta or {}), headers=dict(headers or {}))
 
 
 def make_crawler(setting=None):
@@ -62,3 +68,23 @@ class TestProcessRequest:
         req = make_request()
         mw.process_request(req, spider=None)
         assert req.meta["impersonate"] in set(CURRENT_TARGETS.values())
+
+    def test_sets_user_agent_matching_the_target(self):
+        req = make_request()
+        ImpersonateMiddleware("firefox").process_request(req, spider=None)
+        assert req.headers["User-Agent"] == FAMILY_USER_AGENTS["firefox"]
+
+    def test_does_not_overwrite_explicit_user_agent(self):
+        req = make_request(headers={"User-Agent": "custom-agent"})
+        ImpersonateMiddleware("chrome").process_request(req, spider=None)
+        assert req.headers["User-Agent"] == "custom-agent"
+
+
+class TestUserAgentFor:
+    def test_resolves_each_family(self):
+        assert user_agent_for("chrome131") == FAMILY_USER_AGENTS["chrome"]
+        assert user_agent_for("firefox147") == FAMILY_USER_AGENTS["firefox"]
+        assert user_agent_for("safari180") == FAMILY_USER_AGENTS["safari"]
+
+    def test_unknown_target_falls_back_to_chrome(self):
+        assert user_agent_for("edge101") == FAMILY_USER_AGENTS["chrome"]

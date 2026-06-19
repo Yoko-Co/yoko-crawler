@@ -99,8 +99,9 @@ Choices: `off` (default — standard Scrapy TLS), `chrome`, `firefox`, `safari`,
 or `random` (rotate across the current set). Pinned to current browser versions
 in `tls_impersonate.py`; bump those as `curl_cffi` ships newer targets.
 
-The default User-Agent tracks the pinned Chrome version so it stays consistent
-with the `chrome` TLS fingerprint; override it with `--user-agent` if needed.
+When impersonating, each request is sent with a User-Agent matching its TLS
+fingerprint (so UA and JA3 stay consistent across `chrome`/`firefox`/`safari`,
+including `random`). Pass `--user-agent` only to deliberately override it.
 
 > **How to tell which you need:** if a plain crawl returns `403` but
 > `wget --user-agent="…<chrome UA>…" https://site/` returns `200`, it's
