@@ -2,5 +2,6 @@ fastapi>=0.100
 uvicorn[standard]>=0.27
 scrapy>=2.11
 scrapy-impersonate>=1.7,<2  # browser TLS-fingerprint impersonation (curl_cffi); cap major since the handler is referenced by import path
+trafilatura==2.1.0  # main-content extraction; pinned exactly because extraction heuristics change content_hash between versions (a deliberate upgrade is a hash-epoch change)
 aiofiles
 structlog
