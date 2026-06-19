@@ -340,7 +340,10 @@ class WebsiteSpider(scrapy.Spider):
             }
             content_text = result.normalized_text
         else:
+            # Fresh dict and a fresh list -- never alias the shared constant's
+            # mutable iframe_hosts across rows.
             fields = dict(_EMPTY_ENRICHMENT)
+            fields["iframe_hosts"] = []
             content_text = ""
 
         # CSV can't hold a real array; JSON-encode iframe_hosts so it round-trips.
