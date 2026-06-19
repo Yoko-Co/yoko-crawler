@@ -27,6 +27,14 @@ class TestIsBenignHost:
         # notyoutube.com must not match youtube.com.
         assert not is_benign_host("notyoutube.com", DEFAULT_BENIGN_EMBED_HOSTS)
 
+    def test_google_maps_benign_but_data_dashboards_flagged(self):
+        # Maps embeds are benign; Looker/Data Studio dashboards are exactly the
+        # surprise embeds we must NOT suppress (bare google.com is not allowlisted).
+        assert is_benign_host("www.google.com", DEFAULT_BENIGN_EMBED_HOSTS)
+        assert is_benign_host("maps.google.com", DEFAULT_BENIGN_EMBED_HOSTS)
+        assert not is_benign_host("lookerstudio.google.com", DEFAULT_BENIGN_EMBED_HOSTS)
+        assert not is_benign_host("datastudio.google.com", DEFAULT_BENIGN_EMBED_HOSTS)
+
 
 class TestLoadBenignHosts:
     def test_defaults_when_env_unset(self, monkeypatch):

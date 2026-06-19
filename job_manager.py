@@ -23,6 +23,11 @@ logger = structlog.get_logger()
 
 RESULTS_DIR = Path(os.environ.get("YOKO_CRAWL_RESULTS_DIR", "/opt/yoko-crawl/results"))
 
+# Valid crawl profiles. The HTTP layer also constrains this via a Literal, but
+# start_job guards it too so a direct programmatic caller can't forward an
+# unknown value to the subprocess (where it would fail late as a job error).
+VALID_PROFILES = ("standard", "presale")
+
 # Watchdog timeout: CLOSESPIDER_TIMEOUT (7200s) + 5min buffer.
 _WATCHDOG_TIMEOUT = 7500
 
@@ -144,6 +149,9 @@ class JobManager:
         ``profile`` ("standard"/"presale") selects the politeness bundle.
         ``emit_content`` includes each page's main-content text in the output.
         """
+        if profile not in VALID_PROFILES:
+            raise ValueError(f"invalid profile: {profile!r}")
+
         async with self._lock:
             # Check concurrency limit.
             active = sum(1 for j in self._jobs.values() if j.is_active)

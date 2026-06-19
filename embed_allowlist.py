@@ -19,13 +19,18 @@ from __future__ import annotations
 import os
 
 # Bare domains; subdomains are matched by suffix (see is_benign_host).
+# Google is intentionally NOT allowlisted at the bare-domain level: bare
+# "google.com" would suffix-match data-dashboard subdomains
+# (lookerstudio.google.com, datastudio.google.com) -- exactly the "surprise
+# embeds" we want to flag. Only the basic Maps embed hosts are benign.
 DEFAULT_BENIGN_EMBED_HOSTS = frozenset(
     {
         "youtube.com",  # also covers www.youtube.com
         "youtu.be",
         "youtube-nocookie.com",  # also covers www.youtube-nocookie.com
         "vimeo.com",  # also covers player.vimeo.com
-        "google.com",  # basic Google Maps embeds (www.google.com/maps)
+        "www.google.com",  # basic Google Maps embeds (www.google.com/maps)
+        "maps.google.com",
     }
 )
 

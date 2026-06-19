@@ -120,6 +120,54 @@ class TestJobManager:
         args = mock_exec.call_args.args
         assert args[args.index("--impersonate") + 1] == "off"
 
+    async def test_profile_and_emit_content_passed_to_subprocess(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job(
+                "example.com", profile="presale", emit_content=True
+            )
+
+        assert job.profile == "presale"
+        assert job.emit_content is True
+        args = mock_exec.call_args.args
+        assert args[args.index("--profile") + 1] == "presale"
+        assert "--emit-content" in args
+
+    async def test_emit_content_flag_omitted_by_default(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            await jm.start_job("example.com")
+
+        args = mock_exec.call_args.args
+        assert args[args.index("--profile") + 1] == "standard"
+        assert "--emit-content" not in args
+
+    async def test_invalid_profile_rejected(self):
+        jm = JobManager(max_concurrent=3)
+        with pytest.raises(ValueError):
+            await jm.start_job("example.com", profile="aggressive")
+
+    async def test_status_response_echoes_profile_and_emit_content(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job(
+                "example.com", profile="presale", emit_content=True
+            )
+
+        response = await jm.get_status_response(job)
+        assert response["profile"] == "presale"
+        assert response["emit_content"] is True
+
     async def test_concurrency_limit(self):
         jm = JobManager(max_concurrent=1)
         proc = make_fake_process()

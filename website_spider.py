@@ -11,32 +11,14 @@ from content_extractor import (
     content_hash,
     count_structure,
     embed_signals,
+    empty_enrichment,
     extract_content,
 )
 from embed_allowlist import load_benign_hosts
 
-# Zero/empty defaults for the enrichment fields on rows that carry no HTML body
-# (assets fetched HEAD-only, non-HTML responses, redirects). Keeps every row's
-# shape consistent. content_text is handled separately: present only when
-# --emit-content is set.
-_EMPTY_ENRICHMENT = {
-    "content_hash": "",
-    "main_content_extracted": False,
-    "word_count": 0,
-    "link_count": 0,
-    "internal_link_count": 0,
-    "external_link_count": 0,
-    "pdf_link_count": 0,
-    "asset_link_count": 0,
-    "anchor_link_count": 0,
-    "image_count": 0,
-    "table_count": 0,
-    "form_count": 0,
-    "iframe_count": 0,
-    "heading_count": 0,
-    "embed_count_nonbenign": 0,
-    "iframe_hosts": [],
-}
+# Zero/empty enrichment defaults come from content_extractor.empty_enrichment()
+# (the single source of truth for field names). content_text is handled
+# separately: present only when --emit-content is set.
 
 
 class WebsiteSpider(scrapy.Spider):
@@ -310,9 +292,14 @@ class WebsiteSpider(scrapy.Spider):
         """Compute the additive content/structural fields for a row.
 
         HTML pages (a non-redirect TextResponse with an html content-type and a
-        body) get real counts, embed signals, and a main-content-scoped content
-        hash. Every other row -- assets fetched HEAD-only, non-HTML responses,
-        redirects -- gets zero/empty defaults so all rows share one shape.
+        body) get real counts, page-wide embed signals, and a main-content-scoped
+        content hash. Every other row -- assets fetched HEAD-only, non-HTML
+        responses, redirects -- gets zero/empty defaults so all rows share one
+        shape.
+
+        The whole computation is guarded: if extraction/counting raises on a
+        pathological page, the row still emits with empty enrichment defaults so
+        the original five fields are never lost (the backward-compat guarantee).
         """
         ctype = (response.headers.get("Content-Type") or b"").decode("latin-1").lower()
         is_html_page = (
@@ -322,29 +309,34 @@ class WebsiteSpider(scrapy.Spider):
             and bool(response.body)
         )
 
+        content_text = ""
         if is_html_page:
-            result = extract_content(response.body)
-            counts = count_structure(
-                result.subtree,
-                response.url,
-                is_internal=self.is_internal,
-                asset_extensions=self.ASSET_EXTENSIONS,
-            )
-            signals = embed_signals(result.subtree, self.benign_hosts)
-            fields = {
-                "content_hash": content_hash(result.normalized_text),
-                "main_content_extracted": result.main_content_extracted,
-                **counts,
-                "embed_count_nonbenign": signals["embed_count_nonbenign"],
-                "iframe_hosts": signals["iframe_hosts"],
-            }
-            content_text = result.normalized_text
+            try:
+                result = extract_content(response.body)
+                counts = count_structure(
+                    result.subtree,
+                    response.url,
+                    is_internal=self.is_internal,
+                    asset_extensions=self.ASSET_EXTENSIONS,
+                )
+                # Embeds are page-wide: surprising iframes live in headers,
+                # footers, and sidebars, not just the main content region.
+                signals = embed_signals(result.body_subtree, self.benign_hosts)
+                fields = empty_enrichment()
+                fields.update(counts)
+                fields["content_hash"] = content_hash(result.normalized_text)
+                fields["main_content_extracted"] = result.main_content_extracted
+                fields["embed_count_nonbenign"] = signals["embed_count_nonbenign"]
+                fields["iframe_hosts"] = signals["iframe_hosts"]
+                content_text = result.normalized_text
+            except Exception:
+                # Never let one bad page drop the row (and its original five
+                # fields). Emit empty enrichment and log for diagnosis.
+                self.logger.exception("Enrichment failed for %s", response.url)
+                fields = empty_enrichment()
+                content_text = ""
         else:
-            # Fresh dict and a fresh list -- never alias the shared constant's
-            # mutable iframe_hosts across rows.
-            fields = dict(_EMPTY_ENRICHMENT)
-            fields["iframe_hosts"] = []
-            content_text = ""
+            fields = empty_enrichment()
 
         # CSV can't hold a real array; JSON-encode iframe_hosts so it round-trips.
         # jsonlines keeps the native array (what yoko-corpus consumes).

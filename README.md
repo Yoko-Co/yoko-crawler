@@ -183,13 +183,15 @@ These fields are present on **every** row. For non-HTML rows (assets fetched HEA
 - **pdf_link_count**, **asset_link_count** — links whose target ends in `.pdf` / any known asset extension (`.pdf` counts as both).
 - **anchor_link_count** — in-page jump links (`#frag`, or a link resolving to the current page plus a fragment).
 - **image_count**, **table_count**, **form_count**, **iframe_count** — `<img>`/`<table>`/`<form>`/`<iframe>` in the main content.
-- **embed_count_nonbenign** — iframes whose host is **not** on the benign-embed allowlist (the "surprise embed" signal: Tableau, data dashboards, unknown hosts — excludes routine video/map embeds).
+- **embed_count_nonbenign** — iframes whose host is **not** on the benign-embed allowlist (the "surprise embed" signal: Tableau, data dashboards, unknown hosts — excludes routine video/map embeds). Computed page-wide (header/footer/sidebar embeds count, not just main content). Allowlist-relative — it can change across crawls if the allowlist changes; `iframe_hosts` is the durable signal for cross-crawl comparison.
 - **iframe_hosts** — distinct hostnames of all `<iframe src>`. The durable raw signal; downstream consumers can re-classify it even if the allowlist changes. A real JSON array in `jsonlines`; JSON-encoded into a string for `csv`.
 - **content_text** — the extracted main-content text. **Present only when `--emit-content` / `emit_content: true` is set.** Its absence means "not requested," not "empty."
 
 **Hash always, text on demand.** The content hash and structural counts are emitted on every crawl so change detection stays cheap; the full `content_text` is large and only included on request (`--emit-content`), keeping the default output lean for existing consumers. The hash is computed over the **same** normalized text whether or not `--emit-content` is set, so a content-only crawl and a full crawl produce identical hashes for an unchanged page.
 
 **Normalization (stable across runs).** `content_hash` and `content_text` use the same fixed normalization: Unicode NFC → normalize line endings → collapse all whitespace runs to one space → strip. Case is preserved. The extraction library (`trafilatura`) is pinned exactly in `requirements.txt` because its heuristics change between versions; a deliberate upgrade is a "hash-epoch" change that re-hashes unchanged pages.
+
+When main-content extraction fails, `content_hash` is computed over the normalized `<body>` text instead of the main text, and `main_content_extracted` is `false`. The hashed scope can therefore flip between crawls if extraction succeeds on one run and fails on another — gate cross-crawl change detection on `main_content_extracted` when that matters. Oversized pages (over the internal body-size guard) emit an empty `content_hash` and zero counts.
 
 > **Backward compatibility.** All enrichment fields are additive — the original five fields keep their names and types. Existing consumers that read known keys (the Yoko 301s importer reads only the keys it needs, with null-coalescing defaults) are unaffected; `content_text`'s conditional presence is the only schema variation.
 

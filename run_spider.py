@@ -13,6 +13,7 @@ import time
 
 from scrapy.crawler import CrawlerProcess
 
+from content_extractor import ENRICHMENT_FIELD_NAMES
 from domain_validator import (
     DomainValidationError,
     check_resolution_sync,
@@ -28,31 +29,16 @@ from website_spider import WebsiteSpider
 DEFAULT_USER_AGENT = FAMILY_USER_AGENTS["chrome"]
 
 # NDJSON/CSV columns, in order. The five originals are unchanged for backward
-# compatibility; the rest are additive content/structural enrichment present on
-# every row. content_text is appended only when --emit-content is set.
-BASE_FEED_FIELDS = [
-    "url",
-    "status",
-    "last_modified",
-    "redirected_to",
-    "referrer",
-    "content_hash",
-    "main_content_extracted",
-    "word_count",
-    "link_count",
-    "internal_link_count",
-    "external_link_count",
-    "pdf_link_count",
-    "asset_link_count",
-    "anchor_link_count",
-    "image_count",
-    "table_count",
-    "form_count",
-    "iframe_count",
-    "heading_count",
-    "embed_count_nonbenign",
-    "iframe_hosts",
-]
+# compatibility; the enrichment columns come from content_extractor's single
+# source of truth (ENRICHMENT_FIELD_NAMES). content_text is appended only when
+# --emit-content is set.
+ORIGINAL_FEED_FIELDS = ["url", "status", "last_modified", "redirected_to", "referrer"]
+BASE_FEED_FIELDS = ORIGINAL_FEED_FIELDS + list(ENRICHMENT_FIELD_NAMES)
+
+# Bound the download itself so a hostile multi-hundred-MB response can't blow the
+# memory cap before our per-body guard runs. Well above any real HTML page.
+_DOWNLOAD_MAXSIZE = 64 * 1024 * 1024  # 64 MB
+_DOWNLOAD_WARNSIZE = 8 * 1024 * 1024  # 8 MB
 
 
 def _write_failed_status(status_file, error):
@@ -78,7 +64,7 @@ def _write_failed_status(status_file, error):
 def build_settings(args):
     """Assemble the Scrapy settings dict for a crawl (pure, so it's testable)."""
     feed_fields = list(BASE_FEED_FIELDS)
-    if getattr(args, "emit_content", False):
+    if args.emit_content:
         feed_fields.append("content_text")
 
     # Crawl profile. "presale" is a politer bundle for sites we don't control
@@ -86,7 +72,7 @@ def build_settings(args):
     # reuses the existing --delay>=3 serial path and never relaxes SSRF/domain
     # validation. "standard" leaves the operator's delay untouched.
     delay = args.delay
-    if getattr(args, "profile", "standard") == "presale":
+    if args.profile == "presale":
         delay = max(delay, 3.0)
     serial = delay >= 3
 
@@ -109,6 +95,9 @@ def build_settings(args):
         "DOWNLOAD_DELAY": delay,
         "MEMUSAGE_LIMIT_MB": 384,
         "MEMUSAGE_CHECK_INTERVAL_SECONDS": 30,
+        # Drop oversized responses at download time, before the body reaches lxml.
+        "DOWNLOAD_MAXSIZE": _DOWNLOAD_MAXSIZE,
+        "DOWNLOAD_WARNSIZE": _DOWNLOAD_WARNSIZE,
         "DNSCACHE_ENABLED": True,
         "LOG_LEVEL": "INFO",
         "EXTENSIONS": {ProgressWriter: 500},

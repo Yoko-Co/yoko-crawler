@@ -19,7 +19,7 @@ Yoko Crawler — a Python/FastAPI service that runs Scrapy spiders as subprocess
 
 ## NDJSON contract
 
-Row schema is pinned in two places that must stay in sync: the row dict in `website_spider._emit_row()` and `BASE_FEED_FIELDS` in `run_spider.py`. New fields are additive only — the original five (`url`, `status`, `last_modified`, `redirected_to`, `referrer`) never change. `content_text` is the one conditional column (present only under `--emit-content`). See the README "Output format" section for field semantics and the hash/normalization spec.
+The enrichment field names have a single source of truth: `ENRICHMENT_FIELD_NAMES` in `content_extractor.py`. `website_spider` builds its zero/empty row defaults from `content_extractor.empty_enrichment()`, and `run_spider.BASE_FEED_FIELDS` is the original five fields plus `ENRICHMENT_FIELD_NAMES` — so adding a field in one place propagates everywhere (a sync test in `tests/test_website_spider.py::TestSchemaSync` guards this). New fields are additive only — the original five (`url`, `status`, `last_modified`, `redirected_to`, `referrer`) never change. `content_text` is the one conditional column (present only under `--emit-content`). See the README "Output format" section for field semantics and the hash/normalization spec.
 
 ## Deployment
 

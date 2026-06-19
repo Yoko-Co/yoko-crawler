@@ -15,7 +15,10 @@ from content_extractor import (
     extract_content,
     normalize_content_text,
 )
+from embed_allowlist import load_benign_hosts
 from website_spider import WebsiteSpider
+
+BENIGN = load_benign_hosts()
 
 # The real asset-extension set, so tests classify links exactly as the spider does.
 ASSET_EXTS = WebsiteSpider.ASSET_EXTENSIONS
@@ -99,16 +102,15 @@ class TestExtractContentFallback:
         assert result.normalized_text == ""
 
     def test_oversized_body_skips_extraction(self, monkeypatch):
-        # A body over the size guard counts over <body> without invoking
-        # trafilatura, and still produces hashable text. Force the guard with a
-        # low threshold rather than allocating a multi-MB payload.
+        # A body over the size guard is skipped BEFORE any lxml parse (memory
+        # safety): empty enrichment, no counts, empty hash input. Force the guard
+        # with a low threshold rather than allocating a multi-MB payload.
         monkeypatch.setattr(ce, "MAX_BODY_BYTES", 64)
         result = extract_content(ARTICLE_HTML)
         assert len(ARTICLE_HTML) > ce.MAX_BODY_BYTES
         assert result.main_content_extracted is False
-        assert result.normalized_text  # non-empty body text
-        # Body-scoped text includes chrome that main-scoping would have dropped.
-        assert "footercopyright" in result.normalized_text.lower()
+        # No parse happened, so there is no text to hash.
+        assert result.normalized_text == ""
 
 
 class TestNormalizeContentText:
@@ -262,13 +264,13 @@ class TestEmbedSignals:
             '<iframe src="https://public.tableau.com/views/x"></iframe>'
             "</div>"
         )
-        sig = embed_signals(subtree)
+        sig = embed_signals(subtree, BENIGN)
         assert sig["iframe_hosts"] == ["www.youtube.com", "public.tableau.com"]
         assert sig["embed_count_nonbenign"] == 1
 
     def test_no_iframes(self):
         subtree = lxml_html.fromstring("<div><p>nothing embedded</p></div>")
-        sig = embed_signals(subtree)
+        sig = embed_signals(subtree, BENIGN)
         assert sig["iframe_hosts"] == []
         assert sig["embed_count_nonbenign"] == 0
 
@@ -279,7 +281,7 @@ class TestEmbedSignals:
             '<iframe src="https://public.tableau.com/b"></iframe>'
             "</div>"
         )
-        sig = embed_signals(subtree)
+        sig = embed_signals(subtree, BENIGN)
         # One distinct host, but both elements are non-benign.
         assert sig["iframe_hosts"] == ["public.tableau.com"]
         assert sig["embed_count_nonbenign"] == 2
@@ -298,7 +300,7 @@ class TestEmbedSignals:
         subtree = lxml_html.fromstring(
             '<div><iframe src="/local/widget"></iframe></div>'
         )
-        sig = embed_signals(subtree)
+        sig = embed_signals(subtree, BENIGN)
         assert sig["iframe_hosts"] == []
         assert sig["embed_count_nonbenign"] == 0
 
@@ -338,6 +340,101 @@ class TestContentHash:
         assert content_hash(normalize_content_text(nfc)) == content_hash(
             normalize_content_text(nfd)
         )
+
+
+class TestHashCanary:
+    def test_hash_canary_is_stable(self):
+        # A known input maps to a fixed digest. If this changes, the
+        # normalization pipeline or hash drifted (a deliberate hash-epoch change).
+        assert content_hash(normalize_content_text("The quick brown fox")) == (
+            "5cac4f980fedc3d3f1f99b4be3472c9b30d56523e632d151237ec9309048bda9"
+        )
+
+
+class TestExtractContentLocation:
+    def test_role_main_div_is_located(self):
+        # A div[role=main] with no <main>/<article> still scopes correctly.
+        html = (
+            b"<html><body>"
+            b"<nav><a href='/'>NAVHOME</a></nav>"
+            b"<div role='main'><h1>Coastal Survey Report</h1>"
+            b"<p>The rocky shelves along the northern coast hold dozens of tide "
+            b"pools that fill and drain with each turning of the sea, revealing "
+            b"anemones and crabs to anyone arriving before the lowest tide.</p>"
+            b"<p>Naturalists have catalogued these pools for over a century, "
+            b"season after season, recording which species persist and fade.</p>"
+            b"</div>"
+            b"<footer>FOOTERCOPYRIGHT</footer></body></html>"
+        )
+        result = extract_content(html)
+        assert result.main_content_extracted is True
+        assert "NAVHOME" not in result.subtree.text_content()
+        assert "FOOTERCOPYRIGHT" not in result.subtree.text_content()
+
+    def test_text_extracted_but_no_container_clears_threshold(self, monkeypatch):
+        # trafilatura returns real text, but force location to find no qualifying
+        # container: counts fall back to <body>, but the (better) main text is
+        # still hashed (normalized_text non-empty).
+        monkeypatch.setattr(ce, "_locate_main_subtree", lambda body_el, main: None)
+        result = extract_content(ARTICLE_HTML)
+        assert result.main_content_extracted is False
+        assert result.normalized_text  # main text retained for hashing
+        assert result.subtree is result.body_subtree
+
+    def test_div_soup_over_cap_falls_back_to_body(self, monkeypatch):
+        # When generic candidates exceed the cap, locating gives up (body-scope)
+        # rather than doing O(n*m) work. Force a tiny cap.
+        monkeypatch.setattr(ce, "_MAX_LOCATE_CANDIDATES", 1)
+        html = (
+            b"<html><body>"
+            b"<div><p>The rocky shelves along the northern coast hold dozens of "
+            b"tide pools that fill and drain with each turning of the sea.</p></div>"
+            b"<div><p>Naturalists have catalogued these pools for over a century, "
+            b"season after season, recording which species persist and fade.</p></div>"
+            b"</body></html>"
+        )
+        result = extract_content(html)
+        assert result.main_content_extracted is False
+
+    def test_trafilatura_exception_falls_back_to_body(self, monkeypatch):
+        # If trafilatura raises on pathological markup, extraction is treated as
+        # failure: body-scoped counts, body text hashed.
+        def _boom(*a, **k):
+            raise RuntimeError("trafilatura blew up")
+
+        monkeypatch.setattr(ce, "bare_extraction", _boom)
+        result = extract_content(ARTICLE_HTML)
+        assert result.main_content_extracted is False
+        assert result.normalized_text  # body text, non-empty
+
+    def test_fragment_without_body_is_countable(self):
+        result = extract_content(b"<div><p>just a fragment with some text</p></div>")
+        assert result.subtree is not None
+        assert result.body_subtree is not None
+
+    def test_embeds_scoped_page_wide_not_main(self):
+        # An iframe in the footer (outside main) is captured by body_subtree,
+        # which is what _enrichment uses for embed signals.
+        html = (
+            b"<html><body>"
+            b"<main><article><h1>Survey of the Coastal Pools</h1>"
+            b"<p>The rocky shelves along the northern coast hold dozens of tide "
+            b"pools that fill and drain with each turning of the sea, revealing "
+            b"anemones and crabs to anyone arriving before the lowest tide.</p>"
+            b"<p>Naturalists have catalogued these pools for over a century, "
+            b"season after season, recording which species persist and fade.</p>"
+            b"</article></main>"
+            b"<footer><iframe src='https://public.tableau.com/views/x'></iframe>"
+            b"</footer></body></html>"
+        )
+        result = extract_content(html)
+        assert result.main_content_extracted is True
+        # Main subtree excludes the footer iframe...
+        assert embed_signals(result.subtree, BENIGN)["embed_count_nonbenign"] == 0
+        # ...but the page-wide body_subtree catches it.
+        body_sig = embed_signals(result.body_subtree, BENIGN)
+        assert body_sig["embed_count_nonbenign"] == 1
+        assert "public.tableau.com" in body_sig["iframe_hosts"]
 
 
 class TestMemoryHygiene:

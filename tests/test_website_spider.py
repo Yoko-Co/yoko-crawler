@@ -166,29 +166,17 @@ class TestIsInfraUrlFalsePositives:
 
 from scrapy.http import HtmlResponse, Request, Response  # noqa: E402
 
+import content_extractor as ce  # noqa: E402
+import run_spider  # noqa: E402
+from content_extractor import ENRICHMENT_FIELD_NAMES  # noqa: E402
+
 # The original five fields, which must remain unchanged for backward compat.
 ORIGINAL_FIELDS = {"url", "status", "last_modified", "redirected_to", "referrer"}
 
 # Every additive enrichment field present on every row (content_text excluded --
-# it is conditional on --emit-content).
-ENRICHMENT_FIELDS = {
-    "content_hash",
-    "main_content_extracted",
-    "word_count",
-    "link_count",
-    "internal_link_count",
-    "external_link_count",
-    "pdf_link_count",
-    "asset_link_count",
-    "anchor_link_count",
-    "image_count",
-    "table_count",
-    "form_count",
-    "iframe_count",
-    "heading_count",
-    "embed_count_nonbenign",
-    "iframe_hosts",
-}
+# conditional on --emit-content). Derived from the single source of truth so the
+# test can never drift from the production field list.
+ENRICHMENT_FIELDS = set(ENRICHMENT_FIELD_NAMES)
 
 ARTICLE_PAGE = b"""
 <!DOCTYPE html><html lang="en"><head><title>Pools</title></head><body>
@@ -312,3 +300,115 @@ class TestIframeHostsEncoding:
         assert isinstance(row["iframe_hosts"], str)
         # Round-trips back to the host list.
         assert json.loads(row["iframe_hosts"]) == ["public.tableau.com"]
+
+    def test_csv_with_emit_content_has_both_fields(self):
+        spider = WebsiteSpider(
+            domain="example.com", output_format="csv", emit_content=1
+        )
+        row = _emit_one(spider, _html_response())
+        assert isinstance(row["iframe_hosts"], str)  # JSON-encoded for CSV
+        assert isinstance(row["content_text"], str)
+        assert "tide pools" in row["content_text"].lower()
+
+
+class TestSchemaSync:
+    """Guards against drift between the field-list sources of truth."""
+
+    def test_base_feed_fields_match_source(self):
+        assert run_spider.BASE_FEED_FIELDS == (
+            run_spider.ORIGINAL_FEED_FIELDS + list(ENRICHMENT_FIELD_NAMES)
+        )
+
+    def test_empty_enrichment_keys_match_source(self):
+        assert set(ce.empty_enrichment()) == set(ENRICHMENT_FIELD_NAMES)
+
+    def test_emitted_html_row_keys_match_feed_fields(self):
+        # An emitted HTML row (no --emit-content) must carry exactly the feed
+        # columns -- the actual output contract, end to end.
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_response())
+        assert set(row) == set(run_spider.BASE_FEED_FIELDS)
+
+    def test_asset_and_html_rows_share_keys(self):
+        html_row = _emit_one(WebsiteSpider(domain="example.com"), _html_response())
+        asset_row = _emit_one(WebsiteSpider(domain="example.com"), _asset_response())
+        assert set(html_row) == set(asset_row) == set(run_spider.BASE_FEED_FIELDS)
+
+
+class TestEnrichmentResilience:
+    def test_enrichment_failure_still_emits_row_with_original_fields(self, monkeypatch):
+        # If extraction raises, the row must still emit with the original five
+        # fields intact and empty enrichment defaults (backward-compat guarantee).
+        def _boom(*a, **k):
+            raise RuntimeError("extraction exploded")
+
+        monkeypatch.setattr("website_spider.extract_content", _boom)
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_response())
+        assert ORIGINAL_FIELDS.issubset(row)
+        assert row["url"]
+        assert row["status"] == 200
+        # Enrichment degraded to defaults rather than dropping the row.
+        assert row["content_hash"] == ""
+        assert row["word_count"] == 0
+        assert row["iframe_hosts"] == []
+        assert ENRICHMENT_FIELDS.issubset(row)
+
+    def test_footer_embed_counted_page_wide(self):
+        # A surprise embed in the footer (outside the main region) is still
+        # flagged -- the signal is page-wide.
+        html = (
+            b"<html><body>"
+            b"<main><article><h1>Survey of the Coastal Pools</h1>"
+            b"<p>The rocky shelves along the northern coast hold dozens of tide "
+            b"pools that fill and drain with each turning of the sea, revealing "
+            b"anemones and crabs to anyone arriving before the lowest tide.</p>"
+            b"<p>Naturalists have catalogued these pools for over a century, "
+            b"season after season, recording which species persist and fade.</p>"
+            b"</article></main>"
+            b"<footer><iframe src='https://public.tableau.com/v/x'></iframe></footer>"
+            b"</body></html>"
+        )
+        resp = HtmlResponse(
+            url="https://example.com/survey",
+            body=html,
+            headers={"Content-Type": "text/html"},
+            request=Request("https://example.com/survey"),
+            status=200,
+        )
+        row = _emit_one(WebsiteSpider(domain="example.com"), resp)
+        assert row["main_content_extracted"] is True
+        assert row["embed_count_nonbenign"] == 1
+        assert "public.tableau.com" in row["iframe_hosts"]
+
+
+class TestEnrichmentGating:
+    def test_redirect_html_gets_default_enrichment(self):
+        # A 301 with an HTML body is not a content page -> empty enrichment.
+        resp = HtmlResponse(
+            url="https://example.com/old",
+            body=b"<html><body><p>Moved</p></body></html>",
+            headers={"Content-Type": "text/html", "Location": "/new"},
+            request=Request("https://example.com/old"),
+            status=301,
+        )
+        row = _emit_one(WebsiteSpider(domain="example.com"), resp)
+        assert row["main_content_extracted"] is False
+        assert row["content_hash"] == ""
+        assert row["word_count"] == 0
+
+    def test_non_html_textresponse_gets_default_enrichment(self):
+        # text/xml (e.g. a sitemap) is not enriched.
+        from scrapy.http import TextResponse
+
+        resp = TextResponse(
+            url="https://example.com/sitemap.xml",
+            body=b"<urlset><url><loc>https://example.com/</loc></url></urlset>",
+            headers={"Content-Type": "text/xml"},
+            request=Request("https://example.com/sitemap.xml"),
+            status=200,
+        )
+        row = _emit_one(WebsiteSpider(domain="example.com"), resp)
+        assert row["main_content_extracted"] is False
+        assert row["iframe_hosts"] == []
+        assert ENRICHMENT_FIELDS.issubset(row)

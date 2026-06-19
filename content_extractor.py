@@ -33,7 +33,7 @@ from lxml import html as lxml_html
 from trafilatura import bare_extraction
 from trafilatura.settings import use_config
 
-from embed_allowlist import is_benign_host, load_benign_hosts
+from embed_allowlist import is_benign_host
 
 # trafilatura config built once and reused per page. EXTRACTION_TIMEOUT=0
 # disables the SIGALRM-based timeout (unusable off the main thread in Scrapy).
@@ -53,11 +53,52 @@ MIN_MAIN_TEXT_CHARS = 25
 # so it can be recalibrated against real crawls without hunting through logic.
 _MAIN_CAPTURE_THRESHOLD = 0.8
 
+# Upper bound on generic (section/div) candidates scored during main-region
+# location. Above this, scoring every candidate's text is too costly (div-soup
+# pages from WordPress page builders), so we fall back to body-scoped counting.
+_MAX_LOCATE_CANDIDATES = 250
+
 # Elements whose text is never page content; dropped before counting/matching.
 _NONCONTENT_TAGS = ("script", "style", "noscript", "template")
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
+
+# Single source of truth for the additive enrichment field names and their
+# order. website_spider builds its zero/empty defaults from this; run_spider
+# builds FEED_EXPORT_FIELDS from it; tests derive their expectations from it.
+# Adding a field here (plus producing it in count_structure/embed_signals)
+# propagates everywhere -- no parallel lists to keep in sync. content_text is
+# intentionally NOT here: it is conditional on --emit-content.
+ENRICHMENT_FIELD_NAMES = (
+    "content_hash",
+    "main_content_extracted",
+    "word_count",
+    "link_count",
+    "internal_link_count",
+    "external_link_count",
+    "pdf_link_count",
+    "asset_link_count",
+    "anchor_link_count",
+    "image_count",
+    "table_count",
+    "form_count",
+    "iframe_count",
+    "heading_count",
+    "embed_count_nonbenign",
+    "iframe_hosts",
+)
+
+
+def empty_enrichment() -> dict:
+    """A fresh zero/empty enrichment dict for rows with no HTML body (assets
+    fetched HEAD-only, non-HTML responses, redirects, oversized/unparseable
+    bodies). Returns a new dict and a new iframe_hosts list every call."""
+    fields = {name: 0 for name in ENRICHMENT_FIELD_NAMES}
+    fields["content_hash"] = ""
+    fields["main_content_extracted"] = False
+    fields["iframe_hosts"] = []
+    return fields
 
 
 @dataclass
@@ -67,14 +108,19 @@ class ExtractionResult:
     subtree:                the lxml element to run structural counts over --
                             the located main region when main_content_extracted
                             is True, otherwise the full <body>.
+    body_subtree:           the full <body> element, used for page-wide signals
+                            (iframe hosts / surprise embeds live anywhere on the
+                            page, not just the main region).
     main_content_extracted: True when counts are scoped to a located main region;
                             False when they fall back to the whole <body>.
     normalized_text:        normalized text used for the content hash -- the
                             extracted main text when trafilatura succeeded,
-                            otherwise the normalized <body> text.
+                            otherwise the normalized <body> text (empty for
+                            oversized/unparseable bodies).
     """
 
     subtree: etree._Element
+    body_subtree: etree._Element
     main_content_extracted: bool
     normalized_text: str
 
@@ -159,25 +205,12 @@ def _extract_main_text(body: bytes) -> str | None:
     return text
 
 
-def _locate_main_subtree(
-    body_el: etree._Element, main_text: str
+def _best_candidate(
+    candidates: list, target: set
 ) -> etree._Element | None:
-    """Find the tightest original-DOM element that holds the main text.
-
-    Scores candidate block containers by the fraction of the main text's word
-    tokens they contain; among those clearing the capture threshold, picks the
-    one with the fewest total tokens (least surrounding chrome). Returns None
-    when no single element captures enough of the main text -- the caller then
-    counts over the whole <body>.
-    """
-    target = set(_tokens(main_text))
-    if not target:
-        return None
-
-    candidates = body_el.xpath(
-        ".//main | .//article | .//*[@role='main'] | .//section | .//div"
-    )
-
+    """Among candidate elements, return the one with the fewest tokens that
+    still captures >= the threshold fraction of the target tokens (tightest fit,
+    least surrounding chrome). None if none clear the threshold."""
     best_el = None
     best_token_count = None
     for el in candidates:
@@ -191,8 +224,36 @@ def _locate_main_subtree(
         if best_token_count is None or total < best_token_count:
             best_el = el
             best_token_count = total
-
     return best_el
+
+
+def _locate_main_subtree(
+    body_el: etree._Element, main_text: str
+) -> etree._Element | None:
+    """Find the tightest original-DOM element that holds the main text.
+
+    Semantic containers (<main>/<article>/[role=main]) are scored first -- they
+    are few and usually correct, so the common case skips the expensive generic
+    scan entirely. Only when no semantic container qualifies do we score generic
+    block containers (section/div), and that scan is bounded: div-soup pages
+    (WordPress page builders) can yield hundreds of candidates, each costing a
+    full text materialization, so above _MAX_LOCATE_CANDIDATES we give up and
+    let the caller count over the whole <body>. Returns None when no single
+    element captures enough of the main text.
+    """
+    target = set(_tokens(main_text))
+    if not target:
+        return None
+
+    semantic = body_el.xpath(".//main | .//article | .//*[@role='main']")
+    best = _best_candidate(semantic, target)
+    if best is not None:
+        return best
+
+    generic = body_el.xpath(".//section | .//div")
+    if len(generic) > _MAX_LOCATE_CANDIDATES:
+        return None  # too many to score affordably; count over <body>
+    return _best_candidate(generic, target)
 
 
 def _href_path(resolved_url: str) -> str:
@@ -269,20 +330,20 @@ def count_structure(
 
 
 def embed_signals(
-    subtree: etree._Element, benign_hosts: frozenset[str] | None = None
+    subtree: etree._Element, benign_hosts: frozenset[str]
 ) -> dict:
-    """Compute the "surprise embed" signals over ``subtree``.
+    """Compute the "surprise embed" signals over ``subtree`` (the full page
+    <body> -- surprising embeds live anywhere, not just the main region).
 
     Returns ``iframe_hosts`` (distinct iframe hostnames, first-seen order) and
     ``embed_count_nonbenign`` (count of iframe elements whose host is not on the
     benign allowlist). Relative/same-origin iframes (no host) are ignored: the
     signal targets surprising *external* embeds. ``iframe_hosts`` is the durable
     raw signal -- downstream consumers can re-derive their own classification
-    from it even if the allowlist changes.
+    from it even if the allowlist changes. ``benign_hosts`` is required (resolve
+    it once per crawl via load_benign_hosts) so this stays a pure function with
+    no hidden environment read.
     """
-    if benign_hosts is None:
-        benign_hosts = load_benign_hosts()
-
     hosts: list[str] = []
     seen: set[str] = set()
     nonbenign = 0
@@ -309,27 +370,24 @@ def extract_content(body: bytes) -> ExtractionResult:
     normalized text to hash. Pure and per-call: parses one page and retains no
     references afterward.
     """
+    # Oversized bodies are skipped BEFORE any lxml parse -- parsing first would
+    # allocate a DOM several times the raw byte size and defeat the memory guard.
+    # An oversized body yields empty enrichment (no counts, empty hash).
+    if len(body) > MAX_BODY_BYTES:
+        empty = lxml_html.Element("body")
+        return ExtractionResult(empty, empty, False, "")
+
     body_el = _parse_body(body)
     if body_el is None:
         # Unparseable: nothing to count, empty hash input.
         empty = lxml_html.Element("body")
-        return ExtractionResult(empty, main_content_extracted=False, normalized_text="")
-
-    # Oversized bodies skip extraction to bound memory; count over <body>.
-    if len(body) > MAX_BODY_BYTES:
-        return ExtractionResult(
-            body_el,
-            main_content_extracted=False,
-            normalized_text=normalize_content_text(body_el.text_content()),
-        )
+        return ExtractionResult(empty, empty, False, "")
 
     main_text = _extract_main_text(body)
     if main_text is None:
         # Extraction failed/empty: body-scope counts, hash the body text.
         return ExtractionResult(
-            body_el,
-            main_content_extracted=False,
-            normalized_text=normalize_content_text(body_el.text_content()),
+            body_el, body_el, False, normalize_content_text(body_el.text_content())
         )
 
     normalized = normalize_content_text(main_text)
@@ -337,10 +395,6 @@ def extract_content(body: bytes) -> ExtractionResult:
     if subtree is None:
         # Extracted text but couldn't pinpoint the region: count over <body>,
         # but still hash the (better) main text.
-        return ExtractionResult(
-            body_el, main_content_extracted=False, normalized_text=normalized
-        )
+        return ExtractionResult(body_el, body_el, False, normalized)
 
-    return ExtractionResult(
-        subtree, main_content_extracted=True, normalized_text=normalized
-    )
+    return ExtractionResult(subtree, body_el, True, normalized)
