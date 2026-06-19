@@ -12,6 +12,11 @@ import asyncio
 import ipaddress
 import re
 import socket
+import threading
+
+# Bound on a single synchronous DNS resolution so a slow/hanging resolver cannot
+# stall the Scrapy reactor (SsrfGuardMiddleware) or wedge the crawl worker.
+_RESOLVE_TIMEOUT = 5
 
 _DOMAIN_RE = re.compile(
     r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
@@ -145,6 +150,56 @@ async def check_dns_resolution(domain: str) -> None:
             raise DomainValidationError(
                 "Domain resolves to a private or reserved address"
             )
+
+
+def _resolve_ips(host: str) -> list:
+    """Resolve a host to ip_address objects ([] if it can't or times out).
+
+    Runs getaddrinfo on a daemon thread bounded by _RESOLVE_TIMEOUT so a slow or
+    hanging resolver can't block the caller (including the Scrapy reactor) beyond
+    that. A timeout returns [] (treated as unresolvable -- fail-closed: the
+    request is dropped / the connection would fail anyway). The daemon thread is
+    abandoned and reaped when getaddrinfo eventually returns; it cannot block
+    process exit.
+    """
+    box = {}
+
+    def _do():
+        try:
+            box["r"] = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        except (socket.gaierror, UnicodeError, OSError):
+            box["r"] = []
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(_RESOLVE_TIMEOUT)
+    results = box.get("r", [])  # still alive (timed out) -> treat as unresolvable
+    return [ipaddress.ip_address(sockaddr[0]) for *_, sockaddr in results]
+
+
+def host_resolves_to_blocked(host: str) -> bool:
+    """True if the host resolves to any private/reserved (blocked) address.
+
+    Synchronous, for use inside the crawl worker (no event loop). A host that
+    does not resolve returns False — there is nothing to connect to, so no SSRF.
+    """
+    return any(_is_blocked(ip) for ip in _resolve_ips(host))
+
+
+def check_resolution_sync(domain: str) -> None:
+    """Synchronous analog of check_dns_resolution for the crawl subprocess.
+
+    Re-validates at crawl time (defense-in-depth) that the domain resolves and
+    does not point at a blocked range — catching DNS that changed between API
+    submission and the crawl, or a worker that would otherwise trust the domain.
+    """
+    ips = _resolve_ips(domain)
+    if not ips:
+        raise DomainValidationError(f"Domain does not resolve: {domain}")
+    if any(_is_blocked(ip) for ip in ips):
+        raise DomainValidationError(
+            "Domain resolves to a private or reserved address"
+        )
 
 
 async def validate_domain(domain: str) -> str:

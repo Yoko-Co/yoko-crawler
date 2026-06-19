@@ -139,6 +139,8 @@ class TestStartCrawl:
         assert response.status_code == 202
         args = mock_exec.call_args.args
         assert args[args.index("--impersonate") + 1] == "chrome"
+        # The 202 echoes the accepted options so callers needn't issue a GET.
+        assert response.json()["impersonate"] == "chrome"
 
     async def test_invalid_impersonate_returns_flat_422(self, client, auth_headers):
         response = await client.post(
@@ -151,6 +153,59 @@ class TestStartCrawl:
         # WordPress plugin consumer; assert the shape, not Pydantic's default list.
         body = response.json()
         assert isinstance(body.get("detail"), str)
+
+    async def test_multi_field_validation_joined_in_flat_422(self, client, auth_headers):
+        response = await client.post(
+            "/crawl",
+            json={"domain": "example.com", "impersonate": "edge", "delay": 999},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        # Both failing fields are surfaced, not just the first.
+        assert isinstance(detail, str)
+        assert "impersonate" in detail
+        assert "delay" in detail
+
+    async def test_start_crawl_forwards_delay(self, client, auth_headers):
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.pid = 12345
+
+        async def mock_wait():
+            mock_process.returncode = 0
+            return 0
+
+        mock_process.wait = mock_wait
+        mock_process.terminate = MagicMock()
+
+        mock_results = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop, \
+             patch(
+                 "job_manager.asyncio.create_subprocess_exec",
+                 return_value=mock_process,
+             ) as mock_exec:
+            mock_loop.return_value.getaddrinfo = AsyncMock(return_value=mock_results)
+            response = await client.post(
+                "/crawl",
+                json={"domain": "example.com", "delay": 3},
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 202
+        args = mock_exec.call_args.args
+        assert args[args.index("--delay") + 1] == "3.0"
+        assert response.json()["delay"] == 3.0
+
+    async def test_out_of_range_delay_returns_422(self, client, auth_headers):
+        response = await client.post(
+            "/crawl",
+            json={"domain": "example.com", "delay": 999},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+        assert isinstance(response.json().get("detail"), str)
 
 
 class TestGetStatus:

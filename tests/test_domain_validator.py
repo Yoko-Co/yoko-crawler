@@ -1,6 +1,7 @@
 """Tests for domain_validator.py."""
 
 import ipaddress
+import socket
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8,9 +9,79 @@ import pytest
 from domain_validator import (
     DomainValidationError,
     _is_blocked,
+    check_resolution_sync,
+    host_resolves_to_blocked,
     validate_domain,
     validate_domain_format,
 )
+
+
+def _getaddrinfo_returning(ip):
+    return lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 443))]
+
+
+def _getaddrinfo_failing(*a, **k):
+    raise socket.gaierror("name resolution failed")
+
+
+class TestSyncResolution:
+    def test_blocked_when_private(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo", _getaddrinfo_returning("10.0.0.1")
+        )
+        assert host_resolves_to_blocked("evil.test") is True
+
+    def test_not_blocked_when_public(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo",
+            _getaddrinfo_returning("93.184.216.34"),
+        )
+        assert host_resolves_to_blocked("example.com") is False
+
+    def test_unresolvable_is_not_blocked(self, monkeypatch):
+        # Nothing to connect to -> no SSRF; the connection will simply fail later.
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo", _getaddrinfo_failing
+        )
+        assert host_resolves_to_blocked("nope.test") is False
+
+    def test_check_resolution_sync_raises_on_metadata_ip(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo",
+            _getaddrinfo_returning("169.254.169.254"),
+        )
+        with pytest.raises(DomainValidationError):
+            check_resolution_sync("metadata.test")
+
+    def test_check_resolution_sync_raises_on_unresolvable(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo", _getaddrinfo_failing
+        )
+        with pytest.raises(DomainValidationError):
+            check_resolution_sync("nope.test")
+
+    def test_check_resolution_sync_passes_public(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo",
+            _getaddrinfo_returning("93.184.216.34"),
+        )
+        check_resolution_sync("example.com")  # must not raise
+
+    def test_ipv6_loopback_blocked(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo", _getaddrinfo_returning("::1")
+        )
+        assert host_resolves_to_blocked("evil6.test") is True
+
+    def test_non_gaierror_resolution_failure_is_not_blocked(self, monkeypatch):
+        # getaddrinfo can raise UnicodeError (bad IDN) / OSError, not just
+        # gaierror; these must be swallowed (fail-closed: caller drops the
+        # request), never propagate out of the resolver.
+        def raise_unicode(*a, **k):
+            raise UnicodeError("bad IDN")
+
+        monkeypatch.setattr("domain_validator.socket.getaddrinfo", raise_unicode)
+        assert host_resolves_to_blocked("xn--bad.test") is False
 
 
 class TestValidateDomainFormat:

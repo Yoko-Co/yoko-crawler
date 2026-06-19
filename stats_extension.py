@@ -20,9 +20,12 @@ class ProgressWriter:
     # Safety-valve close reasons that produce valid (possibly partial) results.
     _COMPLETED_REASONS = {"finished", "closespider_timeout", "closespider_itemcount"}
 
-    def __init__(self, stats, status_file):
+    def __init__(self, stats, status_file, impersonate=None):
         self.stats = stats
         self.status_file = status_file
+        # The impersonation target (None when not impersonating). Used to detect
+        # an all-blocked crawl whose pinned TLS fingerprint has gone stale.
+        self.impersonate = impersonate
         self._loop = None
 
     @classmethod
@@ -32,7 +35,11 @@ class ProgressWriter:
             raise ValueError(
                 "STATUS_FILE setting is required for ProgressWriter extension"
             )
-        ext = cls(crawler.stats, status_file)
+        ext = cls(
+            crawler.stats,
+            status_file,
+            impersonate=crawler.settings.get("IMPERSONATE_TARGET"),
+        )
         crawler.signals.connect(ext.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signal=signals.spider_closed)
         return ext
@@ -45,9 +52,41 @@ class ProgressWriter:
         if self._loop and self._loop.running:
             self._loop.stop()
         status = "completed" if reason in self._COMPLETED_REASONS else "failed"
-        self._write_status(
-            status, error=reason if status == "failed" else None, final=True
-        )
+        error = reason if status == "failed" else None
+
+        # Stale-fingerprint guard: an impersonated crawl whose responses were
+        # *all* 403 was blocked wholesale (the pinned TLS fingerprint aged out of
+        # the WAF's allow-list). Surface that as a failure instead of a clean
+        # "completed" with no usable results. Keyed on an all-403 response set
+        # (not "zero 200s"), so a legitimate redirect-only/404 crawl -- which
+        # also has no 200s, since the spider records every status -- is not
+        # mistaken for a blocked one.
+        if status == "completed" and self.impersonate:
+            responses = self.stats.get_value("response_received_count", 0)
+            forbidden = self.stats.get_value("downloader/response_status_count/403", 0)
+            if responses > 0 and forbidden == responses:
+                status = "failed"
+                error = (
+                    "impersonated crawl was blocked on every request (all 403) — "
+                    "the pinned TLS fingerprint may be stale"
+                )
+
+        # SSRF guard produced no fetchable pages: every candidate host resolved
+        # to a blocked range and was dropped, so the crawl ends empty. Surface as
+        # failed rather than a clean "completed" with zero results. (A crawl that
+        # fetched pages but dropped a stray internal link has responses>0 and is
+        # left as completed -- the SSRF attempt was blocked and the crawl is fine.)
+        if status == "completed":
+            blocked = self.stats.get_value("ssrf_guard/blocked", 0)
+            responses = self.stats.get_value("response_received_count", 0)
+            if blocked > 0 and responses == 0:
+                status = "failed"
+                error = (
+                    "crawl blocked by SSRF guard: every target host resolved to "
+                    "a private or reserved address; no pages were fetched"
+                )
+
+        self._write_status(status, error=error, final=True)
 
     def _write_status(self, status, error=None, final=False):
         data = {
