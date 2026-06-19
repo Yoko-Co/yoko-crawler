@@ -23,6 +23,11 @@ logger = structlog.get_logger()
 
 RESULTS_DIR = Path(os.environ.get("YOKO_CRAWL_RESULTS_DIR", "/opt/yoko-crawl/results"))
 
+# Valid crawl profiles. The HTTP layer also constrains this via a Literal, but
+# start_job guards it too so a direct programmatic caller can't forward an
+# unknown value to the subprocess (where it would fail late as a job error).
+VALID_PROFILES = ("standard", "presale")
+
 # Watchdog timeout: CLOSESPIDER_TIMEOUT (7200s) + 5min buffer.
 _WATCHDOG_TIMEOUT = 7500
 
@@ -44,6 +49,8 @@ class Job:
     domain: str
     impersonate: str = "off"
     delay: float = 1.0
+    profile: str = "standard"
+    emit_content: bool = False
     started_at: float = field(default_factory=time.time)
     status: str = "queued"  # queued, running, completed, failed
     error: str | None = None
@@ -123,7 +130,12 @@ class JobManager:
         return sum(1 for j in self._jobs.values() if j.is_active)
 
     async def start_job(
-        self, domain: str, impersonate: str = "off", delay: float = 1.0
+        self,
+        domain: str,
+        impersonate: str = "off",
+        delay: float = 1.0,
+        profile: str = "standard",
+        emit_content: bool = False,
     ) -> Job:
         """
         Start a new crawl job for the given domain.
@@ -134,7 +146,12 @@ class JobManager:
         ``impersonate`` selects a browser TLS fingerprint (off/chrome/firefox/
         safari/random) for sites behind TLS-fingerprinting WAFs. ``delay`` is the
         minimum seconds between requests (its companion knob for aggressive WAFs).
+        ``profile`` ("standard"/"presale") selects the politeness bundle.
+        ``emit_content`` includes each page's main-content text in the output.
         """
+        if profile not in VALID_PROFILES:
+            raise ValueError(f"invalid profile: {profile!r}")
+
         async with self._lock:
             # Check concurrency limit.
             active = sum(1 for j in self._jobs.values() if j.is_active)
@@ -152,7 +169,12 @@ class JobManager:
                 job_id = secrets.token_hex(8)
 
             job = Job(
-                job_id=job_id, domain=domain, impersonate=impersonate, delay=delay
+                job_id=job_id,
+                domain=domain,
+                impersonate=impersonate,
+                delay=delay,
+                profile=profile,
+                emit_content=emit_content,
             )
             self._jobs[job_id] = job
 
@@ -196,20 +218,29 @@ class JobManager:
         """Spawn the Scrapy subprocess for a job."""
         log_fh = open(job.log_file_path, "w")
 
+        cmd = [
+            sys.executable,
+            "run_spider.py",
+            "--domain",
+            job.domain,
+            "--output",
+            str(job.result_file),
+            "--status-file",
+            str(job.status_file),
+            "--impersonate",
+            job.impersonate,
+            "--delay",
+            str(job.delay),
+            "--profile",
+            job.profile,
+        ]
+        # --emit-content is a store_true flag: pass it only when enabled.
+        if job.emit_content:
+            cmd.append("--emit-content")
+
         try:
             job.process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "run_spider.py",
-                "--domain",
-                job.domain,
-                "--output",
-                str(job.result_file),
-                "--status-file",
-                str(job.status_file),
-                "--impersonate",
-                job.impersonate,
-                "--delay",
-                str(job.delay),
+                *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=log_fh,
                 cwd=str(Path(__file__).parent),
@@ -439,6 +470,8 @@ class JobManager:
             "domain": job.domain,
             "impersonate": job.impersonate,
             "delay": job.delay,
+            "profile": job.profile,
+            "emit_content": job.emit_content,
             "urls_discovered": status_data.get("urls_discovered", 0),
             "urls_crawled": status_data.get("urls_crawled", 0),
             "started_at": (

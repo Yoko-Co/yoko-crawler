@@ -13,6 +13,7 @@ import time
 
 from scrapy.crawler import CrawlerProcess
 
+from content_extractor import ENRICHMENT_FIELD_NAMES
 from domain_validator import (
     DomainValidationError,
     check_resolution_sync,
@@ -26,6 +27,18 @@ from website_spider import WebsiteSpider
 # ImpersonateMiddleware sets a per-request UA matching the fingerprint instead.
 # Sourced from tls_impersonate so the chrome UA has a single definition.
 DEFAULT_USER_AGENT = FAMILY_USER_AGENTS["chrome"]
+
+# NDJSON/CSV columns, in order. The five originals are unchanged for backward
+# compatibility; the enrichment columns come from content_extractor's single
+# source of truth (ENRICHMENT_FIELD_NAMES). content_text is appended only when
+# --emit-content is set.
+ORIGINAL_FEED_FIELDS = ["url", "status", "last_modified", "redirected_to", "referrer"]
+BASE_FEED_FIELDS = ORIGINAL_FEED_FIELDS + list(ENRICHMENT_FIELD_NAMES)
+
+# Bound the download itself so a hostile multi-hundred-MB response can't blow the
+# memory cap before our per-body guard runs. Well above any real HTML page.
+_DOWNLOAD_MAXSIZE = 64 * 1024 * 1024  # 64 MB
+_DOWNLOAD_WARNSIZE = 8 * 1024 * 1024  # 8 MB
 
 
 def _write_failed_status(status_file, error):
@@ -50,6 +63,19 @@ def _write_failed_status(status_file, error):
 
 def build_settings(args):
     """Assemble the Scrapy settings dict for a crawl (pure, so it's testable)."""
+    feed_fields = list(BASE_FEED_FIELDS)
+    if args.emit_content:
+        feed_fields.append("content_text")
+
+    # Crawl profile. "presale" is a politer bundle for sites we don't control
+    # (and have permission to crawl): force serial mode with a >=3s delay. It
+    # reuses the existing --delay>=3 serial path and never relaxes SSRF/domain
+    # validation. "standard" leaves the operator's delay untouched.
+    delay = args.delay
+    if args.profile == "presale":
+        delay = max(delay, 3.0)
+    serial = delay >= 3
+
     settings = {
         "FEEDS": {
             args.output: {
@@ -57,24 +83,21 @@ def build_settings(args):
                 "overwrite": True,
             }
         },
-        "FEED_EXPORT_FIELDS": [
-            "url",
-            "status",
-            "last_modified",
-            "redirected_to",
-            "referrer",
-        ],
+        "FEED_EXPORT_FIELDS": feed_fields,
         "USER_AGENT": args.user_agent or DEFAULT_USER_AGENT,
         "CLOSESPIDER_TIMEOUT": 7200,
         "CLOSESPIDER_ITEMCOUNT": 50000,
         "AUTOTHROTTLE_ENABLED": True,
-        "AUTOTHROTTLE_START_DELAY": args.delay,
-        "AUTOTHROTTLE_MAX_DELAY": max(30, args.delay * 10),
-        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0 if args.delay >= 3 else 2.0,
-        "CONCURRENT_REQUESTS": 1 if args.delay >= 3 else 16,
-        "DOWNLOAD_DELAY": args.delay,
+        "AUTOTHROTTLE_START_DELAY": delay,
+        "AUTOTHROTTLE_MAX_DELAY": max(30, delay * 10),
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0 if serial else 2.0,
+        "CONCURRENT_REQUESTS": 1 if serial else 16,
+        "DOWNLOAD_DELAY": delay,
         "MEMUSAGE_LIMIT_MB": 384,
         "MEMUSAGE_CHECK_INTERVAL_SECONDS": 30,
+        # Drop oversized responses at download time, before the body reaches lxml.
+        "DOWNLOAD_MAXSIZE": _DOWNLOAD_MAXSIZE,
+        "DOWNLOAD_WARNSIZE": _DOWNLOAD_WARNSIZE,
         "DNSCACHE_ENABLED": True,
         "LOG_LEVEL": "INFO",
         "EXTENSIONS": {ProgressWriter: 500},
@@ -180,6 +203,27 @@ def main():
             "(standard Scrapy TLS). Use 'chrome' for Cloudflare-protected sites."
         ),
     )
+    parser.add_argument(
+        "--emit-content",
+        action="store_true",
+        help=(
+            "Include the extracted main-content text of each HTML page in a "
+            "content_text field. Off by default to keep output lean; the content "
+            "hash and all structural counts are emitted regardless. Used by "
+            "yoko-corpus when building/refreshing the content store."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["standard", "presale"],
+        default="standard",
+        help=(
+            "Crawl profile. 'standard' (default) uses the configured delay. "
+            "'presale' is a politer bundle for prospect sites we don't control: "
+            "serial mode with a >=3s delay. Permission to crawl is an "
+            "operational matter handled outside this code."
+        ),
+    )
     args = parser.parse_args()
 
     # Defense-in-depth: lightweight domain format check.
@@ -207,6 +251,8 @@ def main():
         reach_pagination=1,
         include_subdomains=0,
         keep_pagination=0,
+        emit_content=1 if args.emit_content else 0,
+        output_format=args.format,
     )
     process.start()
 

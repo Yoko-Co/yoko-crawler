@@ -207,6 +207,89 @@ class TestStartCrawl:
         assert response.status_code == 422
         assert isinstance(response.json().get("detail"), str)
 
+    async def test_start_crawl_forwards_profile_and_emit_content(
+        self, client, auth_headers
+    ):
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.pid = 12345
+
+        async def mock_wait():
+            mock_process.returncode = 0
+            return 0
+
+        mock_process.wait = mock_wait
+        mock_process.terminate = MagicMock()
+
+        mock_results = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop, \
+             patch(
+                 "job_manager.asyncio.create_subprocess_exec",
+                 return_value=mock_process,
+             ) as mock_exec:
+            mock_loop.return_value.getaddrinfo = AsyncMock(return_value=mock_results)
+            response = await client.post(
+                "/crawl",
+                json={
+                    "domain": "example.com",
+                    "profile": "presale",
+                    "emit_content": True,
+                },
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 202
+        args = mock_exec.call_args.args
+        # Both reach the subprocess: --profile takes a value, --emit-content is a flag.
+        assert args[args.index("--profile") + 1] == "presale"
+        assert "--emit-content" in args
+        # The 202 echoes the accepted options.
+        body = response.json()
+        assert body["profile"] == "presale"
+        assert body["emit_content"] is True
+
+    async def test_emit_content_off_omits_flag(self, client, auth_headers):
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.pid = 12345
+
+        async def mock_wait():
+            mock_process.returncode = 0
+            return 0
+
+        mock_process.wait = mock_wait
+        mock_process.terminate = MagicMock()
+
+        mock_results = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop, \
+             patch(
+                 "job_manager.asyncio.create_subprocess_exec",
+                 return_value=mock_process,
+             ) as mock_exec:
+            mock_loop.return_value.getaddrinfo = AsyncMock(return_value=mock_results)
+            response = await client.post(
+                "/crawl",
+                json={"domain": "example.com"},
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 202
+        args = mock_exec.call_args.args
+        # Default profile is standard; the store_true flag is absent.
+        assert args[args.index("--profile") + 1] == "standard"
+        assert "--emit-content" not in args
+
+    async def test_invalid_profile_returns_422(self, client, auth_headers):
+        response = await client.post(
+            "/crawl",
+            json={"domain": "example.com", "profile": "aggressive"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+        assert isinstance(response.json().get("detail"), str)
+
 
 class TestGetStatus:
     async def test_invalid_job_id_format(self, client, auth_headers):
