@@ -71,6 +71,21 @@ class ProgressWriter:
                     "the pinned TLS fingerprint may be stale"
                 )
 
+        # SSRF guard produced no fetchable pages: every candidate host resolved
+        # to a blocked range and was dropped, so the crawl ends empty. Surface as
+        # failed rather than a clean "completed" with zero results. (A crawl that
+        # fetched pages but dropped a stray internal link has responses>0 and is
+        # left as completed -- the SSRF attempt was blocked and the crawl is fine.)
+        if status == "completed":
+            blocked = self.stats.get_value("ssrf_guard/blocked", 0)
+            responses = self.stats.get_value("response_received_count", 0)
+            if blocked > 0 and responses == 0:
+                status = "failed"
+                error = (
+                    "crawl blocked by SSRF guard: every target host resolved to "
+                    "a private or reserved address; no pages were fetched"
+                )
+
         self._write_status(status, error=error, final=True)
 
     def _write_status(self, status, error=None, final=False):

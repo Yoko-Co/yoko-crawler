@@ -78,6 +78,28 @@ def test_guard_does_not_fire_when_no_requests_made(tmp_path):
     assert data["status"] == "completed"
 
 
+def test_ssrf_blocked_into_emptiness_marked_failed(tmp_path):
+    data = _write_and_read(
+        tmp_path,
+        {"ssrf_guard/blocked": 3, "response_received_count": 0},
+        impersonate=None,
+        reason="finished",
+    )
+    assert data["status"] == "failed"
+    assert "SSRF guard" in data["error"]
+
+
+def test_ssrf_block_with_fetched_pages_completes(tmp_path):
+    # Dropped a stray internal link but fetched real pages -> the crawl is fine.
+    data = _write_and_read(
+        tmp_path,
+        {"ssrf_guard/blocked": 1, "response_received_count": 20},
+        impersonate=None,
+        reason="finished",
+    )
+    assert data["status"] == "completed"
+
+
 def test_failure_reason_preserved(tmp_path):
     data = _write_and_read(
         tmp_path,

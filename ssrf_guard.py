@@ -20,13 +20,16 @@ from domain_validator import host_resolves_to_blocked
 
 
 class SsrfGuardMiddleware:
-    def __init__(self):
+    def __init__(self, stats=None):
         # host -> bool(blocked); avoids re-resolving the same host every request.
         self._checked = {}
+        # Scrapy stats collector; bumped on each block so ProgressWriter can tell
+        # a crawl that was blocked into emptiness from a genuinely empty site.
+        self._stats = stats
 
     @classmethod
     def from_crawler(cls, crawler):
-        return cls()
+        return cls(stats=crawler.stats)
 
     def process_request(self, request, spider):
         host = urlparse(request.url).hostname
@@ -37,6 +40,8 @@ class SsrfGuardMiddleware:
             blocked = host_resolves_to_blocked(host)
             self._checked[host] = blocked
         if blocked:
+            if self._stats is not None:
+                self._stats.inc_value("ssrf_guard/blocked")
             raise IgnoreRequest(
                 f"SSRF guard: {host} resolves to a blocked/reserved address"
             )
