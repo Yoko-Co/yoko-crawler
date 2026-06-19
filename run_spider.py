@@ -27,6 +27,33 @@ from website_spider import WebsiteSpider
 # Sourced from tls_impersonate so the chrome UA has a single definition.
 DEFAULT_USER_AGENT = FAMILY_USER_AGENTS["chrome"]
 
+# NDJSON/CSV columns, in order. The five originals are unchanged for backward
+# compatibility; the rest are additive content/structural enrichment present on
+# every row. content_text is appended only when --emit-content is set.
+BASE_FEED_FIELDS = [
+    "url",
+    "status",
+    "last_modified",
+    "redirected_to",
+    "referrer",
+    "content_hash",
+    "main_content_extracted",
+    "word_count",
+    "link_count",
+    "internal_link_count",
+    "external_link_count",
+    "pdf_link_count",
+    "asset_link_count",
+    "anchor_link_count",
+    "image_count",
+    "table_count",
+    "form_count",
+    "iframe_count",
+    "heading_count",
+    "embed_count_nonbenign",
+    "iframe_hosts",
+]
+
 
 def _write_failed_status(status_file, error):
     """Write a terminal 'failed' status so job_manager surfaces ``error`` via the
@@ -50,6 +77,10 @@ def _write_failed_status(status_file, error):
 
 def build_settings(args):
     """Assemble the Scrapy settings dict for a crawl (pure, so it's testable)."""
+    feed_fields = list(BASE_FEED_FIELDS)
+    if getattr(args, "emit_content", False):
+        feed_fields.append("content_text")
+
     settings = {
         "FEEDS": {
             args.output: {
@@ -57,13 +88,7 @@ def build_settings(args):
                 "overwrite": True,
             }
         },
-        "FEED_EXPORT_FIELDS": [
-            "url",
-            "status",
-            "last_modified",
-            "redirected_to",
-            "referrer",
-        ],
+        "FEED_EXPORT_FIELDS": feed_fields,
         "USER_AGENT": args.user_agent or DEFAULT_USER_AGENT,
         "CLOSESPIDER_TIMEOUT": 7200,
         "CLOSESPIDER_ITEMCOUNT": 50000,
@@ -180,6 +205,16 @@ def main():
             "(standard Scrapy TLS). Use 'chrome' for Cloudflare-protected sites."
         ),
     )
+    parser.add_argument(
+        "--emit-content",
+        action="store_true",
+        help=(
+            "Include the extracted main-content text of each HTML page in a "
+            "content_text field. Off by default to keep output lean; the content "
+            "hash and all structural counts are emitted regardless. Used by "
+            "yoko-corpus when building/refreshing the content store."
+        ),
+    )
     args = parser.parse_args()
 
     # Defense-in-depth: lightweight domain format check.
@@ -207,6 +242,8 @@ def main():
         reach_pagination=1,
         include_subdomains=0,
         keep_pagination=0,
+        emit_content=1 if args.emit_content else 0,
+        output_format=args.format,
     )
     process.start()
 

@@ -13,6 +13,7 @@ def make_args(**overrides):
         user_agent=None,
         impersonate="off",
         status_file="status.json",
+        emit_content=False,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -46,3 +47,20 @@ def test_explicit_user_agent_preserved_when_impersonating():
 def test_non_impersonate_uses_default_chrome_ua():
     s = build_settings(make_args(impersonate="off"))
     assert "Chrome" in s["USER_AGENT"]
+
+
+def test_feed_fields_include_enrichment_but_not_content_by_default():
+    s = build_settings(make_args(emit_content=False))
+    fields = s["FEED_EXPORT_FIELDS"]
+    # Original five preserved at the front, in order.
+    assert fields[:5] == ["url", "status", "last_modified", "redirected_to", "referrer"]
+    # Additive enrichment columns present.
+    for f in ("content_hash", "word_count", "iframe_hosts", "embed_count_nonbenign"):
+        assert f in fields
+    # content_text is opt-in.
+    assert "content_text" not in fields
+
+
+def test_emit_content_appends_content_text_column():
+    s = build_settings(make_args(emit_content=True))
+    assert "content_text" in s["FEED_EXPORT_FIELDS"]

@@ -1,9 +1,42 @@
 from __future__ import annotations
 
+import json
+
 import scrapy
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
 from w3lib.url import canonicalize_url
 from scrapy.http import TextResponse
+
+from content_extractor import (
+    content_hash,
+    count_structure,
+    embed_signals,
+    extract_content,
+)
+from embed_allowlist import load_benign_hosts
+
+# Zero/empty defaults for the enrichment fields on rows that carry no HTML body
+# (assets fetched HEAD-only, non-HTML responses, redirects). Keeps every row's
+# shape consistent. content_text is handled separately: present only when
+# --emit-content is set.
+_EMPTY_ENRICHMENT = {
+    "content_hash": "",
+    "main_content_extracted": False,
+    "word_count": 0,
+    "link_count": 0,
+    "internal_link_count": 0,
+    "external_link_count": 0,
+    "pdf_link_count": 0,
+    "asset_link_count": 0,
+    "anchor_link_count": 0,
+    "image_count": 0,
+    "table_count": 0,
+    "form_count": 0,
+    "iframe_count": 0,
+    "heading_count": 0,
+    "embed_count_nonbenign": 0,
+    "iframe_hosts": [],
+}
 
 
 class WebsiteSpider(scrapy.Spider):
@@ -104,6 +137,14 @@ class WebsiteSpider(scrapy.Spider):
         keep_pagination = str(kwargs.get("keep_pagination", "")).lower() in {"1", "true", "yes"}
         self.reach_pagination = str(kwargs.get("reach_pagination", "")).lower() in {"1", "true", "yes"}
         self.include_subdomains = str(kwargs.get("include_subdomains", "")).lower() in {"1", "true", "yes"}
+
+        # Content enrichment options.
+        self.emit_content = str(kwargs.get("emit_content", "")).lower() in {"1", "true", "yes"}
+        # Needed so iframe_hosts (a list) can be JSON-encoded for CSV output,
+        # where a real array can't round-trip. Defaults to jsonlines.
+        self.output_format = str(kwargs.get("output_format", "jsonlines")).lower()
+        # Resolve the benign-embed allowlist once per crawl.
+        self.benign_hosts = load_benign_hosts()
 
         domain_arg = kwargs.get("domain")
         if not domain_arg:
@@ -265,10 +306,60 @@ class WebsiteSpider(scrapy.Spider):
 
     # ---------- Helpers ----------
 
+    def _enrichment(self, response):
+        """Compute the additive content/structural fields for a row.
+
+        HTML pages (a non-redirect TextResponse with an html content-type and a
+        body) get real counts, embed signals, and a main-content-scoped content
+        hash. Every other row -- assets fetched HEAD-only, non-HTML responses,
+        redirects -- gets zero/empty defaults so all rows share one shape.
+        """
+        ctype = (response.headers.get("Content-Type") or b"").decode("latin-1").lower()
+        is_html_page = (
+            isinstance(response, TextResponse)
+            and "html" in ctype
+            and response.status not in self.REDIRECT_STATUSES
+            and bool(response.body)
+        )
+
+        if is_html_page:
+            result = extract_content(response.body)
+            counts = count_structure(
+                result.subtree,
+                response.url,
+                is_internal=self.is_internal,
+                asset_extensions=self.ASSET_EXTENSIONS,
+            )
+            signals = embed_signals(result.subtree, self.benign_hosts)
+            fields = {
+                "content_hash": content_hash(result.normalized_text),
+                "main_content_extracted": result.main_content_extracted,
+                **counts,
+                "embed_count_nonbenign": signals["embed_count_nonbenign"],
+                "iframe_hosts": signals["iframe_hosts"],
+            }
+            content_text = result.normalized_text
+        else:
+            fields = dict(_EMPTY_ENRICHMENT)
+            content_text = ""
+
+        # CSV can't hold a real array; JSON-encode iframe_hosts so it round-trips.
+        # jsonlines keeps the native array (what yoko-corpus consumes).
+        if self.output_format == "csv":
+            fields["iframe_hosts"] = json.dumps(fields["iframe_hosts"])
+
+        # content_text is the one conditional field: present only with
+        # --emit-content (absent means "not requested", not "empty").
+        if self.emit_content:
+            fields["content_text"] = content_text
+
+        return fields
+
     def _emit_row(self, response):
         """
         Write one JSONL row for the fetched URL with:
           url, status, last_modified, redirected_to, referrer (first seen)
+        plus the additive content/structural enrichment fields.
         Emission uses emit-mode normalization (pagination stripped when reach_pagination=1).
         """
         current_emit = self.normalize_url(response.url, exclude_params=self.exclude_params_emit)
@@ -305,13 +396,15 @@ class WebsiteSpider(scrapy.Spider):
                     referrer = ""
 
         self.emitted.add(current_emit)
-        yield {
+        row = {
             "url": current_emit,
             "status": status,
             "last_modified": last_modified,
             "redirected_to": redirected_to,
             "referrer": referrer,
         }
+        row.update(self._enrichment(response))
+        yield row
 
     def _schedule(self, url, *, referrer_emit: str | None = None):
         """
