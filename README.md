@@ -54,7 +54,7 @@ curl -X POST http://localhost:8100/crawl \
   -d '{"domain": "example.com"}'
 ```
 
-The `POST /crawl` body accepts optional `impersonate` (`off`/`chrome`/`firefox`/`safari`/`random`, default `off`) and `delay` (seconds between requests, `0`–`30`, default `1`) — the two knobs for WAF-protected sites:
+The `POST /crawl` body accepts optional `impersonate` and `delay` — the two knobs for WAF-protected sites:
 
 ```bash
 curl -X POST http://localhost:8100/crawl \
@@ -62,6 +62,40 @@ curl -X POST http://localhost:8100/crawl \
   -H "Content-Type: application/json" \
   -d '{"domain": "example.com", "impersonate": "chrome", "delay": 3}'
 ```
+
+## API reference
+
+All `/crawl` routes require `Authorization: Bearer $YOKO_CRAWL_API_KEY`.
+
+### `POST /crawl`
+
+Request body:
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `domain` | string | — | Required. Bare hostname; protocol/path/port are stripped. |
+| `impersonate` | enum | `off` | `off`, `chrome`, `firefox`, `safari`, or `random`. Browser TLS fingerprint for Cloudflare-protected sites. |
+| `delay` | number | `1` | Seconds between requests, `0`–`30`. Try `3`–`5` for aggressive WAFs (the API caps at 30; the CLI `--delay` is unbounded). |
+
+Response `202`:
+
+```json
+{"job_id": "a1b2c3d4e5f60718", "status": "running", "impersonate": "chrome", "delay": 3.0, "message": "Crawl queued for example.com"}
+```
+
+Other status codes: `409` (domain already crawling), `429` (concurrency limit), `422` (validation).
+
+### `GET /crawl/{id}`
+
+Returns job status, including `impersonate` and `delay`, plus `urls_discovered`/`urls_crawled`. A crawl that was blocked wholesale (impersonation fingerprint stale, or every host SSRF-blocked) is reported as `failed` with an explanatory `error`, not a clean `completed`.
+
+### `GET /crawl/{id}/results`
+
+Streams NDJSON once the job is `completed`.
+
+### Errors
+
+All error responses use a flat envelope: `{"detail": "<message>"}` (multiple field errors are joined). Example for an out-of-range `delay`: `{"detail": "delay: Input should be less than or equal to 30"}`.
 
 ## Deployment
 

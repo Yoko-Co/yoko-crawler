@@ -91,10 +91,21 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request, exc):
-    """Flatten Pydantic validation errors to match WordPress plugin's expected format."""
+    """Flatten Pydantic validation errors to match WordPress plugin's expected format.
+
+    Keeps the `{"detail": <string>}` envelope the plugin expects, but joins every
+    field's message (prefixed with the field name) so a request that fails on
+    more than one field isn't silently truncated to the first error.
+    """
     errors = exc.errors()
-    msg = errors[0]["msg"] if errors else "Validation error"
-    return JSONResponse(status_code=422, content={"detail": msg})
+    if not errors:
+        return JSONResponse(status_code=422, content={"detail": "Validation error"})
+    parts = []
+    for err in errors:
+        # loc is like ("body", "delay"); use the last element as the field name.
+        field = err["loc"][-1] if err.get("loc") else None
+        parts.append(f"{field}: {err['msg']}" if field else err["msg"])
+    return JSONResponse(status_code=422, content={"detail": "; ".join(parts)})
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +185,8 @@ async def start_crawl(request: CrawlRequest):
     return {
         "job_id": job.job_id,
         "status": job.status,
+        "impersonate": job.impersonate,
+        "delay": job.delay,
         "message": f"Crawl queued for {domain}",
     }
 
