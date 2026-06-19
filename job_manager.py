@@ -43,6 +43,7 @@ class Job:
     job_id: str
     domain: str
     impersonate: str = "off"
+    delay: float = 1.0
     started_at: float = field(default_factory=time.time)
     status: str = "queued"  # queued, running, completed, failed
     error: str | None = None
@@ -121,7 +122,9 @@ class JobManager:
     def active_job_count(self) -> int:
         return sum(1 for j in self._jobs.values() if j.is_active)
 
-    async def start_job(self, domain: str, impersonate: str = "off") -> Job:
+    async def start_job(
+        self, domain: str, impersonate: str = "off", delay: float = 1.0
+    ) -> Job:
         """
         Start a new crawl job for the given domain.
 
@@ -129,7 +132,8 @@ class JobManager:
         race conditions between concurrent POST requests.
 
         ``impersonate`` selects a browser TLS fingerprint (off/chrome/firefox/
-        safari/random) for sites behind TLS-fingerprinting WAFs.
+        safari/random) for sites behind TLS-fingerprinting WAFs. ``delay`` is the
+        minimum seconds between requests (its companion knob for aggressive WAFs).
         """
         async with self._lock:
             # Check concurrency limit.
@@ -147,7 +151,9 @@ class JobManager:
             while job_id in self._jobs:
                 job_id = secrets.token_hex(8)
 
-            job = Job(job_id=job_id, domain=domain, impersonate=impersonate)
+            job = Job(
+                job_id=job_id, domain=domain, impersonate=impersonate, delay=delay
+            )
             self._jobs[job_id] = job
 
         # Write initial status file so GET never hits FileNotFoundError.
@@ -202,6 +208,8 @@ class JobManager:
                 str(job.status_file),
                 "--impersonate",
                 job.impersonate,
+                "--delay",
+                str(job.delay),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=log_fh,
                 cwd=str(Path(__file__).parent),
@@ -430,6 +438,7 @@ class JobManager:
             "status": job.status,  # In-memory is authoritative for lifecycle.
             "domain": job.domain,
             "impersonate": job.impersonate,
+            "delay": job.delay,
             "urls_discovered": status_data.get("urls_discovered", 0),
             "urls_crawled": status_data.get("urls_crawled", 0),
             "started_at": (

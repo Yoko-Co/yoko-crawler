@@ -130,6 +130,9 @@ class CrawlRequest(BaseModel):
     # Browser TLS-fingerprint impersonation for WAF-protected sites (Cloudflare
     # Bot Management etc.). Default "off" preserves standard Scrapy behavior.
     impersonate: Literal["off", "chrome", "firefox", "safari", "random"] = "off"
+    # Minimum seconds between requests. The documented companion to impersonate
+    # for aggressive WAFs (try 3-5). At >=3 the crawler switches to serial mode.
+    delay: float = Field(default=1, ge=0, le=30)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +151,9 @@ async def start_crawl(request: CrawlRequest):
     jm: JobManager = app.state.job_manager
 
     try:
-        job = await jm.start_job(domain, impersonate=request.impersonate)
+        job = await jm.start_job(
+            domain, impersonate=request.impersonate, delay=request.delay
+        )
     except ConcurrencyLimitError:
         raise HTTPException(
             status_code=429,

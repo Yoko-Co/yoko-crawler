@@ -79,6 +79,20 @@ class TestJobManager:
         assert job.domain == "example.com"
         assert job.status == "running"
         assert len(job.job_id) == 16
+        assert job.delay == 1.0
+
+    async def test_delay_passed_to_subprocess(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job("example.com", delay=3.0)
+
+        assert job.delay == 3.0
+        args = mock_exec.call_args.args
+        assert args[args.index("--delay") + 1] == "3.0"
 
     async def test_impersonate_passed_to_subprocess(self):
         jm = JobManager(max_concurrent=3)
@@ -155,6 +169,7 @@ class TestJobManager:
             job_id="abc123def456789a",
             domain="example.com",
             impersonate="chrome",
+            delay=2.5,
             status="running",
             started_at=time.time() - 60,
         )
@@ -165,6 +180,7 @@ class TestJobManager:
         assert response["domain"] == "example.com"
         assert response["status"] == "running"
         assert response["impersonate"] == "chrome"
+        assert response["delay"] == 2.5
         assert 59 <= response["elapsed_seconds"] <= 61
 
     def test_startup_sweep(self, tmp_path):

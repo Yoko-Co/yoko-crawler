@@ -54,6 +54,15 @@ curl -X POST http://localhost:8100/crawl \
   -d '{"domain": "example.com"}'
 ```
 
+The `POST /crawl` body accepts optional `impersonate` (`off`/`chrome`/`firefox`/`safari`/`random`, default `off`) and `delay` (seconds between requests, `0`–`30`, default `1`) — the two knobs for WAF-protected sites:
+
+```bash
+curl -X POST http://localhost:8100/crawl \
+  -H "Authorization: Bearer $YOKO_CRAWL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "example.com", "impersonate": "chrome", "delay": 3}'
+```
+
 ## Deployment
 
 Two deployment options:
