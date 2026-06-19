@@ -54,19 +54,21 @@ class ProgressWriter:
         status = "completed" if reason in self._COMPLETED_REASONS else "failed"
         error = reason if status == "failed" else None
 
-        # Stale-fingerprint guard: an impersonated crawl that made requests but
-        # got zero successful (2xx) responses was almost certainly blocked
-        # wholesale (the pinned TLS fingerprint aged out of the WAF's allow-list).
-        # Surface that as a failure instead of a clean "completed" with no usable
-        # results, so the caller knows to bump the targets.
+        # Stale-fingerprint guard: an impersonated crawl whose responses were
+        # *all* 403 was blocked wholesale (the pinned TLS fingerprint aged out of
+        # the WAF's allow-list). Surface that as a failure instead of a clean
+        # "completed" with no usable results. Keyed on an all-403 response set
+        # (not "zero 200s"), so a legitimate redirect-only/404 crawl -- which
+        # also has no 200s, since the spider records every status -- is not
+        # mistaken for a blocked one.
         if status == "completed" and self.impersonate:
             responses = self.stats.get_value("response_received_count", 0)
-            ok = self.stats.get_value("downloader/response_status_count/200", 0)
-            if responses > 0 and ok == 0:
+            forbidden = self.stats.get_value("downloader/response_status_count/403", 0)
+            if responses > 0 and forbidden == responses:
                 status = "failed"
                 error = (
-                    "impersonated crawl received no successful responses — the "
-                    "pinned TLS fingerprint may be stale or the site blocked it"
+                    "impersonated crawl was blocked on every request (all 403) — "
+                    "the pinned TLS fingerprint may be stale"
                 )
 
         self._write_status(status, error=error, final=True)

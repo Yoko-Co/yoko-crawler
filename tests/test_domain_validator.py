@@ -67,6 +67,22 @@ class TestSyncResolution:
         )
         check_resolution_sync("example.com")  # must not raise
 
+    def test_ipv6_loopback_blocked(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo", _getaddrinfo_returning("::1")
+        )
+        assert host_resolves_to_blocked("evil6.test") is True
+
+    def test_non_gaierror_resolution_failure_is_not_blocked(self, monkeypatch):
+        # getaddrinfo can raise UnicodeError (bad IDN) / OSError, not just
+        # gaierror; these must be swallowed (fail-closed: caller drops the
+        # request), never propagate out of the resolver.
+        def raise_unicode(*a, **k):
+            raise UnicodeError("bad IDN")
+
+        monkeypatch.setattr("domain_validator.socket.getaddrinfo", raise_unicode)
+        assert host_resolves_to_blocked("xn--bad.test") is False
+
 
 class TestValidateDomainFormat:
     def test_valid_domain(self):
