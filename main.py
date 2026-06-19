@@ -7,6 +7,7 @@ import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import aiofiles
 import structlog
@@ -126,6 +127,9 @@ def valid_job_id(
 
 class CrawlRequest(BaseModel):
     domain: str = Field(max_length=253)
+    # Browser TLS-fingerprint impersonation for WAF-protected sites (Cloudflare
+    # Bot Management etc.). Default "off" preserves standard Scrapy behavior.
+    impersonate: Literal["off", "chrome", "firefox", "safari", "random"] = "off"
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +148,7 @@ async def start_crawl(request: CrawlRequest):
     jm: JobManager = app.state.job_manager
 
     try:
-        job = await jm.start_job(domain)
+        job = await jm.start_job(domain, impersonate=request.impersonate)
     except ConcurrencyLimitError:
         raise HTTPException(
             status_code=429,

@@ -11,6 +11,7 @@ Yoko Crawler — a Python/FastAPI service that runs Scrapy spiders as subprocess
 - **Scrapy subprocess** — each crawl runs via `asyncio.create_subprocess_exec`, writes JSONL results and atomic status.json
 - **Progress extension** (`stats_extension.py`) — Scrapy extension that writes progress to a status file every 3s
 - **Domain validator** (`domain_validator.py`) — three-layer SSRF prevention (format, async DNS, Scrapy DNS cache)
+- **TLS impersonation** (`tls_impersonate.py`) — Scrapy downloader middleware that tags each request with a current browser TLS fingerprint (via curl_cffi / `scrapy-impersonate`) plus a matching User-Agent, to defeat JA3/JA4 WAFs; `IMPERSONATE_CHOICES` is the single source of truth for the `--impersonate` CLI flag and the API field
 - **Auth** (`auth.py`) — Bearer token via `secrets.compare_digest`
 
 ## Deployment

@@ -80,6 +80,32 @@ class TestJobManager:
         assert job.status == "running"
         assert len(job.job_id) == 16
 
+    async def test_impersonate_passed_to_subprocess(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job("example.com", impersonate="chrome")
+
+        assert job.impersonate == "chrome"
+        args = mock_exec.call_args.args
+        assert "--impersonate" in args
+        assert args[args.index("--impersonate") + 1] == "chrome"
+
+    async def test_impersonate_defaults_off(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            await jm.start_job("example.com")
+
+        args = mock_exec.call_args.args
+        assert args[args.index("--impersonate") + 1] == "off"
+
     async def test_concurrency_limit(self):
         jm = JobManager(max_concurrent=1)
         proc = make_fake_process()
@@ -128,6 +154,7 @@ class TestJobManager:
         job = Job(
             job_id="abc123def456789a",
             domain="example.com",
+            impersonate="chrome",
             status="running",
             started_at=time.time() - 60,
         )
@@ -137,6 +164,7 @@ class TestJobManager:
         assert response["job_id"] == "abc123def456789a"
         assert response["domain"] == "example.com"
         assert response["status"] == "running"
+        assert response["impersonate"] == "chrome"
         assert 59 <= response["elapsed_seconds"] <= 61
 
     def test_startup_sweep(self, tmp_path):
