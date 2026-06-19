@@ -20,9 +20,12 @@ class ProgressWriter:
     # Safety-valve close reasons that produce valid (possibly partial) results.
     _COMPLETED_REASONS = {"finished", "closespider_timeout", "closespider_itemcount"}
 
-    def __init__(self, stats, status_file):
+    def __init__(self, stats, status_file, impersonate=None):
         self.stats = stats
         self.status_file = status_file
+        # The impersonation target (None when not impersonating). Used to detect
+        # an all-blocked crawl whose pinned TLS fingerprint has gone stale.
+        self.impersonate = impersonate
         self._loop = None
 
     @classmethod
@@ -32,7 +35,11 @@ class ProgressWriter:
             raise ValueError(
                 "STATUS_FILE setting is required for ProgressWriter extension"
             )
-        ext = cls(crawler.stats, status_file)
+        ext = cls(
+            crawler.stats,
+            status_file,
+            impersonate=crawler.settings.get("IMPERSONATE_TARGET"),
+        )
         crawler.signals.connect(ext.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signal=signals.spider_closed)
         return ext
@@ -45,9 +52,24 @@ class ProgressWriter:
         if self._loop and self._loop.running:
             self._loop.stop()
         status = "completed" if reason in self._COMPLETED_REASONS else "failed"
-        self._write_status(
-            status, error=reason if status == "failed" else None, final=True
-        )
+        error = reason if status == "failed" else None
+
+        # Stale-fingerprint guard: an impersonated crawl that made requests but
+        # got zero successful (2xx) responses was almost certainly blocked
+        # wholesale (the pinned TLS fingerprint aged out of the WAF's allow-list).
+        # Surface that as a failure instead of a clean "completed" with no usable
+        # results, so the caller knows to bump the targets.
+        if status == "completed" and self.impersonate:
+            responses = self.stats.get_value("response_received_count", 0)
+            ok = self.stats.get_value("downloader/response_status_count/200", 0)
+            if responses > 0 and ok == 0:
+                status = "failed"
+                error = (
+                    "impersonated crawl received no successful responses — the "
+                    "pinned TLS fingerprint may be stale or the site blocked it"
+                )
+
+        self._write_status(status, error=error, final=True)
 
     def _write_status(self, status, error=None, final=False):
         data = {
