@@ -144,6 +144,12 @@ class CrawlRequest(BaseModel):
     # Minimum seconds between requests. The documented companion to impersonate
     # for aggressive WAFs (try 3-5). At >=3 the crawler switches to serial mode.
     delay: float = Field(default=1, ge=0, le=30)
+    # Crawl profile. "presale" is a politer bundle (serial, >=3s delay) for
+    # prospect sites we don't control. "standard" preserves current behavior.
+    profile: Literal["standard", "presale"] = "standard"
+    # Include each HTML page's main-content text in a content_text field. Off by
+    # default to keep results lean; yoko-corpus enables it to build the store.
+    emit_content: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +169,11 @@ async def start_crawl(request: CrawlRequest):
 
     try:
         job = await jm.start_job(
-            domain, impersonate=request.impersonate, delay=request.delay
+            domain,
+            impersonate=request.impersonate,
+            delay=request.delay,
+            profile=request.profile,
+            emit_content=request.emit_content,
         )
     except ConcurrencyLimitError:
         raise HTTPException(
@@ -187,6 +197,8 @@ async def start_crawl(request: CrawlRequest):
         "status": job.status,
         "impersonate": job.impersonate,
         "delay": job.delay,
+        "profile": job.profile,
+        "emit_content": job.emit_content,
         "message": f"Crawl queued for {domain}",
     }
 

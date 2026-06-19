@@ -81,6 +81,15 @@ def build_settings(args):
     if getattr(args, "emit_content", False):
         feed_fields.append("content_text")
 
+    # Crawl profile. "presale" is a politer bundle for sites we don't control
+    # (and have permission to crawl): force serial mode with a >=3s delay. It
+    # reuses the existing --delay>=3 serial path and never relaxes SSRF/domain
+    # validation. "standard" leaves the operator's delay untouched.
+    delay = args.delay
+    if getattr(args, "profile", "standard") == "presale":
+        delay = max(delay, 3.0)
+    serial = delay >= 3
+
     settings = {
         "FEEDS": {
             args.output: {
@@ -93,11 +102,11 @@ def build_settings(args):
         "CLOSESPIDER_TIMEOUT": 7200,
         "CLOSESPIDER_ITEMCOUNT": 50000,
         "AUTOTHROTTLE_ENABLED": True,
-        "AUTOTHROTTLE_START_DELAY": args.delay,
-        "AUTOTHROTTLE_MAX_DELAY": max(30, args.delay * 10),
-        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0 if args.delay >= 3 else 2.0,
-        "CONCURRENT_REQUESTS": 1 if args.delay >= 3 else 16,
-        "DOWNLOAD_DELAY": args.delay,
+        "AUTOTHROTTLE_START_DELAY": delay,
+        "AUTOTHROTTLE_MAX_DELAY": max(30, delay * 10),
+        "AUTOTHROTTLE_TARGET_CONCURRENCY": 1.0 if serial else 2.0,
+        "CONCURRENT_REQUESTS": 1 if serial else 16,
+        "DOWNLOAD_DELAY": delay,
         "MEMUSAGE_LIMIT_MB": 384,
         "MEMUSAGE_CHECK_INTERVAL_SECONDS": 30,
         "DNSCACHE_ENABLED": True,
@@ -213,6 +222,17 @@ def main():
             "content_text field. Off by default to keep output lean; the content "
             "hash and all structural counts are emitted regardless. Used by "
             "yoko-corpus when building/refreshing the content store."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["standard", "presale"],
+        default="standard",
+        help=(
+            "Crawl profile. 'standard' (default) uses the configured delay. "
+            "'presale' is a politer bundle for prospect sites we don't control: "
+            "serial mode with a >=3s delay. Permission to crawl is an "
+            "operational matter handled outside this code."
         ),
     )
     args = parser.parse_args()
