@@ -11,7 +11,11 @@ import sys
 
 from scrapy.crawler import CrawlerProcess
 
-from domain_validator import DomainValidationError, validate_domain_format
+from domain_validator import (
+    DomainValidationError,
+    check_resolution_sync,
+    validate_domain_format,
+)
 from stats_extension import ProgressWriter
 from tls_impersonate import FAMILY_USER_AGENTS, IMPERSONATE_CHOICES
 from website_spider import WebsiteSpider
@@ -71,6 +75,15 @@ def main():
         print(str(exc), file=sys.stderr)
         sys.exit(1)
 
+    # Re-validate DNS at crawl time (SSRF): the API checked at submit time, but
+    # DNS can change before the worker runs. Reject a domain that now resolves to
+    # a private/reserved address. SsrfGuardMiddleware re-checks every host below.
+    try:
+        check_resolution_sync(args.domain)
+    except DomainValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
     settings = {
         "FEEDS": {
             args.output: {
@@ -100,6 +113,11 @@ def main():
         "LOG_LEVEL": "INFO",
         "EXTENSIONS": {ProgressWriter: 500},
         "STATUS_FILE": args.status_file,
+        # SSRF connect-time guard: drops any request whose host resolves to a
+        # blocked range, before the download handler (default or curl_cffi) runs.
+        "DOWNLOADER_MIDDLEWARES": {
+            "ssrf_guard.SsrfGuardMiddleware": 90,
+        },
     }
 
     # Browser TLS-fingerprint impersonation (curl_cffi via scrapy-impersonate).
@@ -118,18 +136,17 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(2)
+        # Our own middleware pins a current, verified browser target.
+        # scrapy-impersonate's RandomBrowserMiddleware would rotate into
+        # stale fingerprints (chrome99, edge101, ...) that WAFs block. Add it to
+        # the existing middleware dict so the SSRF guard above stays registered.
+        settings["DOWNLOADER_MIDDLEWARES"]["tls_impersonate.ImpersonateMiddleware"] = 725
         settings.update(
             {
                 "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
                 "DOWNLOAD_HANDLERS": {
                     "http": "scrapy_impersonate.ImpersonateDownloadHandler",
                     "https": "scrapy_impersonate.ImpersonateDownloadHandler",
-                },
-                # Our own middleware pins a current, verified browser target.
-                # scrapy-impersonate's RandomBrowserMiddleware would rotate into
-                # stale fingerprints (chrome99, edge101, ...) that WAFs block.
-                "DOWNLOADER_MIDDLEWARES": {
-                    "tls_impersonate.ImpersonateMiddleware": 725,
                 },
                 "IMPERSONATE_TARGET": args.impersonate,
                 # Cloudflare still issues occasional bot challenges (403) under
