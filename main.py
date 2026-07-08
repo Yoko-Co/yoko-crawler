@@ -11,7 +11,7 @@ from typing import Literal
 
 import aiofiles
 import structlog
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -217,8 +217,28 @@ async def get_status(job_id: str = Depends(valid_job_id)):
 
 
 @crawl_router.get("/crawl/{job_id}/results")
-async def get_results(job_id: str = Depends(valid_job_id)):
-    """Stream crawl results as NDJSON."""
+async def get_results(
+    job_id: str = Depends(valid_job_id),
+    offset: int | None = Query(
+        default=None,
+        ge=0,
+        description=(
+            "Partial mode: stream the result file from this BYTE offset to the "
+            "current end, for a still-running job. Omit for the full-download "
+            "behaviour (completed jobs only). The caller advances offset to the last "
+            "complete-line boundary it consumed and re-requests to follow the crawl."
+        ),
+    ),
+):
+    """Stream crawl results as NDJSON.
+
+    Without ``offset``: the full download, available only once the job is
+    ``completed`` (unchanged). With ``offset``: **partial mode** — serve the bytes
+    written so far from ``offset`` onward for a job in ANY state (running included),
+    so a consumer can ingest pages incrementally as they are crawled (Phase B). The
+    feed is append-only, so reading a running file up to its current EOF is safe; a
+    trailing partial line is the caller's concern (it stops at the last newline and
+    resumes from there)."""
     jm: JobManager = app.state.job_manager
 
     try:
@@ -226,19 +246,25 @@ async def get_results(job_id: str = Depends(valid_job_id)):
     except JobNotFoundError:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.status != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Results not available. Job status: {job.status}",
-        )
-
-    if not job.result_file.exists():
-        raise HTTPException(status_code=404, detail="Result file not found")
+    if offset is None:
+        if job.status != "completed":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Results not available. Job status: {job.status}",
+            )
+        if not job.result_file.exists():
+            raise HTTPException(status_code=404, detail="Result file not found")
 
     async def stream():
+        # Partial mode before the subprocess has written anything: no file yet is
+        # simply "no results so far", not an error -- serve an empty body.
+        if offset is not None and not job.result_file.exists():
+            return
         job.active_readers += 1
         try:
-            async with aiofiles.open(job.result_file, "r") as f:
+            async with aiofiles.open(job.result_file, "rb") as f:
+                if offset:
+                    await f.seek(offset)  # past EOF -> read() yields nothing (empty)
                 while True:
                     chunk = await f.read(65536)  # 64KB chunks
                     if not chunk:
