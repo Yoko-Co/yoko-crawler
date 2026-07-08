@@ -86,15 +86,20 @@ class ProgressWriter:
                     "a private or reserved address; no pages were fetched"
                 )
 
-        self._write_status(status, error=error, final=True)
+        self._write_status(status, error=error, final=True, close_reason=reason)
 
-    def _write_status(self, status, error=None, final=False):
+    def _write_status(self, status, error=None, final=False, close_reason=None):
         data = {
             "status": status,
             "urls_discovered": self.stats.get_value("scheduler/enqueued", 0),
             "urls_crawled": self.stats.get_value("response_received_count", 0),
             "updated_at": time.time(),
             "error": error,
+            # The Scrapy close reason, surfaced even on a "completed" close so a
+            # consumer can tell a natural `finished` from a safety-valve stop
+            # (`closespider_timeout` / `closespider_itemcount`) that produced only
+            # partial results. None while the crawl is still running.
+            "close_reason": close_reason,
         }
         if final:
             data["finished_at"] = datetime.now(timezone.utc).isoformat()
