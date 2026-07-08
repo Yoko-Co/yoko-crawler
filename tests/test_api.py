@@ -374,3 +374,33 @@ class TestGetResults:
         )
         assert r.status_code == 200
         assert r.content == b""
+
+    async def test_full_download_body_intact_after_binary_switch(self, client, auth_headers):
+        # Guard the 'r'->'rb' change: the completed full download is byte-identical.
+        job = self._register("dddddddddddddddd", status="completed")
+        body = b'{"url": "https://x.com/a"}\n{"url": "https://x.com/b"}\n'
+        job.result_file.write_bytes(body)
+        r = await client.get("/crawl/dddddddddddddddd/results", headers=auth_headers)
+        assert r.status_code == 200
+        assert r.content == body
+
+    async def test_partial_offset_past_eof_is_empty(self, client, auth_headers):
+        job = self._register("eeeeeeeeeeeeeeee", status="running")
+        job.result_file.write_bytes(b'{"url": "https://x.com/a"}\n')
+        r = await client.get(
+            "/crawl/eeeeeeeeeeeeeeee/results?offset=99999", headers=auth_headers
+        )
+        assert r.status_code == 200
+        assert r.content == b""
+
+    async def test_partial_works_on_completed_job(self, client, auth_headers):
+        # Partial mode is allowed in ANY state, including completed (offset resume).
+        job = self._register("ffffffffffffffff", status="completed")
+        line_a = b'{"url": "https://x.com/a"}\n'
+        line_b = b'{"url": "https://x.com/b"}\n'
+        job.result_file.write_bytes(line_a + line_b)
+        r = await client.get(
+            f"/crawl/ffffffffffffffff/results?offset={len(line_a)}", headers=auth_headers
+        )
+        assert r.status_code == 200
+        assert r.content == line_b
