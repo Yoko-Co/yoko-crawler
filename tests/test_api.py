@@ -325,3 +325,82 @@ class TestGetResults:
             headers=auth_headers,
         )
         assert response.status_code == 404
+
+    def _register(self, job_id, status="running"):
+        job = Job(job_id=job_id, domain="example.com")
+        job.status = status
+        app.state.job_manager._jobs[job_id] = job
+        return job
+
+    async def test_full_download_still_409_while_running(self, client, auth_headers):
+        # Unchanged behaviour: without offset, results are completed-only.
+        self._register("aaaaaaaaaaaaaaaa", status="running")
+        r = await client.get("/crawl/aaaaaaaaaaaaaaaa/results", headers=auth_headers)
+        assert r.status_code == 409
+
+    async def test_partial_serves_running_job_from_offset(self, client, auth_headers):
+        job = self._register("bbbbbbbbbbbbbbbb", status="running")
+        line_a = b'{"url": "https://x.com/a"}\n'
+        line_b = b'{"url": "https://x.com/b"}\n'
+        job.result_file.write_bytes(line_a + line_b)
+
+        # offset=0 -> the whole partial file, even though the job is still running.
+        r0 = await client.get(
+            "/crawl/bbbbbbbbbbbbbbbb/results?offset=0", headers=auth_headers
+        )
+        assert r0.status_code == 200
+        assert r0.content == line_a + line_b
+
+        # offset past the first line -> only the tail bytes (the caller advances offset
+        # to the last complete-line boundary and follows the crawl).
+        r1 = await client.get(
+            f"/crawl/bbbbbbbbbbbbbbbb/results?offset={len(line_a)}", headers=auth_headers
+        )
+        assert r1.content == line_b
+
+        # offset at EOF -> empty (nothing new yet).
+        r2 = await client.get(
+            f"/crawl/bbbbbbbbbbbbbbbb/results?offset={len(line_a) + len(line_b)}",
+            headers=auth_headers,
+        )
+        assert r2.status_code == 200
+        assert r2.content == b""
+
+    async def test_partial_no_file_yet_is_empty_not_404(self, client, auth_headers):
+        # A running job that hasn't written anything: "no results so far", not an error.
+        self._register("cccccccccccccccc", status="running")
+        r = await client.get(
+            "/crawl/cccccccccccccccc/results?offset=0", headers=auth_headers
+        )
+        assert r.status_code == 200
+        assert r.content == b""
+
+    async def test_full_download_body_intact_after_binary_switch(self, client, auth_headers):
+        # Guard the 'r'->'rb' change: the completed full download is byte-identical.
+        job = self._register("dddddddddddddddd", status="completed")
+        body = b'{"url": "https://x.com/a"}\n{"url": "https://x.com/b"}\n'
+        job.result_file.write_bytes(body)
+        r = await client.get("/crawl/dddddddddddddddd/results", headers=auth_headers)
+        assert r.status_code == 200
+        assert r.content == body
+
+    async def test_partial_offset_past_eof_is_empty(self, client, auth_headers):
+        job = self._register("eeeeeeeeeeeeeeee", status="running")
+        job.result_file.write_bytes(b'{"url": "https://x.com/a"}\n')
+        r = await client.get(
+            "/crawl/eeeeeeeeeeeeeeee/results?offset=99999", headers=auth_headers
+        )
+        assert r.status_code == 200
+        assert r.content == b""
+
+    async def test_partial_works_on_completed_job(self, client, auth_headers):
+        # Partial mode is allowed in ANY state, including completed (offset resume).
+        job = self._register("ffffffffffffffff", status="completed")
+        line_a = b'{"url": "https://x.com/a"}\n'
+        line_b = b'{"url": "https://x.com/b"}\n'
+        job.result_file.write_bytes(line_a + line_b)
+        r = await client.get(
+            f"/crawl/ffffffffffffffff/results?offset={len(line_a)}", headers=auth_headers
+        )
+        assert r.status_code == 200
+        assert r.content == line_b
