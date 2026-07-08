@@ -109,3 +109,29 @@ def test_failure_reason_preserved(tmp_path):
     )
     assert data["status"] == "failed"
     assert data["error"] == "memusage_exceeded"
+
+
+def test_close_reason_surfaced_on_natural_finish(tmp_path):
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 20, "scheduler/enqueued": 20},
+        impersonate=None,
+        reason="finished",
+    )
+    assert data["status"] == "completed"
+    assert data["close_reason"] == "finished"
+
+
+def test_close_reason_surfaced_on_safety_valve_stop(tmp_path):
+    # A capped crawl reports "completed" but the close_reason marks it partial, and
+    # discovered > crawled shows how much was left unfetched.
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 1200, "scheduler/enqueued": 5000},
+        impersonate=None,
+        reason="closespider_timeout",
+    )
+    assert data["status"] == "completed"
+    assert data["close_reason"] == "closespider_timeout"
+    assert data["urls_crawled"] == 1200
+    assert data["urls_discovered"] == 5000

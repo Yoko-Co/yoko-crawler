@@ -474,6 +474,11 @@ class JobManager:
             "emit_content": job.emit_content,
             "urls_discovered": status_data.get("urls_discovered", 0),
             "urls_crawled": status_data.get("urls_crawled", 0),
+            # Scrapy close reason (None until the crawl closes). Lets a consumer
+            # distinguish a natural `finished` from a safety-valve stop
+            # (`closespider_timeout`/`closespider_itemcount`) that only partially
+            # crawled the site, even though both report status "completed".
+            "close_reason": status_data.get("close_reason"),
             "started_at": (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(job.started_at))
             ),
