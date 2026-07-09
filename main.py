@@ -150,6 +150,12 @@ class CrawlRequest(BaseModel):
     # Include each HTML page's main-content text in a content_text field. Off by
     # default to keep results lean; yoko-corpus enables it to build the store.
     emit_content: bool = False
+    # Resumable crawl (Phase C): persist a per-domain JOBDIR so a crawl that pauses at
+    # the session cap resumes on the next run instead of re-crawling from the seed.
+    resumable: bool = False
+    # Discard any prior resume state and start fresh (e.g. a forced re-scan that must
+    # re-detect changes). Only meaningful alongside resumable.
+    reset: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +180,8 @@ async def start_crawl(request: CrawlRequest):
             delay=request.delay,
             profile=request.profile,
             emit_content=request.emit_content,
+            resumable=request.resumable,
+            reset=request.reset,
         )
     except ConcurrencyLimitError:
         raise HTTPException(

@@ -109,6 +109,12 @@ def build_settings(args):
         },
     }
 
+    # Resumable crawl: Scrapy persists the request frontier + dupefilter to JOBDIR and,
+    # on a re-launch with the same dir, resumes -- skipping already-seen URLs and
+    # continuing the pending frontier -- instead of re-crawling from the seed (Phase C).
+    if getattr(args, "jobdir", None):
+        settings["JOBDIR"] = args.jobdir
+
     if args.impersonate == "off":
         return settings
 
@@ -167,6 +173,15 @@ def main():
     parser = argparse.ArgumentParser(description="Run the website spider")
     parser.add_argument("--domain", required=True, help="Domain to crawl")
     parser.add_argument("--output", required=True, help="Path for JSONL output")
+    parser.add_argument(
+        "--jobdir",
+        default=None,
+        help=(
+            "Persistent Scrapy JOBDIR for a resumable crawl. When set, the request "
+            "frontier + dupefilter persist here and a re-launch resumes instead of "
+            "re-crawling from the seed."
+        ),
+    )
     parser.add_argument(
         "--status-file", required=True, help="Path for status JSON file"
     )
