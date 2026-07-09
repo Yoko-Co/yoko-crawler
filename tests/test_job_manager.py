@@ -62,6 +62,16 @@ class TestJob:
         assert job.log_file_path.name == "abc123.log"
 
 
+def test_jobdir_for_neutralizes_path_traversal():
+    # A hostile domain must never resolve outside JOBDIR_ROOT -- the path is rmtree'd.
+    import job_manager as jm_mod
+
+    root = jm_mod.JOBDIR_ROOT.resolve()
+    for hostile in ("..", ".", "...", "../../etc", ".hidden", "a/../b"):
+        p = jm_mod._jobdir_for(hostile)
+        assert p.parent == root  # stays directly under the root, never escapes
+
+
 @pytest.fixture(autouse=True)
 def use_tmp_results_dir(tmp_path, monkeypatch):
     """Use temp directories for RESULTS_DIR + JOBDIR_ROOT in all job manager tests."""
@@ -153,6 +163,13 @@ class TestJobManager:
         job = await self._run_monitor_with_close_reason(jm, "closespider_timeout")
         # Paused at the session cap -> keep the JOBDIR so the next session resumes.
         assert (job.jobdir / "requests.seen").exists()
+
+    async def test_monitor_deletes_jobdir_on_nongraceful_close(self):
+        # No close_reason (killed/OOM/crash before the spider flushed) -> the frontier
+        # may be half-written, so drop it rather than resume a corrupt JOBDIR.
+        jm = JobManager(max_concurrent=3)
+        job = await self._run_monitor_with_close_reason(jm, None)
+        assert not job.jobdir.exists()
 
     async def test_impersonate_passed_to_subprocess(self):
         jm = JobManager(max_concurrent=3)

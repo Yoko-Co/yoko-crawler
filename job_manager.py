@@ -33,10 +33,17 @@ JOBDIR_ROOT = Path(os.environ.get("YOKO_CRAWL_JOBDIR", "/opt/yoko-crawl/jobdirs"
 
 
 def _jobdir_for(domain: str) -> Path:
-    """The stable per-domain JOBDIR path. Domains are already restricted to
-    [a-z0-9.-]; sanitize defensively so the path can't escape JOBDIR_ROOT."""
-    safe = re.sub(r"[^a-z0-9.-]", "_", domain.lower()) or "_"
-    return JOBDIR_ROOT / safe
+    """The stable per-domain JOBDIR path, GUARANTEED to sit directly under JOBDIR_ROOT
+    -- this path is handed to shutil.rmtree, so it must never escape. The char-class
+    filter alone is NOT enough: dots are in the allow-set, so `.`, `..`, and
+    leading/trailing-dot values would resolve to JOBDIR_ROOT itself or its PARENT (and
+    `reset` would rmtree it). Strip dot-only components to a single safe filename, then
+    assert containment as defense-in-depth (raises rather than deleting the wrong dir)."""
+    safe = re.sub(r"[^a-z0-9.-]", "_", domain.lower()).strip(".") or "_"
+    path = (JOBDIR_ROOT / safe).resolve()
+    if path.parent != JOBDIR_ROOT.resolve():
+        raise ValueError(f"refusing unsafe jobdir path for domain {domain!r}")
+    return path
 
 # Valid crawl profiles. The HTTP layer also constrains this via a Literal, but
 # start_job guards it too so a direct programmatic caller can't forward an
@@ -108,7 +115,13 @@ class Job:
         return int(time.time() - self.started_at)
 
     def cleanup_files(self) -> None:
-        """Remove all files associated with this job."""
+        """Remove all files associated with this job (status/result/log).
+
+        Deliberately does NOT touch the JOBDIR: it is keyed on DOMAIN, not job_id, and
+        must OUTLIVE this session's job record so the next session (a new job) can
+        resume it. The JOBDIR's own lifecycle is driven by the crawl outcome in
+        `_monitor` (delete on 'finished' or a non-graceful kill) and by `reset`; a
+        stale/abandoned JOBDIR is a garbage-collection concern tracked separately."""
         for path in (self.status_file, self.result_file, self.log_file_path):
             try:
                 path.unlink(missing_ok=True)
@@ -324,6 +337,10 @@ class JobManager:
                 job.status = "failed"
                 job.error = "Crawl exceeded maximum duration"
                 job.failed_at = time.time()
+                # Hard-killed mid-write -> the JOBDIR frontier may be half-written and
+                # must not be resumed. Drop it (re-crawl fresh; ingested pages persist).
+                if job.resumable and job.jobdir is not None:
+                    shutil.rmtree(job.jobdir, ignore_errors=True)
                 return
 
             # Process exited — check if job was deleted during wait.
@@ -343,17 +360,19 @@ class JobManager:
                 job.status = "failed"
                 job.error = f"Process exited with code {job.process.returncode}"
 
-            # Resumable crawl lifecycle: a "finished" close means the frontier drained
-            # (the whole site was crawled), so drop the JOBDIR -- the next crawl of this
-            # domain starts fresh and re-detects changes. A safety-valve pause
-            # (closespider_timeout/itemcount) leaves it so the next session resumes.
-            if (
-                job.resumable
-                and job.jobdir is not None
-                and status_data
-                and status_data.get("close_reason") == "finished"
-            ):
-                shutil.rmtree(job.jobdir, ignore_errors=True)
+            # Resumable JOBDIR lifecycle:
+            #  - "finished" (frontier drained -> whole site crawled): delete it, so the
+            #    next crawl of this domain starts fresh and re-detects changes.
+            #  - a GRACEFUL pause (closespider_timeout/itemcount -- close_reason present):
+            #    keep it, so the next session resumes the frontier.
+            #  - NO graceful close (close_reason absent: killed / OOM / crash before the
+            #    spider could flush its disk queue): delete it. A half-written frontier
+            #    must not be resumed (corrupt); re-crawl fresh. The pages ingested so
+            #    far already persist in the corpus, so no fetched work is lost.
+            if job.resumable and job.jobdir is not None:
+                close_reason = status_data.get("close_reason") if status_data else None
+                if close_reason == "finished" or close_reason is None:
+                    shutil.rmtree(job.jobdir, ignore_errors=True)
 
             now = time.time()
             if job.status == "completed":
