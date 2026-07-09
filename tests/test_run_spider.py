@@ -20,9 +20,20 @@ def make_args(**overrides):
         status_file="status.json",
         emit_content=False,
         profile="standard",
+        jobdir=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_no_jobdir_setting_by_default():
+    s = build_settings(make_args())
+    assert "JOBDIR" not in s
+
+
+def test_jobdir_setting_enables_scrapy_resume():
+    s = build_settings(make_args(jobdir="/var/yoko-crawl/jobdirs/example.com"))
+    assert s["JOBDIR"] == "/var/yoko-crawl/jobdirs/example.com"
 
 
 def test_ssrf_guard_registered_without_impersonation():

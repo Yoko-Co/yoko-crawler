@@ -17,6 +17,7 @@ from job_manager import (
     JobNotFoundError,
     RESULTS_DIR,
     _humanize_error,
+    _jobdir_for,
 )
 
 
@@ -61,10 +62,21 @@ class TestJob:
         assert job.log_file_path.name == "abc123.log"
 
 
+def test_jobdir_for_neutralizes_path_traversal():
+    # A hostile domain must never resolve outside JOBDIR_ROOT -- the path is rmtree'd.
+    import job_manager as jm_mod
+
+    root = jm_mod.JOBDIR_ROOT.resolve()
+    for hostile in ("..", ".", "...", "../../etc", ".hidden", "a/../b"):
+        p = jm_mod._jobdir_for(hostile)
+        assert p.parent == root  # stays directly under the root, never escapes
+
+
 @pytest.fixture(autouse=True)
 def use_tmp_results_dir(tmp_path, monkeypatch):
-    """Use a temp directory for RESULTS_DIR in all job manager tests."""
+    """Use temp directories for RESULTS_DIR + JOBDIR_ROOT in all job manager tests."""
     monkeypatch.setattr("job_manager.RESULTS_DIR", tmp_path)
+    monkeypatch.setattr("job_manager.JOBDIR_ROOT", tmp_path / "jobdirs")
     yield
 
 
@@ -93,6 +105,71 @@ class TestJobManager:
         assert job.delay == 3.0
         args = mock_exec.call_args.args
         assert args[args.index("--delay") + 1] == "3.0"
+
+    async def test_resumable_passes_jobdir_to_subprocess(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job("example.com", resumable=True)
+        assert job.resumable is True
+        args = mock_exec.call_args.args
+        assert args[args.index("--jobdir") + 1] == str(job.jobdir)
+        assert job.jobdir == _jobdir_for("example.com")
+
+    async def test_non_resumable_omits_jobdir(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job("example.com")
+        assert job.resumable is False
+        assert job.jobdir is None
+        assert "--jobdir" not in mock_exec.call_args.args
+
+    async def test_reset_discards_existing_jobdir_before_start(self):
+        jm = JobManager(max_concurrent=3)
+        jd = _jobdir_for("example.com")
+        jd.mkdir(parents=True, exist_ok=True)
+        (jd / "requests.seen").write_text("stale-frontier")
+        proc = make_fake_process()
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            await jm.start_job("example.com", resumable=True, reset=True)
+        assert not (jd / "requests.seen").exists()  # prior resume state discarded
+
+    async def _run_monitor_with_close_reason(self, jm, close_reason):
+        proc = make_fake_process(returncode=0)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("example.com", resumable=True)
+        # Simulate the spider having persisted a JOBDIR + written its close reason.
+        job.jobdir.mkdir(parents=True, exist_ok=True)
+        (job.jobdir / "requests.seen").write_text("frontier")
+        job.status_file.write_text(
+            json.dumps({"status": "completed", "close_reason": close_reason})
+        )
+        await jm._monitor(job.job_id)
+        return job
+
+    async def test_monitor_deletes_jobdir_when_finished(self):
+        jm = JobManager(max_concurrent=3)
+        job = await self._run_monitor_with_close_reason(jm, "finished")
+        # Frontier drained -> resume state dropped so the next crawl is fresh.
+        assert not job.jobdir.exists()
+
+    async def test_monitor_keeps_jobdir_when_paused(self):
+        jm = JobManager(max_concurrent=3)
+        job = await self._run_monitor_with_close_reason(jm, "closespider_timeout")
+        # Paused at the session cap -> keep the JOBDIR so the next session resumes.
+        assert (job.jobdir / "requests.seen").exists()
+
+    async def test_monitor_deletes_jobdir_on_nongraceful_close(self):
+        # No close_reason (killed/OOM/crash before the spider flushed) -> the frontier
+        # may be half-written, so drop it rather than resume a corrupt JOBDIR.
+        jm = JobManager(max_concurrent=3)
+        job = await self._run_monitor_with_close_reason(jm, None)
+        assert not job.jobdir.exists()
 
     async def test_impersonate_passed_to_subprocess(self):
         jm = JobManager(max_concurrent=3)

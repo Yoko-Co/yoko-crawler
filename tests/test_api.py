@@ -38,8 +38,9 @@ def auth_headers(api_key):
 
 @pytest.fixture
 async def client(tmp_path, monkeypatch):
-    # Use temp directory for results so tests work outside Docker.
+    # Use temp directories for results + JOBDIRs so tests work outside Docker.
     monkeypatch.setattr("job_manager.RESULTS_DIR", tmp_path)
+    monkeypatch.setattr("job_manager.JOBDIR_ROOT", tmp_path / "jobdirs")
 
     # Manually set up app state since ASGITransport doesn't run lifespan.
     app.state.job_manager = JobManager(max_concurrent=3)
@@ -141,6 +142,34 @@ class TestStartCrawl:
         assert args[args.index("--impersonate") + 1] == "chrome"
         # The 202 echoes the accepted options so callers needn't issue a GET.
         assert response.json()["impersonate"] == "chrome"
+
+    async def test_start_crawl_forwards_resumable_as_jobdir(self, client, auth_headers):
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.pid = 12345
+
+        async def mock_wait():
+            mock_process.returncode = 0
+            return 0
+
+        mock_process.wait = mock_wait
+        mock_process.terminate = MagicMock()
+        mock_results = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop, \
+             patch(
+                 "job_manager.asyncio.create_subprocess_exec",
+                 return_value=mock_process,
+             ) as mock_exec:
+            mock_loop.return_value.getaddrinfo = AsyncMock(return_value=mock_results)
+            response = await client.post(
+                "/crawl",
+                json={"domain": "example.com", "resumable": True},
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 202
+        assert "--jobdir" in mock_exec.call_args.args
 
     async def test_invalid_impersonate_returns_flat_422(self, client, auth_headers):
         response = await client.post(

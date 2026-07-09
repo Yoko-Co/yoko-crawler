@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -22,6 +24,26 @@ import structlog
 logger = structlog.get_logger()
 
 RESULTS_DIR = Path(os.environ.get("YOKO_CRAWL_RESULTS_DIR", "/opt/yoko-crawl/results"))
+
+# Persistent per-domain Scrapy JOBDIRs for resumable crawls (Phase C). Kept SEPARATE
+# from RESULTS_DIR (which is TTL-cleaned) because a JOBDIR must survive between the
+# sessions of one crawl. Scrapy persists the request frontier + dupefilter here, so a
+# re-launch with the same JOBDIR resumes instead of re-fetching from the seed.
+JOBDIR_ROOT = Path(os.environ.get("YOKO_CRAWL_JOBDIR", "/opt/yoko-crawl/jobdirs"))
+
+
+def _jobdir_for(domain: str) -> Path:
+    """The stable per-domain JOBDIR path, GUARANTEED to sit directly under JOBDIR_ROOT
+    -- this path is handed to shutil.rmtree, so it must never escape. The char-class
+    filter alone is NOT enough: dots are in the allow-set, so `.`, `..`, and
+    leading/trailing-dot values would resolve to JOBDIR_ROOT itself or its PARENT (and
+    `reset` would rmtree it). Strip dot-only components to a single safe filename, then
+    assert containment as defense-in-depth (raises rather than deleting the wrong dir)."""
+    safe = re.sub(r"[^a-z0-9.-]", "_", domain.lower()).strip(".") or "_"
+    path = (JOBDIR_ROOT / safe).resolve()
+    if path.parent != JOBDIR_ROOT.resolve():
+        raise ValueError(f"refusing unsafe jobdir path for domain {domain!r}")
+    return path
 
 # Valid crawl profiles. The HTTP layer also constrains this via a Literal, but
 # start_job guards it too so a direct programmatic caller can't forward an
@@ -51,6 +73,9 @@ class Job:
     delay: float = 1.0
     profile: str = "standard"
     emit_content: bool = False
+    # Resumable crawl (Phase C): when true the spider runs with a persistent
+    # per-domain JOBDIR, so a crawl that pauses (session cap) resumes on the next run.
+    resumable: bool = False
     started_at: float = field(default_factory=time.time)
     status: str = "queued"  # queued, running, completed, failed
     error: str | None = None
@@ -73,6 +98,12 @@ class Job:
         return RESULTS_DIR / f"{self.job_id}.jsonl"
 
     @property
+    def jobdir(self) -> Path | None:
+        """The persistent per-domain JOBDIR for a resumable crawl, else None. Keyed on
+        domain (not job_id) so consecutive sessions of one crawl share resume state."""
+        return _jobdir_for(self.domain) if self.resumable else None
+
+    @property
     def log_file_path(self) -> Path:
         return RESULTS_DIR / f"{self.job_id}.log"
 
@@ -84,7 +115,13 @@ class Job:
         return int(time.time() - self.started_at)
 
     def cleanup_files(self) -> None:
-        """Remove all files associated with this job."""
+        """Remove all files associated with this job (status/result/log).
+
+        Deliberately does NOT touch the JOBDIR: it is keyed on DOMAIN, not job_id, and
+        must OUTLIVE this session's job record so the next session (a new job) can
+        resume it. The JOBDIR's own lifecycle is driven by the crawl outcome in
+        `_monitor` (delete on 'finished' or a non-graceful kill) and by `reset`; a
+        stale/abandoned JOBDIR is a garbage-collection concern tracked separately."""
         for path in (self.status_file, self.result_file, self.log_file_path):
             try:
                 path.unlink(missing_ok=True)
@@ -136,6 +173,8 @@ class JobManager:
         delay: float = 1.0,
         profile: str = "standard",
         emit_content: bool = False,
+        resumable: bool = False,
+        reset: bool = False,
     ) -> Job:
         """
         Start a new crawl job for the given domain.
@@ -148,6 +187,10 @@ class JobManager:
         minimum seconds between requests (its companion knob for aggressive WAFs).
         ``profile`` ("standard"/"presale") selects the politeness bundle.
         ``emit_content`` includes each page's main-content text in the output.
+        ``resumable`` runs the spider with a persistent per-domain JOBDIR, so a crawl
+        that pauses at the session cap RESUMES on the next run instead of re-fetching
+        from the seed (Phase C). ``reset`` discards any existing JOBDIR first, forcing
+        a fresh scan (e.g. a "request fresh crawl" that must re-detect changes).
         """
         if profile not in VALID_PROFILES:
             raise ValueError(f"invalid profile: {profile!r}")
@@ -163,6 +206,12 @@ class JobManager:
                 if j.domain == domain and j.is_active:
                     raise DomainAlreadyCrawlingError()
 
+            # A fresh scan discards prior resume state (frontier + dupefilter) so the
+            # crawl starts from the seed and re-detects changes. Only meaningful with
+            # a JOBDIR (resumable); harmless otherwise.
+            if reset:
+                shutil.rmtree(_jobdir_for(domain), ignore_errors=True)
+
             # Generate unique job ID with collision check.
             job_id = secrets.token_hex(8)
             while job_id in self._jobs:
@@ -175,6 +224,7 @@ class JobManager:
                 delay=delay,
                 profile=profile,
                 emit_content=emit_content,
+                resumable=resumable,
             )
             self._jobs[job_id] = job
 
@@ -238,6 +288,12 @@ class JobManager:
         if job.emit_content:
             cmd.append("--emit-content")
 
+        # Resumable crawl: Scrapy persists the frontier + dupefilter to this dir and
+        # resumes from it on the next run for the same domain.
+        if job.jobdir is not None:
+            job.jobdir.parent.mkdir(parents=True, exist_ok=True)
+            cmd += ["--jobdir", str(job.jobdir)]
+
         try:
             job.process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -281,6 +337,10 @@ class JobManager:
                 job.status = "failed"
                 job.error = "Crawl exceeded maximum duration"
                 job.failed_at = time.time()
+                # Hard-killed mid-write -> the JOBDIR frontier may be half-written and
+                # must not be resumed. Drop it (re-crawl fresh; ingested pages persist).
+                if job.resumable and job.jobdir is not None:
+                    shutil.rmtree(job.jobdir, ignore_errors=True)
                 return
 
             # Process exited — check if job was deleted during wait.
@@ -299,6 +359,20 @@ class JobManager:
             else:
                 job.status = "failed"
                 job.error = f"Process exited with code {job.process.returncode}"
+
+            # Resumable JOBDIR lifecycle:
+            #  - "finished" (frontier drained -> whole site crawled): delete it, so the
+            #    next crawl of this domain starts fresh and re-detects changes.
+            #  - a GRACEFUL pause (closespider_timeout/itemcount -- close_reason present):
+            #    keep it, so the next session resumes the frontier.
+            #  - NO graceful close (close_reason absent: killed / OOM / crash before the
+            #    spider could flush its disk queue): delete it. A half-written frontier
+            #    must not be resumed (corrupt); re-crawl fresh. The pages ingested so
+            #    far already persist in the corpus, so no fetched work is lost.
+            if job.resumable and job.jobdir is not None:
+                close_reason = status_data.get("close_reason") if status_data else None
+                if close_reason == "finished" or close_reason is None:
+                    shutil.rmtree(job.jobdir, ignore_errors=True)
 
             now = time.time()
             if job.status == "completed":
@@ -472,6 +546,7 @@ class JobManager:
             "delay": job.delay,
             "profile": job.profile,
             "emit_content": job.emit_content,
+            "resumable": job.resumable,
             "urls_discovered": status_data.get("urls_discovered", 0),
             "urls_crawled": status_data.get("urls_crawled", 0),
             # Scrapy close reason (None until the crawl closes). Lets a consumer
