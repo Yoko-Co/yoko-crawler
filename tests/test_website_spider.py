@@ -412,3 +412,53 @@ class TestEnrichmentGating:
         assert row["main_content_extracted"] is False
         assert row["iframe_hosts"] == []
         assert ENRICHMENT_FIELDS.issubset(row)
+
+
+class TestUnwantedParamStripping:
+    """Query-param dedup (issue #8): non-content params collapse to the base URL, both
+    when emitting (so /x/ and /x/?s= aren't two pages) and when scheduling (so the ?s=
+    variant isn't even crawled). Meaningful params survive."""
+
+    def _emit(self, spider, url):
+        return spider.normalize_url(url, exclude_params=spider.exclude_params_emit)
+
+    def _schedule(self, spider, url):
+        return spider.normalize_url(url, exclude_params=spider.exclude_params_schedule)
+
+    def test_empty_wp_search_collapses_on_emit(self, spider):
+        # The GVF doubling: every page appeared as /x/ AND /x/?s=.
+        assert self._emit(spider, "https://example.com/x/?s=") == self._emit(spider, "https://example.com/x/")
+
+    def test_wp_search_with_value_collapses(self, spider):
+        # Search-results variants are not content pages -> collapse any ?s= value.
+        assert self._emit(spider, "https://example.com/x/?s=vitiligo") == self._emit(spider, "https://example.com/x/")
+
+    def test_s_is_stripped_from_scheduling_too(self, spider):
+        # Not just deduped on emit -- the ?s= variant normalizes to the base for scheduling,
+        # so the dupefilter treats it as already-seen and it is never crawled.
+        assert "s" in spider.exclude_params_schedule
+        assert self._schedule(spider, "https://example.com/x/?s=") == self._schedule(spider, "https://example.com/x/")
+
+    def test_wp_comment_params_collapse(self, spider):
+        assert self._emit(spider, "https://example.com/post/?replytocom=42") == self._emit(spider, "https://example.com/post/")
+
+    def test_meaningful_param_is_preserved(self, spider):
+        # A curated denylist only -- an unknown param (e.g. a store item id) must survive.
+        out = self._emit(spider, "https://example.com/product/?product_id=5")
+        assert "product_id=5" in out
+
+    def test_search_param_appended_to_pdf_collapses(self, spider):
+        # GVF even appended ?s= to a PDF URL; the variant must collapse onto the asset.
+        assert self._emit(spider, "https://example.com/file.pdf?s=") == self._emit(spider, "https://example.com/file.pdf")
+
+    def test_s_is_case_insensitive(self, spider):
+        # key.lower() -> ?S= collapses too.
+        assert self._emit(spider, "https://example.com/x/?S=") == self._emit(spider, "https://example.com/x/")
+
+    def test_search_key_collapses(self, spider):
+        assert self._emit(spider, "https://example.com/x/?search=vitiligo") == self._emit(spider, "https://example.com/x/")
+
+    def test_denylisted_dropped_while_sibling_kept(self, spider):
+        # The drop-one-keep-the-other path: ?s= dropped, a meaningful param survives.
+        out = self._emit(spider, "https://example.com/x/?s=q&id=5")
+        assert "id=5" in out and "s=q" not in out
