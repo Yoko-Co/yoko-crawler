@@ -21,6 +21,7 @@ Design decisions (see docs/plans/...-crawler-corpus-enrichment-plan.md):
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 import unicodedata
@@ -59,7 +60,20 @@ _MAIN_CAPTURE_THRESHOLD = 0.8
 _MAX_LOCATE_CANDIDATES = 250
 
 # Elements whose text is never page content; dropped before counting/matching.
-_NONCONTENT_TAGS = ("script", "style", "noscript", "template")
+# `svg` is here so icon/logo markup (and any inline <text>) never inflates word counts.
+_NONCONTENT_TAGS = ("script", "style", "noscript", "template", "svg")
+
+# Site chrome dropped from the counting subtree ON THE BODY-FALLBACK PATH ONLY (issue #9):
+# when main-content extraction fails we count over the whole <body>, which otherwise counts
+# the nav bar, footer, and per-page search box -- inflating word/link/anchor/form counts and
+# falsely tripping the complexity thresholds on essentially every page. `nav`/`aside` and the
+# ARIA landmark roles are unambiguous chrome; `header`/`footer` are stripped ONLY when not
+# inside <main>/<article> (an article's own <header> carries the title/H1, which IS content).
+# body_subtree (page-wide embed detection) keeps the FULL body, so a footer tracking iframe
+# is still caught.
+_CHROME_TAGS = ("nav", "aside")
+_CHROME_ROLES = frozenset({"navigation", "banner", "contentinfo", "search"})
+_CONTENT_ANCESTOR_TAGS = frozenset({"main", "article"})
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -175,6 +189,39 @@ def _parse_body(body: bytes) -> etree._Element | None:
 
     body_el = root.find(".//body")
     return body_el if body_el is not None else root
+
+
+def _within_content(el: etree._Element) -> bool:
+    """True when `el` is inside a <main>/<article> region -- an article's own header/footer
+    (title/H1, byline) is content, not chrome, so it must not be stripped."""
+    for ancestor in el.iterancestors():
+        if isinstance(ancestor.tag, str) and ancestor.tag.lower() in _CONTENT_ANCESTOR_TAGS:
+            return True
+    return False
+
+
+def _dechrome(body_el: etree._Element) -> etree._Element:
+    """Return a COPY of `body_el` with site chrome removed, for structural counting on the
+    body-fallback path (issue #9). Drops nav/aside, ARIA landmark roles
+    (navigation/banner/contentinfo/search), and header/footer that are NOT inside
+    <main>/<article>. Operates on a deep copy so the caller's `body_subtree` (used for
+    page-wide embed detection) is untouched. Collect-then-drop with a parent check so
+    dropping an ancestor first doesn't double-drop a nested match."""
+    clone = copy.deepcopy(body_el)
+    to_drop = []
+    for el in clone.iter():
+        if not isinstance(el.tag, str):
+            continue  # comments / processing instructions
+        tag = el.tag.lower()
+        role = (el.get("role") or "").strip().lower()
+        if tag in _CHROME_TAGS or role in _CHROME_ROLES:
+            to_drop.append(el)
+        elif tag in ("header", "footer") and not _within_content(el):
+            to_drop.append(el)
+    for el in to_drop:
+        if el.getparent() is not None:  # skip anything already removed with an ancestor
+            el.drop_tree()
+    return clone
 
 
 def _extract_main_text(body: bytes) -> str | None:
@@ -385,16 +432,18 @@ def extract_content(body: bytes) -> ExtractionResult:
 
     main_text = _extract_main_text(body)
     if main_text is None:
-        # Extraction failed/empty: body-scope counts, hash the body text.
+        # Extraction failed/empty: body-scope counts over a DE-CHROMED copy (issue #9) so
+        # nav/footer/search-box don't inflate the counts, but hash the full body text and
+        # keep the full body for page-wide embed detection.
         return ExtractionResult(
-            body_el, body_el, False, normalize_content_text(body_el.text_content())
+            _dechrome(body_el), body_el, False, normalize_content_text(body_el.text_content())
         )
 
     normalized = normalize_content_text(main_text)
     subtree = _locate_main_subtree(body_el, main_text)
     if subtree is None:
-        # Extracted text but couldn't pinpoint the region: count over <body>,
-        # but still hash the (better) main text.
-        return ExtractionResult(body_el, body_el, False, normalized)
+        # Extracted text but couldn't pinpoint the region: count over the de-chromed <body>
+        # (issue #9), but still hash the (better) main text.
+        return ExtractionResult(_dechrome(body_el), body_el, False, normalized)
 
     return ExtractionResult(subtree, body_el, True, normalized)

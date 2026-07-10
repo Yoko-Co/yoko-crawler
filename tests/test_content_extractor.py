@@ -373,13 +373,18 @@ class TestExtractContentLocation:
 
     def test_text_extracted_but_no_container_clears_threshold(self, monkeypatch):
         # trafilatura returns real text, but force location to find no qualifying
-        # container: counts fall back to <body>, but the (better) main text is
-        # still hashed (normalized_text non-empty).
+        # container: counts fall back to the DE-CHROMED <body> (issue #9), but the (better)
+        # main text is still hashed (normalized_text non-empty).
         monkeypatch.setattr(ce, "_locate_main_subtree", lambda body_el, main: None)
         result = extract_content(ARTICLE_HTML)
         assert result.main_content_extracted is False
         assert result.normalized_text  # main text retained for hashing
-        assert result.subtree is result.body_subtree
+        # subtree is now a de-chromed COPY of the body (not the body itself), so chrome is
+        # excluded from counts while the full body stays intact for page-wide signals.
+        assert result.subtree is not result.body_subtree
+        assert "NAVHOME" not in result.subtree.text_content()
+        assert "FOOTERCOPYRIGHT" not in result.subtree.text_content()
+        assert "FOOTERCOPYRIGHT" in result.body_subtree.text_content()
 
     def test_div_soup_over_cap_falls_back_to_body(self, monkeypatch):
         # When generic candidates exceed the cap, locating gives up (body-scope)
@@ -445,3 +450,84 @@ class TestMemoryHygiene:
             again = extract_content(ARTICLE_HTML)
             assert again.normalized_text == first.normalized_text
             assert again.main_content_extracted == first.main_content_extracted
+
+
+# Fallback page (no <main>/<article>, thin content) wrapped in heavy chrome: nav, a
+# banner header carrying the per-page search box, an aside, and a footer with a tracking
+# iframe. The real content is a short sentence with two links + a subscribe form.
+_FALLBACK_CHROME_HTML = b"""
+<!DOCTYPE html><html><head><title>T</title></head>
+<body>
+  <nav><a href="/n1">N1</a><a href="/n2">N2</a><a href="/n3">N3</a>
+       <a href="/n4">N4</a><a href="/n5">N5</a></nav>
+  <header role="banner">
+    <a href="/logo">LOGO</a>
+    <form role="search" action="/"><input name="s"></form>
+  </header>
+  <div class="entry">
+    <p>Read <a href="/one">one</a> and <a href="/two">two</a>.</p>
+    <form action="/subscribe"><input name="email"></form>
+  </div>
+  <aside><a href="/side">SIDE</a></aside>
+  <footer>
+    <a href="/f1">F1</a><a href="/f2">F2</a>
+    <iframe src="https://tracker.evil/x"></iframe>
+  </footer>
+</body></html>
+"""
+
+
+class TestChromeAwareCounting:
+    """issue #9: on the body-fallback path, structural counts exclude site chrome (nav /
+    banner header / aside / footer + the per-page search box) so they measure content, not
+    the theme -- while page-wide embed detection still sees chrome (a footer tracking
+    iframe)."""
+
+    def _counts(self, subtree):
+        return count_structure(subtree, "https://example.com/p", is_internal=_internal, asset_extensions=ASSET_EXTS)
+
+    def test_falls_back_and_strips_chrome_from_counts(self):
+        result = extract_content(_FALLBACK_CHROME_HTML)
+        assert result.main_content_extracted is False  # thin content -> body fallback
+        sub = self._counts(result.subtree)
+        # Only the content div survives: its 2 links + 1 real form. Nav/header/aside/footer
+        # links and the header search form are gone.
+        assert sub["link_count"] == 2
+        assert sub["form_count"] == 1
+
+    def test_body_subtree_still_carries_chrome(self):
+        # The full body (used for page-wide signals) is untouched -- proving the counts
+        # difference is real de-chroming, not a parse quirk.
+        result = extract_content(_FALLBACK_CHROME_HTML)
+        body = self._counts(result.body_subtree)
+        assert body["link_count"] > 2  # nav/footer/aside/logo links present in the body
+        assert body["form_count"] == 2  # search box + subscribe form
+
+    def test_footer_embed_still_detected_page_wide(self):
+        # The de-chroming must NOT hide a surprising embed: embed_signals runs over the full
+        # body, so the footer tracking iframe is still flagged.
+        result = extract_content(_FALLBACK_CHROME_HTML)
+        signals = embed_signals(result.body_subtree, BENIGN)
+        assert signals["embed_count_nonbenign"] == 1
+
+    def test_article_nested_header_footer_are_kept(self):
+        # An article's own <header>/<footer> (title/H1, byline) is content, not chrome.
+        body = lxml_html.fromstring(
+            b"<body><header><a href='/nav'>NAV</a></header>"
+            b"<article><header><h1><a href='/self'>Title</a></h1></header>"
+            b"<p>body</p><footer><a href='/byline'>By Someone</a></footer></article>"
+            b"<footer><a href='/site'>SITE</a></footer></body>"
+        )
+        dechromed = ce._dechrome(body)
+        hrefs = {a.get("href") for a in dechromed.xpath(".//a[@href]")}
+        assert "/self" in hrefs and "/byline" in hrefs  # article header/footer kept
+        assert "/nav" not in hrefs and "/site" not in hrefs  # site header/footer dropped
+
+    def test_svg_text_not_counted_as_words(self):
+        # <svg> is non-content: its inline text must not inflate the word count.
+        result = extract_content(
+            b"<html><body><div><p>Real words here plainly.</p>"
+            b"<svg><text>ICONWORDONE ICONWORDTWO ICONWORDTHREE</text></svg></div></body></html>"
+        )
+        # svg dropped in _parse_body, so its text is absent from both subtree and body.
+        assert "ICONWORD" not in result.subtree.text_content()
