@@ -66,14 +66,23 @@ _NONCONTENT_TAGS = ("script", "style", "noscript", "template", "svg")
 # Site chrome dropped from the counting subtree ON THE BODY-FALLBACK PATH ONLY (issue #9):
 # when main-content extraction fails we count over the whole <body>, which otherwise counts
 # the nav bar, footer, and per-page search box -- inflating word/link/anchor/form counts and
-# falsely tripping the complexity thresholds on essentially every page. `nav`/`aside` and the
-# ARIA landmark roles are unambiguous chrome; `header`/`footer` are stripped ONLY when not
-# inside <main>/<article> (an article's own <header> carries the title/H1, which IS content).
-# body_subtree (page-wide embed detection) keeps the FULL body, so a footer tracking iframe
-# is still caught.
-_CHROME_TAGS = ("nav", "aside")
+# falsely tripping the complexity thresholds on essentially every page. body_subtree
+# (page-wide embed detection) keeps the FULL body, so a footer tracking iframe is still caught.
+#
+# Two guards keep this from EATING real content -- which for a scoping tool is worse than
+# over-counting (a zeroed page reads falsely simple and under-quotes):
+#  1. `<article>` is the content-region signal, NOT `<main>` (page builders wrap the WHOLE
+#     body in one <main>, which would defeat the strip): chrome inside an <article> is that
+#     article's own header/footer/nav (title, byline, TOC) and is kept.
+#  2. `_holds_content`: a chrome candidate that actually holds content -- an <article>/<main>
+#     descendant, or substantial NON-LINK prose (real nav/footer/search is link-dense,
+#     prose-sparse) -- is kept, so a theme misusing <nav>/<aside>/role=contentinfo to wrap
+#     real content isn't silently emptied.
+_CHROME_TAGS = ("nav", "aside", "header", "footer")
 _CHROME_ROLES = frozenset({"navigation", "banner", "contentinfo", "search"})
-_CONTENT_ANCESTOR_TAGS = frozenset({"main", "article"})
+_CONTENT_ANCESTOR_TAGS = frozenset({"article"})
+# A chrome block with more non-link prose than this is likely mis-wrapped real content.
+_MIN_CHROME_PROSE_WORDS = 25
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -192,32 +201,54 @@ def _parse_body(body: bytes) -> etree._Element | None:
 
 
 def _within_content(el: etree._Element) -> bool:
-    """True when `el` is inside a <main>/<article> region -- an article's own header/footer
-    (title/H1, byline) is content, not chrome, so it must not be stripped."""
+    """True when `el` is inside an <article> -- an article's own header/footer/nav (title,
+    byline, table-of-contents) is content, not chrome, so it must not be stripped. `<main>`
+    is deliberately NOT a content signal here: page builders wrap the entire body in one
+    <main>, so exempting it would keep the site header/footer and defeat the strip."""
     for ancestor in el.iterancestors():
         if isinstance(ancestor.tag, str) and ancestor.tag.lower() in _CONTENT_ANCESTOR_TAGS:
             return True
     return False
 
 
+def _prose_word_count(el: etree._Element) -> int:
+    """Words of `el`'s text that are NOT inside a link. Real nav/footer/search is link-dense
+    with little prose; a block of real content wrapped in a chrome tag has prose."""
+    total = len(_WORD_RE.findall(" ".join(el.itertext())))
+    link_words = sum(len(_WORD_RE.findall(" ".join(a.itertext()))) for a in el.iterfind(".//a"))
+    return max(0, total - link_words)
+
+
+def _holds_content(el: etree._Element) -> bool:
+    """True when a chrome-tagged/role'd element actually holds main content (a theme misusing
+    a chrome element to wrap real content), so de-chroming must NOT drop it and zero out a
+    real page. Signals: an <article>/<main> descendant, or substantial non-link prose."""
+    if el.find(".//article") is not None or el.find(".//main") is not None:
+        return True
+    return _prose_word_count(el) >= _MIN_CHROME_PROSE_WORDS
+
+
+def _is_chrome(el: etree._Element) -> bool:
+    """Whether `el` is site chrome to drop on the body-fallback path: a nav/aside/header/
+    footer tag or a navigation/banner/contentinfo/search ARIA role, that is NOT inside an
+    <article> and does NOT itself hold real content."""
+    if not isinstance(el.tag, str):
+        return False  # comments / processing instructions
+    tag = el.tag.lower()
+    role = (el.get("role") or "").strip().lower()
+    if tag not in _CHROME_TAGS and role not in _CHROME_ROLES:
+        return False
+    return not _within_content(el) and not _holds_content(el)
+
+
 def _dechrome(body_el: etree._Element) -> etree._Element:
     """Return a COPY of `body_el` with site chrome removed, for structural counting on the
-    body-fallback path (issue #9). Drops nav/aside, ARIA landmark roles
-    (navigation/banner/contentinfo/search), and header/footer that are NOT inside
-    <main>/<article>. Operates on a deep copy so the caller's `body_subtree` (used for
-    page-wide embed detection) is untouched. Collect-then-drop with a parent check so
-    dropping an ancestor first doesn't double-drop a nested match."""
+    body-fallback path (issue #9). See the chrome constants above for the tag/role set and
+    the two content-preservation guards. Operates on a deep copy so the caller's
+    `body_subtree` (page-wide embed detection) is untouched. Collect-then-drop with a parent
+    check so dropping an ancestor first doesn't double-drop a nested match."""
     clone = copy.deepcopy(body_el)
-    to_drop = []
-    for el in clone.iter():
-        if not isinstance(el.tag, str):
-            continue  # comments / processing instructions
-        tag = el.tag.lower()
-        role = (el.get("role") or "").strip().lower()
-        if tag in _CHROME_TAGS or role in _CHROME_ROLES:
-            to_drop.append(el)
-        elif tag in ("header", "footer") and not _within_content(el):
-            to_drop.append(el)
+    to_drop = [el for el in clone.iter() if _is_chrome(el)]
     for el in to_drop:
         if el.getparent() is not None:  # skip anything already removed with an ancestor
             el.drop_tree()

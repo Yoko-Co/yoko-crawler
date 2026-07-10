@@ -531,3 +531,73 @@ class TestChromeAwareCounting:
         )
         # svg dropped in _parse_body, so its text is absent from both subtree and body.
         assert "ICONWORD" not in result.subtree.text_content()
+
+    def test_content_misplaced_in_a_chrome_tag_is_not_zeroed(self):
+        # P1 guard: a theme that wraps REAL content in <nav> must NOT be de-chromed to empty
+        # (false-simple under-scopes a real project -- worse than over-counting).
+        html = (
+            b"<html><body><nav><h1>My Great Article Title</h1>"
+            b"<p>The northern coastline holds dozens of tide pools that fill and drain with "
+            b"each turning of the sea, revealing anemones and hermit crabs to visitors.</p>"
+            b"</nav></body></html>"
+        )
+        result = extract_content(html)
+        assert result.main_content_extracted is False  # trafilatura calls nav boilerplate
+        # The nav holds real prose, so it's kept -- the page is not zeroed.
+        assert "tide pools" in result.subtree.text_content()
+        assert self._counts(result.subtree)["word_count"] > 20
+
+    def test_role_wrapper_around_an_article_is_kept(self):
+        # P1 guard: a misused role=contentinfo wrapping a real <article> must not delete it.
+        html = (
+            b"<html><body><div role='contentinfo'><article><h1>Report</h1>"
+            b"<p>Substantial article content that should survive de-chroming entirely.</p>"
+            b"</article></div></body></html>"
+        )
+        result = extract_content(html)
+        assert "Substantial article content" in result.subtree.text_content()
+
+    def test_body_wrapping_main_still_drops_site_header_and_footer(self):
+        # P2 fix: a page builder wraps the whole body in one <main>; <main> is NOT a content
+        # signal, so the link-dense site header/footer inside it are still stripped.
+        html = (
+            b"<html><body><main>"
+            b"<header><a href='/h1'>H1</a><a href='/h2'>H2</a><a href='/h3'>H3</a></header>"
+            b"<div class='c'><p>Read <a href='/one'>one</a>.</p></div>"
+            b"<footer><a href='/f1'>F1</a><a href='/f2'>F2</a></footer>"
+            b"</main></body></html>"
+        )
+        result = extract_content(html)
+        assert result.main_content_extracted is False
+        assert self._counts(result.subtree)["link_count"] == 1  # only the content link
+
+    def test_in_article_nav_is_kept(self):
+        # An article's own table-of-contents <nav> is content, not chrome.
+        body = lxml_html.fromstring(
+            b"<body><nav><a href='/site'>SITE</a></nav>"
+            b"<article><nav><a href='#s1'>Section 1</a></nav><p>body</p></article></body>"
+        )
+        dechromed = ce._dechrome(body)
+        hrefs = {a.get("href") for a in dechromed.xpath(".//a[@href]")}
+        assert "#s1" in hrefs  # in-article TOC nav kept
+        assert "/site" not in hrefs  # site nav dropped
+
+    def test_all_chrome_page_counts_zero_but_hash_is_non_empty(self):
+        # A menu/sitemap page (only nav + footer) de-chromes to empty counts, but the hash
+        # still reflects the full body text (change detection unaffected). Documents the
+        # intentional word_count=0 / content_hash!="" state for a chrome-only HTML page --
+        # distinct from empty_enrichment (hash="") which means a non-HTML/no-body row.
+        html = b"<html><body><nav><a href='/a'>A</a><a href='/b'>B</a></nav><footer>Copyright</footer></body></html>"
+        result = extract_content(html)
+        assert self._counts(result.subtree)["link_count"] == 0
+        assert result.normalized_text != ""  # hash input non-empty
+
+    def test_div_soup_chrome_is_not_stripped_known_limitation(self):
+        # Documented limitation: non-semantic chrome (<div class='menu'>) has no tag/role
+        # signal, so it is NOT stripped -- the fix helps semantic-HTML sites only.
+        body = lxml_html.fromstring(
+            b"<body><div class='menu'><a href='/a'>A</a><a href='/b'>B</a></div><p>x</p></body>"
+        )
+        dechromed = ce._dechrome(body)
+        hrefs = {a.get("href") for a in dechromed.xpath(".//a[@href]")}
+        assert "/a" in hrefs and "/b" in hrefs  # div-soup nav survives (limitation)
