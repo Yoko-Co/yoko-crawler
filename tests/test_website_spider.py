@@ -243,6 +243,18 @@ class TestEmitSchema:
         assert row["word_count"] > 0
         assert len(row["content_hash"]) == 64
 
+    def test_html_row_carries_component_count(self):
+        # issue #12: a page with a slider emits component_count on the row.
+        body = (
+            '<html><head><title>t</title></head><body><main><article><p>'
+            + "word " * 60 +
+            '</p></article></main><div class="swiper"><div class="swiper-slide">a</div></div>'
+            '</body></html>'
+        ).encode("utf-8")
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_response(body=body, url="https://example.com/slides"))
+        assert row["component_count"] == 1
+
     def test_asset_row_has_default_enrichment(self):
         spider = WebsiteSpider(domain="example.com")
         row = _emit_one(spider, _asset_response())

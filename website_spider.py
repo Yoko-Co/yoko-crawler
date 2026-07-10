@@ -10,6 +10,7 @@ from scrapy.http import TextResponse
 
 from content_extractor import (
     content_hash,
+    component_signals,
     count_structure,
     embed_signals,
     empty_enrichment,
@@ -365,11 +366,14 @@ class WebsiteSpider(scrapy.Spider):
                 # Embeds are page-wide: surprising iframes live in headers,
                 # footers, and sidebars, not just the main content region.
                 signals = embed_signals(result.body_subtree, self.benign_hosts)
+                # Interactive JS components are page-wide too (issue #12).
+                components = component_signals(result.body_subtree)
                 fields = empty_enrichment()
                 fields.update(counts)
                 fields["content_hash"] = content_hash(result.normalized_text)
                 fields["main_content_extracted"] = result.main_content_extracted
                 fields["embed_count_nonbenign"] = signals["embed_count_nonbenign"]
+                fields["component_count"] = components["component_count"]
                 fields["iframe_hosts"] = signals["iframe_hosts"]
                 content_text = result.normalized_text
             except Exception:

@@ -109,6 +109,10 @@ ENRICHMENT_FIELD_NAMES = (
     "iframe_count",
     "heading_count",
     "embed_count_nonbenign",
+    # Count of interactive JS components (sliders/carousels/accordions/tabs/galleries/
+    # lightboxes) detected by container markers (issue #12). Real design+dev work that is
+    # otherwise invisible (JS-hydrated) or laundered into word/image counts.
+    "component_count",
     "iframe_hosts",
     # The page's <link rel="canonical"> target, normalized (issue #10). "" when absent.
     # Downstream (yoko-corpus) uses it to collapse query-string/pagination/variant URLs to
@@ -411,6 +415,42 @@ def count_structure(
         "iframe_count": _count(".//iframe"),
         "heading_count": _count(".//h1|.//h2|.//h3|.//h4|.//h5|.//h6"),
     }
+
+
+# Container class tokens for common interactive JS components (issue #12). Matched as
+# whitespace-separated CLASS TOKENS (not substrings) so a slider's child parts
+# (`swiper-slide`, `carousel-item`) don't inflate the count -- only the container matches.
+_COMPONENT_CLASS_TOKENS = (
+    "swiper", "swiper-container", "slick-slider", "carousel", "splide", "owl-carousel",
+    "flickity-enabled", "flexslider", "tns-slider", "accordion", "lightbox", "fancybox",
+    "galleria", "lightgallery", "masonry", "nav-tabs",
+)
+# CONTAINER-level attribute markers only. Per-ITEM markers (`data-fancybox` on each gallery
+# link, `data-toggle=tab` on each tab button) are deliberately excluded -- they'd count once
+# per trigger, inflating one gallery/tab set into N components. Tab widgets are still caught
+# by the container (`nav-tabs` class + `role=tablist`); a bare per-link Fancybox gallery with
+# no container class is missed (acceptable -- a miss beats a 10x over-count for a scoping
+# signal, and class-based galleries lightbox/galleria/lightgallery/masonry are still caught).
+_COMPONENT_ATTR_PREDICATES = (
+    "@data-slider", "@data-carousel", "@role='tablist'",
+)
+# descendant-or-self so the passed subtree is counted if it is itself a component container
+# (robust regardless of what element the caller passes).
+_COMPONENT_XPATH = "descendant-or-self::*[" + " or ".join(
+    [f"contains(concat(' ', normalize-space(@class), ' '), ' {t} ')" for t in _COMPONENT_CLASS_TOKENS]
+    + list(_COMPONENT_ATTR_PREDICATES)
+) + "]"
+
+
+def component_signals(subtree: etree._Element) -> dict:
+    """Count interactive JS components (sliders/carousels/accordions/tabs/galleries/
+    lightboxes) over ``subtree`` (the full page <body> -- a slider lives anywhere). Matches
+    a curated set of CONTAINER class tokens + attribute markers; distinct matched elements
+    are counted (xpath returns a unique node set), so one component with several markers
+    counts once and a slider's child slides don't count at all. Detection is over the raw
+    pre-JS HTML, so it catches components declared in markup (the common case for these
+    libraries) even though they hydrate client-side. issue #12."""
+    return {"component_count": len(subtree.xpath(_COMPONENT_XPATH))}
 
 
 def embed_signals(

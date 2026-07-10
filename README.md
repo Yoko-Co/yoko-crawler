@@ -161,7 +161,7 @@ including `random`). Pass `--user-agent` only to deliberately override it.
 > TLS fingerprinting — use `--impersonate chrome`.
 
 ```json
-{"url": "https://example.com/about", "status": 200, "last_modified": "", "redirected_to": "", "referrer": "https://example.com/", "content_hash": "9f86d0…", "main_content_extracted": true, "word_count": 412, "link_count": 18, "internal_link_count": 15, "external_link_count": 3, "pdf_link_count": 2, "asset_link_count": 2, "anchor_link_count": 0, "image_count": 4, "table_count": 0, "form_count": 1, "iframe_count": 1, "heading_count": 6, "embed_count_nonbenign": 0, "iframe_hosts": ["www.youtube.com"], "canonical": "https://example.com/about"}
+{"url": "https://example.com/about", "status": 200, "last_modified": "", "redirected_to": "", "referrer": "https://example.com/", "content_hash": "9f86d0…", "main_content_extracted": true, "word_count": 412, "link_count": 18, "internal_link_count": 15, "external_link_count": 3, "pdf_link_count": 2, "asset_link_count": 2, "anchor_link_count": 0, "image_count": 4, "table_count": 0, "form_count": 1, "iframe_count": 1, "heading_count": 6, "embed_count_nonbenign": 0, "component_count": 2, "iframe_hosts": ["www.youtube.com"], "canonical": "https://example.com/about"}
 ```
 
 ### Original fields (unchanged)
@@ -185,6 +185,7 @@ These fields are present on **every** row. For non-HTML rows (assets fetched HEA
 - **anchor_link_count** — in-page jump links (`#frag`, or a link resolving to the current page plus a fragment).
 - **image_count**, **table_count**, **form_count**, **iframe_count** — `<img>`/`<table>`/`<form>`/`<iframe>` in the main content.
 - **embed_count_nonbenign** — iframes whose host is **not** on the benign-embed allowlist (the "surprise embed" signal: Tableau, data dashboards, unknown hosts — excludes routine video/map embeds). Computed page-wide (header/footer/sidebar embeds count, not just main content). Allowlist-relative — it can change across crawls if the allowlist changes; `iframe_hosts` is the durable signal for cross-crawl comparison.
+- **component_count** — count of interactive JS components (sliders/carousels/accordions/tabs/galleries/lightboxes) detected by container markers (issue #12). Real design+dev work otherwise invisible (JS-hydrated) or laundered into word/image counts.
 - **iframe_hosts** — distinct hostnames of all `<iframe src>`. The durable raw signal; downstream consumers can re-classify it even if the allowlist changes. A real JSON array in `jsonlines`; JSON-encoded into a string for `csv`.
 - **content_text** — the extracted main-content text. **Present only when `--emit-content` / `emit_content: true` is set.** Its absence means "not requested," not "empty."
 
