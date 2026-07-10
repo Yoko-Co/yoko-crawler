@@ -550,3 +550,35 @@ class TestCanonical:
         spider = WebsiteSpider(domain="example.com")
         row = _emit_one(spider, _asset_response())
         assert row["canonical"] == ""
+
+    def test_self_referential_canonical_equals_emit_url(self):
+        # Load-bearing for corpus #26: a page canonical'd to itself must yield
+        # canonical == the emitted url field (same normalization on both sides).
+        spider = WebsiteSpider(domain="example.com")
+        url = "https://example.com/page/?utm_source=x"
+        row = _emit_one(spider, _html_with_canonical("https://example.com/page/", url=url))
+        assert row["canonical"] == row["url"]
+
+    def test_multitoken_and_uppercase_rel_still_match(self):
+        # Fresh spider per case (same URL would be deduped by _emit_row's `emitted` set).
+        for rel in ["canonical alternate", "CANONICAL"]:
+            spider = WebsiteSpider(domain="example.com")
+            body = (
+                '<html><head><link rel="' + rel + '" href="https://example.com/a">'
+                '</head><body><main><article><p>' + "word " * 60 +
+                '</p></article></main></body></html>'
+            ).encode("utf-8")
+            row = _emit_one(spider, _html_response(body=body, url="https://example.com/p"))
+            assert row["canonical"] == "https://example.com/a", rel
+
+    def test_canonical_emitted_even_when_extraction_fails(self, monkeypatch):
+        # Independence: a canonical is still emitted alongside empty/zero counts when the
+        # body extraction raises.
+        import content_extractor as ce
+        monkeypatch.setattr(ce, "extract_content", lambda body: (_ for _ in ()).throw(RuntimeError("boom")))
+        import website_spider as ws
+        monkeypatch.setattr(ws, "extract_content", ce.extract_content)
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("https://example.com/canon"))
+        assert row["canonical"] == "https://example.com/canon"
+        assert row["content_hash"] == "" and row["word_count"] == 0  # counts defaulted
