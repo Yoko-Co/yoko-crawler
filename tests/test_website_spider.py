@@ -479,6 +479,11 @@ class TestNavigationalHref:
     def test_percent20_mangled_mailto_rejected(self, spider):
         assert spider.is_navigational_href("mail%20to:info@example.com") is False
 
+    def test_encoded_whitespace_and_bom_mangled_mailto_rejected(self, spider):
+        # Review hardening: %09/%0a encoded whitespace and a leading BOM also collapse.
+        for h in ("mail%09to:info@x", "mail%0Ato:info@x", "\ufeffmailto:info@x"):
+            assert spider.is_navigational_href(h) is False, h
+
     def test_mailto_case_insensitive(self, spider):
         assert spider.is_navigational_href("MAILTO:X@Y.COM") is False
 

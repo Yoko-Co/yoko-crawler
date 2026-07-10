@@ -186,7 +186,10 @@ class WebsiteSpider(scrapy.Spider):
         uses the original href."""
         if not href:
             return False
-        collapsed = re.sub(r"(?:\s|%20)+", "", href, flags=re.IGNORECASE).lower()
+        # Collapse literal AND percent-encoded whitespace (and a leading BOM) so a scheme
+        # split by any of them still resolves -- `mail to:`, `mail%20to:`, `mail%09to:`.
+        collapsed = re.sub(r"(?:\s|%20|%09|%0a|%0d)+", "", href, flags=re.IGNORECASE)
+        collapsed = collapsed.lstrip("\ufeff\u200b\x00").lower()  # BOM / zero-width / NUL
         if not collapsed or collapsed.startswith("#"):
             return False
         return not collapsed.startswith(self._NONNAV_SCHEMES)
