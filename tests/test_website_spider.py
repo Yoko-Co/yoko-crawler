@@ -462,3 +462,49 @@ class TestUnwantedParamStripping:
         # The drop-one-keep-the-other path: ?s= dropped, a meaningful param survives.
         out = self._emit(spider, "https://example.com/x/?s=q&id=5")
         assert "id=5" in out and "s=q" not in out
+
+
+class TestNavigationalHref:
+    """issue #11: only http(s)-navigational hrefs become crawl targets. Non-navigational
+    schemes -- including MALFORMED ones a space/%20 would smuggle past urljoin as a path --
+    are skipped."""
+
+    def test_well_formed_mailto_rejected(self, spider):
+        assert spider.is_navigational_href("mailto:info@example.com") is False
+
+    def test_space_mangled_mailto_rejected(self, spider):
+        # The GVF case: <a href="mail to:info@x"> would urljoin to '.../mail%20to:info@x'.
+        assert spider.is_navigational_href("mail to:info@example.com") is False
+
+    def test_percent20_mangled_mailto_rejected(self, spider):
+        assert spider.is_navigational_href("mail%20to:info@example.com") is False
+
+    def test_encoded_whitespace_and_bom_mangled_mailto_rejected(self, spider):
+        # Review hardening: %09/%0a encoded whitespace and a leading BOM also collapse.
+        for h in ("mail%09to:info@x", "mail%0Ato:info@x", "\ufeffmailto:info@x"):
+            assert spider.is_navigational_href(h) is False, h
+
+    def test_mailto_case_insensitive(self, spider):
+        assert spider.is_navigational_href("MAILTO:X@Y.COM") is False
+
+    def test_other_nonnav_schemes_rejected(self, spider):
+        for h in ("tel:+15551234", "sms:15551234", "javascript:void(0)", "data:text/html,x", "callto:x", "file:///etc"):
+            assert spider.is_navigational_href(h) is False, h
+
+    def test_empty_and_fragment_rejected(self, spider):
+        assert spider.is_navigational_href("") is False
+        assert spider.is_navigational_href(None) is False
+        assert spider.is_navigational_href("#section") is False
+
+    def test_normal_urls_are_navigational(self, spider):
+        for h in ("/about", "https://example.com/x", "http://example.com/y", "articles/1", "../up"):
+            assert spider.is_navigational_href(h) is True, h
+
+    def test_space_in_path_is_navigational(self, spider):
+        # A space in the PATH (not a mangled scheme) is a real URL -- collapse is only for
+        # scheme detection; the real urljoin handles the space.
+        assert spider.is_navigational_href("/files/my report.pdf") is True
+
+    def test_tel_as_path_segment_is_navigational(self, spider):
+        # '/tel/...' is a path, not the tel: scheme.
+        assert spider.is_navigational_href("/tel/directory") is True
