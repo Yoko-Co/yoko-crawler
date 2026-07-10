@@ -370,6 +370,18 @@ class WebsiteSpider(scrapy.Spider):
                 self.logger.exception("Enrichment failed for %s", response.url)
                 fields = empty_enrichment()
                 content_text = ""
+            # Canonical (issue #10) is a <head> concern, independent of the body-scoped
+            # counts -- extract it separately (reusing parsel's already-parsed tree) and
+            # best-effort, so a bad canonical can never drop the row's real counts.
+            try:
+                canon_href = response.css("link[rel='canonical']::attr(href)").get()
+                if canon_href and canon_href.strip():
+                    fields["canonical"] = self.normalize_url(
+                        response.urljoin(canon_href.strip()),
+                        exclude_params=self.exclude_params_emit,
+                    )
+            except Exception:
+                self.logger.debug("canonical extraction failed for %s", response.url)
         else:
             fields = empty_enrichment()
 

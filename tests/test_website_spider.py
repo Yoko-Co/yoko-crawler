@@ -508,3 +508,45 @@ class TestNavigationalHref:
     def test_tel_as_path_segment_is_navigational(self, spider):
         # '/tel/...' is a path, not the tel: scheme.
         assert spider.is_navigational_href("/tel/directory") is True
+
+
+def _html_with_canonical(canon_href, url="https://example.com/page"):
+    body = (
+        '<html><head><link rel="canonical" href="' + canon_href + '">'
+        '<title>t</title></head><body><main><article><p>'
+        + "word " * 60 +
+        '</p></article></main></body></html>'
+    ).encode("utf-8")
+    return _html_response(body=body, url=url)
+
+
+class TestCanonical:
+    """issue #10: the page's <link rel=canonical> is emitted, normalized like any URL, so
+    yoko-corpus can collapse query-string/variant URLs onto their canonical page."""
+
+    def test_absolute_canonical_normalized(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("https://example.com/canonical-page"))
+        assert row["canonical"] == "https://example.com/canonical-page"
+
+    def test_relative_canonical_resolved(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("/canon", url="https://example.com/some/path"))
+        assert row["canonical"] == "https://example.com/canon"
+
+    def test_canonical_junk_params_stripped(self):
+        # Normalized with the same emit rules -> the ?s= that #8 strips is stripped here too,
+        # so a canonical pointing at a clean page compares equal to that page's emit URL.
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("https://example.com/p?utm_source=x&s="))
+        assert row["canonical"] == "https://example.com/p"
+
+    def test_absent_canonical_is_empty(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_response())  # ARTICLE_PAGE has no canonical
+        assert row["canonical"] == ""
+
+    def test_asset_row_canonical_empty(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _asset_response())
+        assert row["canonical"] == ""

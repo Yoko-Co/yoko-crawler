@@ -161,7 +161,7 @@ including `random`). Pass `--user-agent` only to deliberately override it.
 > TLS fingerprinting — use `--impersonate chrome`.
 
 ```json
-{"url": "https://example.com/about", "status": 200, "last_modified": "", "redirected_to": "", "referrer": "https://example.com/", "content_hash": "9f86d0…", "main_content_extracted": true, "word_count": 412, "link_count": 18, "internal_link_count": 15, "external_link_count": 3, "pdf_link_count": 2, "asset_link_count": 2, "anchor_link_count": 0, "image_count": 4, "table_count": 0, "form_count": 1, "iframe_count": 1, "heading_count": 6, "embed_count_nonbenign": 0, "iframe_hosts": ["www.youtube.com"]}
+{"url": "https://example.com/about", "status": 200, "last_modified": "", "redirected_to": "", "referrer": "https://example.com/", "content_hash": "9f86d0…", "main_content_extracted": true, "word_count": 412, "link_count": 18, "internal_link_count": 15, "external_link_count": 3, "pdf_link_count": 2, "asset_link_count": 2, "anchor_link_count": 0, "image_count": 4, "table_count": 0, "form_count": 1, "iframe_count": 1, "heading_count": 6, "embed_count_nonbenign": 0, "iframe_hosts": ["www.youtube.com"], "canonical": "https://example.com/about"}
 ```
 
 ### Original fields (unchanged)
@@ -178,6 +178,7 @@ These fields are present on **every** row. For non-HTML rows (assets fetched HEA
 
 - **content_hash** — SHA-256 (hex) of the page's normalized main-content text, for change detection. Empty string for non-HTML rows.
 - **main_content_extracted** — `true` when the counts are scoped to a located main region; `false` when they fall back to the `<body>` (or the row is non-HTML). On the fallback, site chrome (`<nav>`/`<aside>`/`<header>`/`<footer>` tags and navigation/banner/contentinfo/search ARIA roles) is excluded from the counts (issue #9) so the nav bar and per-page search box don't inflate word/link/form counts. Two guards keep it from eating real content (a zeroed page would read falsely simple): chrome inside an `<article>` is kept (that article's own title/byline/TOC), and any chrome block that actually holds content — an `<article>`/`<main>` descendant or substantial non-link prose — is kept. Known limitation: non-semantic chrome (`<div class="menu">`) has no tag/role signal and is not stripped.
+- **canonical** — the page's `<link rel="canonical">` target, resolved to absolute and normalized like any URL (issue #10; `""` when absent). Lets the corpus collapse query-string/pagination/variant URLs onto their canonical page.
 - **word_count**, **heading_count** — words and `<h1>`–`<h6>` in the main content.
 - **link_count**, **internal_link_count**, **external_link_count** — `<a href>` links, split by the spider's internal/external rule.
 - **pdf_link_count**, **asset_link_count** — links whose target ends in `.pdf` / any known asset extension (`.pdf` counts as both).
