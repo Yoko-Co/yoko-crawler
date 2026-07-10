@@ -109,6 +109,14 @@ class WebsiteSpider(scrapy.Spider):
     # Separable so we can treat pagination differently for scheduling vs emitting
     PAGINATION_PARAMS = {"page", "p", "offset", "start", "sort", "order", "dir"}
 
+    # <link rel=canonical> href, matched case-insensitively and as a whitespace-separated
+    # token (so `rel="canonical alternate"` and `rel="CANONICAL"` both match). issue #10.
+    _CANONICAL_XPATH = (
+        "//link[contains(concat(' ', "
+        "translate(@rel, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+        "' '), ' canonical ')]/@href"
+    )
+
     def __init__(self, *args, **kwargs):
         """
         Spider args:
@@ -370,6 +378,20 @@ class WebsiteSpider(scrapy.Spider):
                 self.logger.exception("Enrichment failed for %s", response.url)
                 fields = empty_enrichment()
                 content_text = ""
+            # Canonical (issue #10) is a <head> concern, independent of the body-scoped
+            # counts -- extract it separately (reusing parsel's already-parsed tree) and
+            # best-effort, so a bad canonical can never drop the row's real counts. XPath
+            # (not [rel='canonical']) so a multi-token `rel="canonical alternate"` or an
+            # uppercase `rel` still matches: lowercase then whitespace-token membership.
+            try:
+                canon_href = response.xpath(self._CANONICAL_XPATH).get()
+                if canon_href and canon_href.strip():
+                    fields["canonical"] = self.normalize_url(
+                        response.urljoin(canon_href.strip()),
+                        exclude_params=self.exclude_params_emit,
+                    )
+            except Exception:
+                self.logger.debug("canonical extraction failed for %s", response.url)
         else:
             fields = empty_enrichment()
 

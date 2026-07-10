@@ -110,6 +110,11 @@ ENRICHMENT_FIELD_NAMES = (
     "heading_count",
     "embed_count_nonbenign",
     "iframe_hosts",
+    # The page's <link rel="canonical"> target, normalized (issue #10). "" when absent.
+    # Downstream (yoko-corpus) uses it to collapse query-string/pagination/variant URLs to
+    # their canonical page. Populated by the spider (it reads the response's <head>), not by
+    # the body-scoped extraction here.
+    "canonical",
 )
 
 
@@ -121,6 +126,7 @@ def empty_enrichment() -> dict:
     fields["content_hash"] = ""
     fields["main_content_extracted"] = False
     fields["iframe_hosts"] = []
+    fields["canonical"] = ""
     return fields
 
 

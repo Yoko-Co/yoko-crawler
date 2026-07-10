@@ -508,3 +508,77 @@ class TestNavigationalHref:
     def test_tel_as_path_segment_is_navigational(self, spider):
         # '/tel/...' is a path, not the tel: scheme.
         assert spider.is_navigational_href("/tel/directory") is True
+
+
+def _html_with_canonical(canon_href, url="https://example.com/page"):
+    body = (
+        '<html><head><link rel="canonical" href="' + canon_href + '">'
+        '<title>t</title></head><body><main><article><p>'
+        + "word " * 60 +
+        '</p></article></main></body></html>'
+    ).encode("utf-8")
+    return _html_response(body=body, url=url)
+
+
+class TestCanonical:
+    """issue #10: the page's <link rel=canonical> is emitted, normalized like any URL, so
+    yoko-corpus can collapse query-string/variant URLs onto their canonical page."""
+
+    def test_absolute_canonical_normalized(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("https://example.com/canonical-page"))
+        assert row["canonical"] == "https://example.com/canonical-page"
+
+    def test_relative_canonical_resolved(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("/canon", url="https://example.com/some/path"))
+        assert row["canonical"] == "https://example.com/canon"
+
+    def test_canonical_junk_params_stripped(self):
+        # Normalized with the same emit rules -> the ?s= that #8 strips is stripped here too,
+        # so a canonical pointing at a clean page compares equal to that page's emit URL.
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("https://example.com/p?utm_source=x&s="))
+        assert row["canonical"] == "https://example.com/p"
+
+    def test_absent_canonical_is_empty(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_response())  # ARTICLE_PAGE has no canonical
+        assert row["canonical"] == ""
+
+    def test_asset_row_canonical_empty(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _asset_response())
+        assert row["canonical"] == ""
+
+    def test_self_referential_canonical_equals_emit_url(self):
+        # Load-bearing for corpus #26: a page canonical'd to itself must yield
+        # canonical == the emitted url field (same normalization on both sides).
+        spider = WebsiteSpider(domain="example.com")
+        url = "https://example.com/page/?utm_source=x"
+        row = _emit_one(spider, _html_with_canonical("https://example.com/page/", url=url))
+        assert row["canonical"] == row["url"]
+
+    def test_multitoken_and_uppercase_rel_still_match(self):
+        # Fresh spider per case (same URL would be deduped by _emit_row's `emitted` set).
+        for rel in ["canonical alternate", "CANONICAL"]:
+            spider = WebsiteSpider(domain="example.com")
+            body = (
+                '<html><head><link rel="' + rel + '" href="https://example.com/a">'
+                '</head><body><main><article><p>' + "word " * 60 +
+                '</p></article></main></body></html>'
+            ).encode("utf-8")
+            row = _emit_one(spider, _html_response(body=body, url="https://example.com/p"))
+            assert row["canonical"] == "https://example.com/a", rel
+
+    def test_canonical_emitted_even_when_extraction_fails(self, monkeypatch):
+        # Independence: a canonical is still emitted alongside empty/zero counts when the
+        # body extraction raises.
+        import content_extractor as ce
+        monkeypatch.setattr(ce, "extract_content", lambda body: (_ for _ in ()).throw(RuntimeError("boom")))
+        import website_spider as ws
+        monkeypatch.setattr(ws, "extract_content", ce.extract_content)
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_with_canonical("https://example.com/canon"))
+        assert row["canonical"] == "https://example.com/canon"
+        assert row["content_hash"] == "" and row["word_count"] == 0  # counts defaulted
