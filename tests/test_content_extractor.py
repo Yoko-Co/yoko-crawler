@@ -601,3 +601,37 @@ class TestChromeAwareCounting:
         dechromed = ce._dechrome(body)
         hrefs = {a.get("href") for a in dechromed.xpath(".//a[@href]")}
         assert "/a" in hrefs and "/b" in hrefs  # div-soup nav survives (limitation)
+
+
+class TestComponentSignals:
+    """issue #12: detect interactive JS components (sliders/carousels/accordions/tabs/
+    galleries) by container markers -- real dev work otherwise invisible or miscounted."""
+
+    def _n(self, html):
+        return ce.component_signals(lxml_html.fromstring(html))["component_count"]
+
+    def test_slider_container_counts_once_not_its_slides(self):
+        assert self._n(
+            '<body><div class="swiper"><div class="swiper-slide">a</div>'
+            '<div class="swiper-slide">b</div></div></body>'
+        ) == 1
+
+    def test_multiple_distinct_components(self):
+        assert self._n(
+            '<body><div class="carousel"><div class="carousel-item">x</div></div>'
+            '<div class="accordion">y</div></body>'
+        ) == 2
+
+    def test_attribute_and_role_markers(self):
+        assert self._n('<body><section data-slider="true">s</section></body>') == 1
+        assert self._n('<body><ul role="tablist"><li>t</li></ul></body>') == 1
+
+    def test_no_components(self):
+        assert self._n('<body><p>text</p><table class="data-table"><tr><td>x</td></tr></table></body>') == 0
+
+    def test_orphan_child_token_not_matched(self):
+        # a stray swiper-slide with no container must not count.
+        assert self._n('<body><div class="swiper-slide">orphan</div></body>') == 0
+
+    def test_multi_class_container_counts_once(self):
+        assert self._n('<body><div class="owl-carousel owl-theme">c</div></body>') == 1
