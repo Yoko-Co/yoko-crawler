@@ -203,6 +203,7 @@ The bundled spider (`website_spider.py`) does comprehensive URL discovery:
 - Records HTTP status, redirect targets, and referrers
 - Handles pagination archives (traverses without recording each page URL)
 - Skips login/auth URLs (wp-login, OAuth, SSO, SAML, etc.)
+- Skips non-navigational hrefs (`mailto:`/`tel:`/`javascript:`/`data:`…) — including malformed ones like `mail to:` that would otherwise be resolved into a crawlable path (issue #11)
 - Issues HEAD requests for non-HTML assets (PDFs, images, etc.)
 - Normalizes URLs and strips non-content query params — tracking (UTM, session IDs, etc.) and on-site search/comment params (`?s=`, `replytocom`) — so query-only variants of the same page are deduped and not re-crawled (issue #8)
 - Respects autothrottle for polite crawling

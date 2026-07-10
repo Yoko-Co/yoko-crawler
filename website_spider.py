@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import scrapy
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
@@ -168,6 +169,28 @@ class WebsiteSpider(scrapy.Spider):
             return host == self.base_domain or host.endswith(f".{self.base_domain}")
         return host in {self.base_domain, f"www.{self.base_domain}"}
 
+    # Non-navigational URI schemes: never page URLs. A well-formed one (e.g. `mailto:`)
+    # already fails is_internal (no host), but a MALFORMED one -- `mail to:info@x`, a
+    # `mailto:` link with a stray space -- would otherwise be urljoin'd into a crawlable
+    # path (`.../mail%20to:info@x`), which is exactly the junk the GVF crawl followed.
+    _NONNAV_SCHEMES = (
+        "mailto:", "tel:", "callto:", "sms:", "whatsapp:", "javascript:",
+        "data:", "blob:", "file:", "ftp:", "ftps:",
+    )
+
+    def is_navigational_href(self, href: str) -> bool:
+        """Whether a raw <a href> is worth following as a page URL. Rejects empty and
+        fragment-only hrefs and non-navigational schemes -- INCLUDING malformed ones a
+        literal space or a `%20` would otherwise smuggle past urljoin as a relative path.
+        Whitespace/`%20` is collapsed only to detect the SCHEME; the real urljoin still
+        uses the original href."""
+        if not href:
+            return False
+        collapsed = re.sub(r"(?:\s|%20)+", "", href, flags=re.IGNORECASE).lower()
+        if not collapsed or collapsed.startswith("#"):
+            return False
+        return not collapsed.startswith(self._NONNAV_SCHEMES)
+
     def strip_unwanted_queries(self, url: str, *, exclude_params) -> str:
         parsed = urlparse(url)
         query = parse_qs(parsed.query, keep_blank_values=True)
@@ -285,7 +308,11 @@ class WebsiteSpider(scrapy.Spider):
 
         for sel in response.css(", ".join(selectors)):
             href = sel.attrib.get("href")
-            if not href:
+            if not self.is_navigational_href(href):
+                # empty/fragment-only, or a non-navigational scheme (mailto/tel/js/...),
+                # including a malformed one -- don't urljoin it into a crawlable path.
+                if href:
+                    self.crawler.stats.inc_value("nonnav_hrefs_skipped")
                 continue
             full_url = response.urljoin(href)
             if self.is_internal(full_url):
