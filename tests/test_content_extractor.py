@@ -635,3 +635,28 @@ class TestComponentSignals:
 
     def test_multi_class_container_counts_once(self):
         assert self._n('<body><div class="owl-carousel owl-theme">c</div></body>') == 1
+
+    def test_bootstrap_tab_widget_counts_once_not_per_button(self):
+        # nav-tabs + role=tablist on the container -> 1; the per-button data-bs-toggle
+        # triggers must NOT each add a component (the item-level over-count fix).
+        assert self._n(
+            '<body><ul class="nav nav-tabs" role="tablist">'
+            '<button data-bs-toggle="tab">A</button>'
+            '<button data-bs-toggle="tab">B</button>'
+            '<button data-bs-toggle="tab">C</button></ul></body>'
+        ) == 1
+
+    def test_fancybox_per_link_gallery_not_over_counted(self):
+        # A bare per-link Fancybox gallery (no container class) is missed, not counted 3x.
+        assert self._n(
+            '<body><a data-fancybox="g" href="1.jpg">1</a>'
+            '<a data-fancybox="g" href="2.jpg">2</a>'
+            '<a data-fancybox="g" href="3.jpg">3</a></body>'
+        ) == 0
+
+    def test_nested_components_both_count(self):
+        # a slider inside an accordion -> 2 distinct components.
+        assert self._n(
+            '<body><div class="accordion"><div class="swiper">'
+            '<div class="swiper-slide">a</div></div></div></body>'
+        ) == 2

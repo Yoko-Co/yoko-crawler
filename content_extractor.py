@@ -425,10 +425,14 @@ _COMPONENT_CLASS_TOKENS = (
     "flickity-enabled", "flexslider", "tns-slider", "accordion", "lightbox", "fancybox",
     "galleria", "lightgallery", "masonry", "nav-tabs",
 )
-# Attribute markers (component libraries that key off data-* / ARIA rather than a class).
+# CONTAINER-level attribute markers only. Per-ITEM markers (`data-fancybox` on each gallery
+# link, `data-toggle=tab` on each tab button) are deliberately excluded -- they'd count once
+# per trigger, inflating one gallery/tab set into N components. Tab widgets are still caught
+# by the container (`nav-tabs` class + `role=tablist`); a bare per-link Fancybox gallery with
+# no container class is missed (acceptable -- a miss beats a 10x over-count for a scoping
+# signal, and class-based galleries lightbox/galleria/lightgallery/masonry are still caught).
 _COMPONENT_ATTR_PREDICATES = (
-    "@data-slider", "@data-carousel", "@data-fancybox", "@role='tablist'",
-    "@data-toggle='tab'", "@data-bs-toggle='tab'",
+    "@data-slider", "@data-carousel", "@role='tablist'",
 )
 # descendant-or-self so the passed subtree is counted if it is itself a component container
 # (robust regardless of what element the caller passes).
