@@ -96,6 +96,11 @@ class WebsiteSpider(scrapy.Spider):
         # Cache busting / random
         "nocache", "cachebust", "cb", "rnd", "random", "_ts",
         "timestamp", "t",
+        # WordPress / CMS non-content: on-site search (?s= renders the SAME page and was
+        # doubling whole crawls -- e.g. every GVF page appeared as /x/ AND /x/?s=), plus
+        # comment-reply/moderation links. Search-results variants are not content pages, so
+        # collapsing any ?s= value onto the base URL is correct.
+        "s", "search", "replytocom", "unapproved", "moderation-hash",
         # Pagination/sorting (toggleable)
         "page", "p", "offset", "start", "sort", "order", "dir",
     }
