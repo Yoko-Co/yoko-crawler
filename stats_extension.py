@@ -20,12 +20,9 @@ class ProgressWriter:
     # Safety-valve close reasons that produce valid (possibly partial) results.
     _COMPLETED_REASONS = {"finished", "closespider_timeout", "closespider_itemcount"}
 
-    def __init__(self, stats, status_file, impersonate=None):
+    def __init__(self, stats, status_file):
         self.stats = stats
         self.status_file = status_file
-        # The impersonation target (None when not impersonating). Used to detect
-        # an all-blocked crawl whose pinned TLS fingerprint has gone stale.
-        self.impersonate = impersonate
         self._loop = None
 
     @classmethod
@@ -35,11 +32,7 @@ class ProgressWriter:
             raise ValueError(
                 "STATUS_FILE setting is required for ProgressWriter extension"
             )
-        ext = cls(
-            crawler.stats,
-            status_file,
-            impersonate=crawler.settings.get("IMPERSONATE_TARGET"),
-        )
+        ext = cls(crawler.stats, status_file)
         crawler.signals.connect(ext.spider_opened, signal=signals.spider_opened)
         crawler.signals.connect(ext.spider_closed, signal=signals.spider_closed)
         return ext
@@ -54,22 +47,13 @@ class ProgressWriter:
         status = "completed" if reason in self._COMPLETED_REASONS else "failed"
         error = reason if status == "failed" else None
 
-        # Stale-fingerprint guard: an impersonated crawl whose responses were
-        # *all* 403 was blocked wholesale (the pinned TLS fingerprint aged out of
-        # the WAF's allow-list). Surface that as a failure instead of a clean
-        # "completed" with no usable results. Keyed on an all-403 response set
-        # (not "zero 200s"), so a legitimate redirect-only/404 crawl -- which
-        # also has no 200s, since the spider records every status -- is not
-        # mistaken for a blocked one.
-        if status == "completed" and self.impersonate:
-            responses = self.stats.get_value("response_received_count", 0)
-            forbidden = self.stats.get_value("downloader/response_status_count/403", 0)
-            if responses > 0 and forbidden == responses:
-                status = "failed"
-                error = (
-                    "impersonated crawl was blocked on every request (all 403) — "
-                    "the pinned TLS fingerprint may be stale"
-                )
+        # NOTE: an all-403/blocked crawl (bot-wall) is intentionally NOT failed here. The
+        # crawl COMPLETES and emits its 403 rows; the consumer (yoko-corpus) owns the
+        # blocked-crawl policy -- it reads the forbidden ratio to retry with browser
+        # impersonation and, if still blocked, presents an honest "we couldn't read this
+        # site" report. Failing the crawl here would deny the corpus both. The spider's
+        # `waf_challenge_count` stat records the wall for observability. (The SSRF guard
+        # below still fails a crawl that fetched NOTHING -- a genuine empty result.)
 
         # SSRF guard produced no fetchable pages: every candidate host resolved
         # to a blocked range and was dropped, so the crawl ends empty. Surface as

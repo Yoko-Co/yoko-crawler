@@ -54,6 +54,14 @@ class WebsiteSpider(scrapy.Spider):
     handle_httpstatus_all = True  # capture all status codes, including 3xx
     REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
+    # HTTP statuses a bot-wall (Cloudflare/WAF) serves a challenge/block page on. The
+    # challenge page is real HTML with a body, so without a guard the crawler would
+    # extract its markup as "content" and follow its links (e.g. Kinsta's
+    # `?ki-cf-botcl=1` challenge URL) — polluting the crawl with the wall's own pages.
+    # A challenge row is still EMITTED (its 403/429 status is the signal the corpus reads
+    # to detect a bot-block and retry with impersonation), just not mined for content/links.
+    WAF_CHALLENGE_STATUSES = {403, 429, 503}
+
     # File types to skip downloading/parsing (log only)
     ASSET_EXTENSIONS = {
         ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".rtf", ".txt", ".ics",
@@ -98,6 +106,12 @@ class WebsiteSpider(scrapy.Spider):
         # Cache busting / random
         "nocache", "cachebust", "cb", "rnd", "random", "_ts",
         "timestamp", "t",
+        # Bot-wall challenge tokens: Kinsta+Cloudflare (`?ki-cf-botcl=1`) and Cloudflare's
+        # own challenge query tokens. These are the WALL's URLs, never real content pages;
+        # stripping them keeps a stray challenge link from being recorded as a distinct page
+        # (the challenge pages themselves are also not followed -- see WAF_CHALLENGE_STATUSES).
+        "ki-cf-botcl", "__cf_chl_rt_tk", "__cf_chl_tk", "__cf_chl_jschl_tk__",
+        "__cf_chl_f_tk", "cf_chl_rt_tk",
         # WordPress / CMS non-content: on-site search (?s= renders the SAME page and was
         # doubling whole crawls -- e.g. every GVF page appeared as /x/ AND /x/?s=), plus
         # comment-reply/moderation links. Search-results variants are not content pages, so
@@ -291,6 +305,13 @@ class WebsiteSpider(scrapy.Spider):
         # Emit the fetched page once (using emit-mode normalization)
         yield from self._emit_row(response)
 
+        # A bot-wall challenge/block page (Cloudflare/WAF): the row is emitted (its 403/429
+        # is the signal the corpus reads), but we do NOT follow its links -- they are the
+        # wall's own challenge URLs (e.g. `?ki-cf-botcl=1`), not the site's navigation.
+        if self._is_waf_challenge(response):
+            self.crawler.stats.inc_value("waf_challenge_count")
+            return
+
         # If redirect, schedule the single hop and stop parsing this page
         if response.status in self.REDIRECT_STATUSES:
             loc = response.headers.get("Location")
@@ -332,6 +353,25 @@ class WebsiteSpider(scrapy.Spider):
 
     # ---------- Helpers ----------
 
+    def _is_waf_challenge(self, response) -> bool:
+        """True when a response is a Cloudflare/WAF bot-wall challenge or block page,
+        not a real page. Keyed on a challenge status (403/429/503) PLUS a Cloudflare
+        fingerprint so an ordinary application 403/503 (a protected page, a brief
+        maintenance blip) isn't mistaken for a wall:
+          - `cf-mitigated` header — Cloudflare stamps it on challenge/block responses; or
+          - a `cf-ray` header AND `server: cloudflare` — a Cloudflare-fronted response at a
+            challenge status (Kinsta fronts with Cloudflare and adds the `ki-cf-botcl` param).
+        Conservative on purpose: a false positive only costs us one page's content/links
+        (already unreadable at 403), while a false negative re-introduces the wall-page
+        pollution this guards against."""
+        if response.status not in self.WAF_CHALLENGE_STATUSES:
+            return False
+        headers = response.headers
+        if headers.get("cf-mitigated"):
+            return True
+        server = (headers.get("Server") or b"").decode("latin-1").lower()
+        return bool(headers.get("cf-ray")) and "cloudflare" in server
+
     def _enrichment(self, response):
         """Compute the additive content/structural fields for a row.
 
@@ -351,6 +391,10 @@ class WebsiteSpider(scrapy.Spider):
             and "html" in ctype
             and response.status not in self.REDIRECT_STATUSES
             and bool(response.body)
+            # A WAF challenge page is HTML with a body, but its markup is the wall's, not
+            # the site's — don't extract it as content (a bogus word_count/content_hash
+            # would make a bot-blocked page look like a real "simple" page downstream).
+            and not self._is_waf_challenge(response)
         )
 
         content_text = ""

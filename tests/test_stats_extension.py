@@ -1,4 +1,10 @@
-"""Tests for stats_extension.ProgressWriter (status file + stale-fingerprint guard)."""
+"""Tests for stats_extension.ProgressWriter (status file + SSRF-empty guard).
+
+An all-403/blocked crawl is NOT failed here: the crawl completes and emits its 403
+rows, and the consumer (yoko-corpus) owns the blocked-crawl policy (retry with browser
+impersonation, then an honest "we couldn't read this" report). Only a crawl that fetched
+NOTHING (SSRF guard dropped every host) is failed as a genuine empty result.
+"""
 
 import json
 
@@ -13,66 +19,42 @@ class FakeStats:
         return self._values.get(key, default)
 
 
-def _write_and_read(tmp_path, stats_values, impersonate, reason):
+def _write_and_read(tmp_path, stats_values, reason):
     status_file = str(tmp_path / "status.json")
-    writer = ProgressWriter(FakeStats(stats_values), status_file, impersonate=impersonate)
+    writer = ProgressWriter(FakeStats(stats_values), status_file)
     writer.spider_closed(spider=None, reason=reason)
     with open(status_file) as f:
         return json.load(f)
 
 
-def test_impersonated_all_403_marked_failed(tmp_path):
+def test_all_403_completes_consumer_owns_policy(tmp_path):
+    # A wholesale bot-block (every response 403) COMPLETES, emitting its 403 rows -- the
+    # corpus reads the forbidden ratio to retry with impersonation / report honestly.
+    # Failing here would deny it both. (Was: impersonated all-403 -> failed.)
     data = _write_and_read(
         tmp_path,
         {"response_received_count": 50, "downloader/response_status_count/403": 50},
-        impersonate="chrome",
-        reason="finished",
-    )
-    assert data["status"] == "failed"
-    assert "all 403" in data["error"]
-
-
-def test_impersonated_partial_403_completes(tmp_path):
-    # Some 403s but not all -> the crawl got usable results; not a blocked crawl.
-    data = _write_and_read(
-        tmp_path,
-        {"response_received_count": 50, "downloader/response_status_count/403": 10},
-        impersonate="chrome",
         reason="finished",
     )
     assert data["status"] == "completed"
     assert data["error"] is None
 
 
-def test_impersonated_all_redirects_completes(tmp_path):
-    # Regression: a legit redirect-only (or 404-only) crawl has zero 200s but
-    # zero 403s -- it must NOT be mistaken for a blocked crawl.
+def test_partial_403_completes(tmp_path):
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 50, "downloader/response_status_count/403": 10},
+        reason="finished",
+    )
+    assert data["status"] == "completed"
+    assert data["error"] is None
+
+
+def test_all_redirects_completes(tmp_path):
+    # A legit redirect-only (or 404-only) crawl has zero 200s -- it completes.
     data = _write_and_read(
         tmp_path,
         {"response_received_count": 50, "downloader/response_status_count/403": 0},
-        impersonate="chrome",
-        reason="finished",
-    )
-    assert data["status"] == "completed"
-
-
-def test_non_impersonated_all_403_still_completes(tmp_path):
-    # The guard only applies to impersonated crawls; a normal crawl that the site
-    # blocks is the caller's signal to read the 403 rows, not a tooling failure.
-    data = _write_and_read(
-        tmp_path,
-        {"response_received_count": 50, "downloader/response_status_count/403": 50},
-        impersonate=None,
-        reason="finished",
-    )
-    assert data["status"] == "completed"
-
-
-def test_guard_does_not_fire_when_no_requests_made(tmp_path):
-    data = _write_and_read(
-        tmp_path,
-        {"response_received_count": 0, "downloader/response_status_count/403": 0},
-        impersonate="chrome",
         reason="finished",
     )
     assert data["status"] == "completed"
@@ -82,7 +64,6 @@ def test_ssrf_blocked_into_emptiness_marked_failed(tmp_path):
     data = _write_and_read(
         tmp_path,
         {"ssrf_guard/blocked": 3, "response_received_count": 0},
-        impersonate=None,
         reason="finished",
     )
     assert data["status"] == "failed"
@@ -94,17 +75,16 @@ def test_ssrf_block_with_fetched_pages_completes(tmp_path):
     data = _write_and_read(
         tmp_path,
         {"ssrf_guard/blocked": 1, "response_received_count": 20},
-        impersonate=None,
         reason="finished",
     )
     assert data["status"] == "completed"
 
 
 def test_failure_reason_preserved(tmp_path):
+    # A real non-completed close reason (e.g. OOM) still fails and is surfaced verbatim.
     data = _write_and_read(
         tmp_path,
         {"response_received_count": 10, "downloader/response_status_count/403": 2},
-        impersonate="chrome",
         reason="memusage_exceeded",
     )
     assert data["status"] == "failed"
@@ -115,7 +95,6 @@ def test_close_reason_surfaced_on_natural_finish(tmp_path):
     data = _write_and_read(
         tmp_path,
         {"response_received_count": 20, "scheduler/enqueued": 20},
-        impersonate=None,
         reason="finished",
     )
     assert data["status"] == "completed"
@@ -128,7 +107,6 @@ def test_close_reason_surfaced_on_safety_valve_stop(tmp_path):
     data = _write_and_read(
         tmp_path,
         {"response_received_count": 1200, "scheduler/enqueued": 5000},
-        impersonate=None,
         reason="closespider_timeout",
     )
     assert data["status"] == "completed"

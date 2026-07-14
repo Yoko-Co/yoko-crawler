@@ -89,7 +89,7 @@ Other status codes: `409` (domain already crawling), `429` (concurrency limit), 
 
 ### `GET /crawl/{id}`
 
-Returns job status, including `impersonate`, `delay`, `profile`, and `emit_content`, plus `urls_discovered`/`urls_crawled`. A crawl that was blocked wholesale (impersonation fingerprint stale, or every host SSRF-blocked) is reported as `failed` with an explanatory `error`, not a clean `completed`.
+Returns job status, including `impersonate`, `delay`, `profile`, and `emit_content`, plus `urls_discovered`/`urls_crawled`. A crawl where every host was SSRF-blocked (nothing fetched) is reported as `failed` with an explanatory `error`. A wholesale bot-block (all-403) is **not** failed — the crawl `completed`s and emits its `403` rows so the consumer (yoko-corpus) can retry with impersonation and/or present an honest "we couldn't read this site" report; the `waf_challenge_count` stat records recognized Cloudflare/WAF challenge pages (which are emitted but not mined for content or followed).
 
 ### `GET /crawl/{id}/results`
 
