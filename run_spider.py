@@ -8,6 +8,7 @@ Accepts --domain, --output, --status-file as command-line arguments.
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -85,6 +86,11 @@ def build_settings(args):
         },
         "FEED_EXPORT_FIELDS": feed_fields,
         "USER_AGENT": args.user_agent or DEFAULT_USER_AGENT,
+        # Cookie jar ON (Scrapy's default) -- stated explicitly because injected cookies
+        # (--cookies, e.g. a browser-solved cf_clearance) rely on it: the spider seeds the
+        # jar on the start request and CookiesMiddleware re-attaches to every followed
+        # request to the same domain.
+        "COOKIES_ENABLED": True,
         "CLOSESPIDER_TIMEOUT": 7200,
         "CLOSESPIDER_ITEMCOUNT": 50000,
         "AUTOTHROTTLE_ENABLED": True,
@@ -208,6 +214,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--cookies",
+        default=None,
+        help=(
+            "Raw Cookie-header string ('cf_clearance=...; __cf_bm=...') sent with every "
+            "request via Scrapy's cookie jar. Use to reuse a browser-solved Cloudflare "
+            "clearance cookie. Pair with a matching --user-agent: cf_clearance is bound to "
+            "the User-Agent (and usually the IP) that solved the challenge. Prefer the "
+            "YOKO_CRAWL_COOKIES env var over this flag for a real (secret) cookie -- an "
+            "argv value is world-readable via the process table; the API uses the env var."
+        ),
+    )
+    parser.add_argument(
         "--impersonate",
         choices=list(IMPERSONATE_CHOICES),
         default="off",
@@ -259,6 +277,12 @@ def main():
         _write_failed_status(args.status_file, str(exc))
         sys.exit(1)
 
+    # The cookie is a secret (a browser-solved cf_clearance), so the API/job manager passes
+    # it via the YOKO_CRAWL_COOKIES env var (readable only by the same uid) rather than argv
+    # (world-readable via the process table). The --cookies flag stays for manual/dev use;
+    # the env var wins when both are set.
+    cookies = os.environ.get("YOKO_CRAWL_COOKIES") or args.cookies
+
     process = CrawlerProcess(settings=build_settings(args))
     process.crawl(
         WebsiteSpider,
@@ -268,6 +292,7 @@ def main():
         keep_pagination=0,
         emit_content=1 if args.emit_content else 0,
         output_format=args.format,
+        cookies=cookies,
     )
     process.start()
 

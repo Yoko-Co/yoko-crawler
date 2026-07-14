@@ -36,6 +36,12 @@ def test_jobdir_setting_enables_scrapy_resume():
     assert s["JOBDIR"] == "/var/yoko-crawl/jobdirs/example.com"
 
 
+def test_cookie_jar_enabled():
+    # Injected cookies (cf_clearance reuse) rely on the jar to propagate to followed links.
+    s = build_settings(make_args())
+    assert s["COOKIES_ENABLED"] is True
+
+
 def test_ssrf_guard_registered_without_impersonation():
     s = build_settings(make_args(impersonate="off"))
     assert "ssrf_guard.SsrfGuardMiddleware" in s["DOWNLOADER_MIDDLEWARES"]

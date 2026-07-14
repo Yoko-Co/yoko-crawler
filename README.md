@@ -78,6 +78,8 @@ Request body:
 | `delay` | number | `1` | Seconds between requests, `0`–`30`. Try `3`–`5` for aggressive WAFs (the API caps at 30; the CLI `--delay` is unbounded). |
 | `profile` | enum | `standard` | `standard` or `presale`. `presale` is a politer bundle (serial, ≥3s delay) for prospect sites you don't control. Never relaxes SSRF/domain validation. |
 | `emit_content` | bool | `false` | When `true`, each HTML page's extracted main-content text is included in a `content_text` field. Off keeps output lean; the content hash and structural counts are emitted regardless. |
+| `cookies` | string | — | Raw `Cookie`-header string (`cf_clearance=…; __cf_bm=…`, ≤8192 chars) sent with every request via the cookie jar. Reuse a browser-solved Cloudflare clearance cookie when even `impersonate` is blocked (a JS/managed challenge). Pair with `user_agent`. **Caveat:** `cf_clearance` is bound to the User-Agent **and usually the IP** that solved the challenge — a cookie solved in your browser (your IP) is rejected from the crawler's (different) IP unless the site's Cloudflare doesn't bind the bypass cookie to IP. |
+| `user_agent` | string | — | Override the `User-Agent` on every request (≤512 chars). Required alongside a `cf_clearance` cookie so the UA matches the one that solved the challenge; also survives `impersonate` (pass it only to deliberately override the impersonated browser's UA). |
 
 Response `202`:
 
