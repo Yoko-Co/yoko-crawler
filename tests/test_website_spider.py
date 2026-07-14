@@ -594,3 +594,93 @@ class TestCanonical:
         row = _emit_one(spider, _html_with_canonical("https://example.com/canon"))
         assert row["canonical"] == "https://example.com/canon"
         assert row["content_hash"] == "" and row["word_count"] == 0  # counts defaulted
+
+
+# ---------- WAF / bot-wall challenge handling ----------
+
+import types  # noqa: E402
+
+
+class _FakeStats:
+    def __init__(self):
+        self.values = {}
+
+    def inc_value(self, key, count=1, start=0):
+        self.values[key] = self.values.get(key, start) + count
+
+
+def _challenge_response(status=403, url="https://example.com/",
+                        body=ARTICLE_PAGE, cloudflare=True, cf_mitigated=False):
+    headers = {"Content-Type": "text/html; charset=utf-8"}
+    if cloudflare:
+        headers["cf-ray"] = "8ab1122334455-EWR"
+        headers["Server"] = "cloudflare"
+    if cf_mitigated:
+        headers["cf-mitigated"] = "challenge"
+    return HtmlResponse(url=url, body=body, headers=headers,
+                        request=Request(url), status=status)
+
+
+class TestWafChallenge:
+    def test_cloudflare_403_is_a_challenge(self):
+        spider = WebsiteSpider(domain="example.com")
+        assert spider._is_waf_challenge(_challenge_response(status=403)) is True
+
+    def test_cf_mitigated_header_is_a_challenge(self):
+        spider = WebsiteSpider(domain="example.com")
+        # 403 + cf-mitigated, even without server:cloudflare, is a challenge.
+        resp = _challenge_response(status=403, cloudflare=False, cf_mitigated=True)
+        assert spider._is_waf_challenge(resp) is True
+
+    def test_ordinary_403_without_cloudflare_is_not_a_challenge(self):
+        spider = WebsiteSpider(domain="example.com")
+        resp = HtmlResponse(url="https://example.com/secret", body=b"<html>no</html>",
+                            headers={"Content-Type": "text/html"},
+                            request=Request("https://example.com/secret"), status=403)
+        assert spider._is_waf_challenge(resp) is False
+
+    def test_200_is_never_a_challenge_even_behind_cloudflare(self):
+        spider = WebsiteSpider(domain="example.com")
+        assert spider._is_waf_challenge(_challenge_response(status=200)) is False
+
+    def test_challenge_page_gets_empty_enrichment(self):
+        # The challenge markup must NOT be mined as content -- a real word_count /
+        # content_hash would make a bot-blocked page look like a real "simple" page.
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _challenge_response(status=403))
+        assert row["status"] == 403
+        assert row["content_hash"] == "" and row["word_count"] == 0
+        # A normal 200 with the SAME body DOES get real content (contrast).
+        normal = _emit_one(WebsiteSpider(domain="example.com"),
+                           _html_response(body=ARTICLE_PAGE))
+        assert normal["word_count"] > 0
+
+    def test_challenge_page_links_are_not_followed(self):
+        spider = WebsiteSpider(domain="example.com")
+        spider.crawler = types.SimpleNamespace(stats=_FakeStats())
+        body = (b"<html><body><a href='/?ki-cf-botcl=1'>verify</a>"
+                b"<a href='/real-page'>real</a></body></html>")
+        resp = _challenge_response(status=403, body=body)
+        out = list(spider.parse(resp))
+        # The row is still emitted, but no link Requests are scheduled off the wall page.
+        assert any(isinstance(o, dict) for o in out)
+        assert not any(isinstance(o, Request) for o in out)
+        assert spider.crawler.stats.values.get("waf_challenge_count") == 1
+
+    def test_normal_page_links_are_followed(self):
+        # Control: an ordinary page yields link Requests (challenge guard doesn't fire).
+        spider = WebsiteSpider(domain="example.com")
+        spider.crawler = types.SimpleNamespace(stats=_FakeStats())
+        body = b"<html><body><a href='/real-page'>real</a></body></html>"
+        resp = _html_response(body=body, url="https://example.com/")
+        out = list(spider.parse(resp))
+        assert any(isinstance(o, Request) for o in out)
+
+    def test_challenge_query_params_are_stripped(self):
+        # ki-cf-botcl (and Cloudflare challenge tokens) are junk params -> normalized away.
+        spider = WebsiteSpider(domain="example.com")
+        assert "ki-cf-botcl" in spider.UNWANTED_PARAMS
+        normalized = spider.normalize_url(
+            "https://example.com/x?ki-cf-botcl=1", exclude_params=spider.exclude_params_emit
+        )
+        assert "ki-cf-botcl" not in normalized
