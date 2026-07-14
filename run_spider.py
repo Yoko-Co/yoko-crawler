@@ -85,6 +85,11 @@ def build_settings(args):
         },
         "FEED_EXPORT_FIELDS": feed_fields,
         "USER_AGENT": args.user_agent or DEFAULT_USER_AGENT,
+        # Cookie jar ON (Scrapy's default) -- stated explicitly because injected cookies
+        # (--cookies, e.g. a browser-solved cf_clearance) rely on it: the spider seeds the
+        # jar on the start request and CookiesMiddleware re-attaches to every followed
+        # request to the same domain.
+        "COOKIES_ENABLED": True,
         "CLOSESPIDER_TIMEOUT": 7200,
         "CLOSESPIDER_ITEMCOUNT": 50000,
         "AUTOTHROTTLE_ENABLED": True,
@@ -208,6 +213,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--cookies",
+        default=None,
+        help=(
+            "Raw Cookie-header string ('cf_clearance=...; __cf_bm=...') sent with every "
+            "request via Scrapy's cookie jar. Use to reuse a browser-solved Cloudflare "
+            "clearance cookie. Pair with a matching --user-agent: cf_clearance is bound to "
+            "the User-Agent (and usually the IP) that solved the challenge."
+        ),
+    )
+    parser.add_argument(
         "--impersonate",
         choices=list(IMPERSONATE_CHOICES),
         default="off",
@@ -268,6 +283,7 @@ def main():
         keep_pagination=0,
         emit_content=1 if args.emit_content else 0,
         output_format=args.format,
+        cookies=args.cookies,
     )
     process.start()
 

@@ -684,3 +684,36 @@ class TestWafChallenge:
             "https://example.com/x?ki-cf-botcl=1", exclude_params=spider.exclude_params_emit
         )
         assert "ki-cf-botcl" not in normalized
+
+
+# ---------- injected cookies (cf_clearance reuse) ----------
+
+class TestInjectedCookies:
+    def test_parse_cookie_string(self):
+        spider = WebsiteSpider(domain="example.com")
+        assert spider._parse_cookie_string("cf_clearance=abc123; __cf_bm=xy=z") == {
+            "cf_clearance": "abc123",
+            "__cf_bm": "xy=z",  # value keeps everything after the FIRST '='
+        }
+
+    def test_parse_cookie_string_tolerates_junk(self):
+        spider = WebsiteSpider(domain="example.com")
+        assert spider._parse_cookie_string("  ; =novalue; a=1 ;; b= ") == {"a": "1", "b": ""}
+        assert spider._parse_cookie_string(None) == {}
+        assert spider._parse_cookie_string("") == {}
+
+    def test_no_cookies_by_default(self):
+        spider = WebsiteSpider(domain="example.com")
+        assert spider.injected_cookies == {}
+        # start_requests carries no cookies (None) when none were injected.
+        reqs = list(spider.start_requests())
+        assert all(not r.cookies for r in reqs)
+
+    def test_injected_cookies_seed_the_start_requests(self):
+        spider = WebsiteSpider(domain="example.com", cookies="cf_clearance=tok; a=1")
+        assert spider.injected_cookies == {"cf_clearance": "tok", "a": "1"}
+        reqs = list(spider.start_requests())
+        # Both seeds (homepage + robots.txt) carry the cookies so the jar propagates them.
+        assert len(reqs) == 2
+        for r in reqs:
+            assert r.cookies == {"cf_clearance": "tok", "a": "1"}

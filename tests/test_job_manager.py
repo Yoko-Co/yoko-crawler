@@ -197,6 +197,30 @@ class TestJobManager:
         args = mock_exec.call_args.args
         assert args[args.index("--impersonate") + 1] == "off"
 
+    async def test_cookies_and_user_agent_passed_to_subprocess(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job(
+                "example.com", cookies="cf_clearance=tok", user_agent="Mozilla/5.0 X"
+            )
+        assert job.cookies == "cf_clearance=tok" and job.user_agent == "Mozilla/5.0 X"
+        args = mock_exec.call_args.args
+        assert args[args.index("--cookies") + 1] == "cf_clearance=tok"
+        assert args[args.index("--user-agent") + 1] == "Mozilla/5.0 X"
+
+    async def test_cookies_and_user_agent_omitted_when_unset(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            await jm.start_job("example.com")
+        args = mock_exec.call_args.args
+        assert "--cookies" not in args and "--user-agent" not in args
+
     async def test_profile_and_emit_content_passed_to_subprocess(self):
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process()

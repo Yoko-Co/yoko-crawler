@@ -156,6 +156,13 @@ class CrawlRequest(BaseModel):
     # Discard any prior resume state and start fresh (e.g. a forced re-scan that must
     # re-detect changes). Only meaningful alongside resumable.
     reset: bool = False
+    # Raw Cookie-header string ("cf_clearance=...; __cf_bm=...") sent with every request
+    # via the cookie jar -- reuse a browser-solved Cloudflare clearance cookie. Bounded so a
+    # pasted value can't be unbounded. Pair with user_agent (cf_clearance is UA-bound).
+    cookies: str | None = Field(default=None, max_length=8192)
+    # Override the User-Agent on every request. Required alongside a cf_clearance cookie so
+    # the UA matches the one that solved the challenge (Cloudflare cross-checks UA vs cookie).
+    user_agent: str | None = Field(default=None, max_length=512)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +189,8 @@ async def start_crawl(request: CrawlRequest):
             emit_content=request.emit_content,
             resumable=request.resumable,
             reset=request.reset,
+            cookies=request.cookies,
+            user_agent=request.user_agent,
         )
     except ConcurrencyLimitError:
         raise HTTPException(

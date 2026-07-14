@@ -76,6 +76,10 @@ class Job:
     # Resumable crawl (Phase C): when true the spider runs with a persistent
     # per-domain JOBDIR, so a crawl that pauses (session cap) resumes on the next run.
     resumable: bool = False
+    # Injected cookies (raw Cookie-header string, e.g. a browser-solved cf_clearance) and a
+    # User-Agent override sent with every request -- reuse a solved Cloudflare challenge.
+    cookies: str | None = None
+    user_agent: str | None = None
     started_at: float = field(default_factory=time.time)
     status: str = "queued"  # queued, running, completed, failed
     error: str | None = None
@@ -175,6 +179,8 @@ class JobManager:
         emit_content: bool = False,
         resumable: bool = False,
         reset: bool = False,
+        cookies: str | None = None,
+        user_agent: str | None = None,
     ) -> Job:
         """
         Start a new crawl job for the given domain.
@@ -191,6 +197,9 @@ class JobManager:
         that pauses at the session cap RESUMES on the next run instead of re-fetching
         from the seed (Phase C). ``reset`` discards any existing JOBDIR first, forcing
         a fresh scan (e.g. a "request fresh crawl" that must re-detect changes).
+        ``cookies`` (raw Cookie-header string) seeds the cookie jar on every request --
+        reuse a browser-solved Cloudflare ``cf_clearance`` -- and ``user_agent`` overrides
+        the UA to match the one that solved the challenge (cf_clearance is UA-bound).
         """
         if profile not in VALID_PROFILES:
             raise ValueError(f"invalid profile: {profile!r}")
@@ -225,6 +234,8 @@ class JobManager:
                 profile=profile,
                 emit_content=emit_content,
                 resumable=resumable,
+                cookies=cookies,
+                user_agent=user_agent,
             )
             self._jobs[job_id] = job
 
@@ -293,6 +304,13 @@ class JobManager:
         if job.jobdir is not None:
             job.jobdir.parent.mkdir(parents=True, exist_ok=True)
             cmd += ["--jobdir", str(job.jobdir)]
+
+        # Injected cookies + UA override (reuse a browser-solved cf_clearance): passed only
+        # when set, so an unset value never sends an empty arg.
+        if job.cookies:
+            cmd += ["--cookies", job.cookies]
+        if job.user_agent:
+            cmd += ["--user-agent", job.user_agent]
 
         try:
             job.process = await asyncio.create_subprocess_exec(

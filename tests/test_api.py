@@ -278,6 +278,42 @@ class TestStartCrawl:
         assert body["profile"] == "presale"
         assert body["emit_content"] is True
 
+    async def test_start_crawl_forwards_cookies_and_user_agent(self, client, auth_headers):
+        mock_process = AsyncMock()
+        mock_process.returncode = None
+        mock_process.pid = 12345
+
+        async def mock_wait():
+            mock_process.returncode = 0
+            return 0
+
+        mock_process.wait = mock_wait
+        mock_process.terminate = MagicMock()
+        mock_results = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop, \
+             patch(
+                 "job_manager.asyncio.create_subprocess_exec",
+                 return_value=mock_process,
+             ) as mock_exec:
+            mock_loop.return_value.getaddrinfo = AsyncMock(return_value=mock_results)
+            response = await client.post(
+                "/crawl",
+                json={
+                    "domain": "example.com",
+                    "cookies": "cf_clearance=tok123",
+                    "user_agent": "Mozilla/5.0 (X11; Linux) Chrome/131",
+                },
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 202
+        args = mock_exec.call_args.args
+        assert args[args.index("--cookies") + 1] == "cf_clearance=tok123"
+        assert args[args.index("--user-agent") + 1] == "Mozilla/5.0 (X11; Linux) Chrome/131"
+        # The cookie value is NOT echoed back in the 202 (it's a secret-ish token).
+        assert "cf_clearance" not in response.text
+
     async def test_emit_content_off_omits_flag(self, client, auth_headers):
         mock_process = AsyncMock()
         mock_process.returncode = None

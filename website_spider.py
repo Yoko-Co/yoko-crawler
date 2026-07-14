@@ -149,6 +149,15 @@ class WebsiteSpider(scrapy.Spider):
         self.reach_pagination = str(kwargs.get("reach_pagination", "")).lower() in {"1", "true", "yes"}
         self.include_subdomains = str(kwargs.get("include_subdomains", "")).lower() in {"1", "true", "yes"}
 
+        # Injected cookies: reuse a browser-solved Cloudflare clearance cookie. A raw
+        # Cookie-header string ("cf_clearance=...; __cf_bm=...") is parsed to a dict and
+        # attached to the seed requests; Scrapy's cookie jar (COOKIES_ENABLED default True)
+        # then re-sends them on every followed request to the same domain, so a
+        # cf_clearance cookie carries through the whole crawl. Pair with a matching
+        # --user-agent -- cf_clearance is bound to the UA (and usually the IP) that solved
+        # the challenge, so a mismatched UA (or a different egress IP) is rejected.
+        self.injected_cookies = self._parse_cookie_string(kwargs.get("cookies"))
+
         # Content enrichment options.
         self.emit_content = str(kwargs.get("emit_content", "")).lower() in {"1", "true", "yes"}
         # Needed so iframe_hosts (a list) can be JSON-encoded for CSV output,
@@ -182,6 +191,23 @@ class WebsiteSpider(scrapy.Spider):
                 base -= self.PAGINATION_PARAMS
             self.exclude_params_schedule = base
             self.exclude_params_emit = base
+
+    @staticmethod
+    def _parse_cookie_string(raw) -> dict:
+        """Parse a raw Cookie-header string ("a=1; b=2") into a {name: value} dict.
+        Tolerant: splits pairs on ';' and each pair on the FIRST '=' (a cookie value can
+        itself contain '=', e.g. base64), trims whitespace, and skips empty/malformed
+        pairs. Returns {} for None/empty input."""
+        cookies = {}
+        for part in str(raw or "").split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if name:
+                cookies[name] = value.strip()
+        return cookies
 
     # ---------- URL helpers ----------
 
@@ -249,9 +275,17 @@ class WebsiteSpider(scrapy.Spider):
     # ---------- Entry points ----------
 
     def start_requests(self):
+        # Seed the cookie jar with any injected cookies (e.g. a browser-solved
+        # cf_clearance): setting them on the seed requests lets Scrapy's CookiesMiddleware
+        # re-attach them to every followed request to the same domain automatically.
+        cookies = self.injected_cookies or None
         for url in self.start_urls:
-            yield scrapy.Request(url, callback=self.parse)
-        yield scrapy.Request(urljoin(self.start_urls[0], "/robots.txt"), callback=self.parse_robots)
+            yield scrapy.Request(url, callback=self.parse, cookies=cookies)
+        yield scrapy.Request(
+            urljoin(self.start_urls[0], "/robots.txt"),
+            callback=self.parse_robots,
+            cookies=cookies,
+        )
 
     # ---------- Robots & sitemaps ----------
 
