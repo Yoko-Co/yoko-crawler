@@ -22,6 +22,14 @@ from embed_allowlist import load_benign_hosts
 # (the single source of truth for field names). content_text is handled
 # separately: present only when --emit-content is set.
 
+# Control characters an injected cookie value must never carry into an HTTP header
+# (CR/LF would enable header injection; NUL is invalid in a header).
+_CONTROL_CHARS = str.maketrans("", "", "\r\n\x00")
+
+
+def _strip_controls(value: str) -> str:
+    return value.translate(_CONTROL_CHARS)
+
 
 class WebsiteSpider(scrapy.Spider):
     """
@@ -197,16 +205,18 @@ class WebsiteSpider(scrapy.Spider):
         """Parse a raw Cookie-header string ("a=1; b=2") into a {name: value} dict.
         Tolerant: splits pairs on ';' and each pair on the FIRST '=' (a cookie value can
         itself contain '=', e.g. base64), trims whitespace, and skips empty/malformed
-        pairs. Returns {} for None/empty input."""
+        pairs. Control characters (CR/LF/NUL) are stripped from names and values so a
+        crafted value can't inject a header into the outgoing Cookie header (defense in
+        depth; the download handler also validates). Returns {} for None/empty input."""
         cookies = {}
         for part in str(raw or "").split(";"):
             part = part.strip()
             if not part or "=" not in part:
                 continue
             name, value = part.split("=", 1)
-            name = name.strip()
+            name = _strip_controls(name).strip()
             if name:
-                cookies[name] = value.strip()
+                cookies[name] = _strip_controls(value).strip()
         return cookies
 
     # ---------- URL helpers ----------

@@ -309,10 +309,25 @@ class TestStartCrawl:
 
         assert response.status_code == 202
         args = mock_exec.call_args.args
-        assert args[args.index("--cookies") + 1] == "cf_clearance=tok123"
+        # Cookie via env var (secret), UA via argv (not secret).
+        assert "--cookies" not in args
+        assert mock_exec.call_args.kwargs["env"]["YOKO_CRAWL_COOKIES"] == "cf_clearance=tok123"
         assert args[args.index("--user-agent") + 1] == "Mozilla/5.0 (X11; Linux) Chrome/131"
         # The cookie value is NOT echoed back in the 202 (it's a secret-ish token).
         assert "cf_clearance" not in response.text
+
+    async def test_start_crawl_rejects_control_chars_in_cookies(self, client, auth_headers):
+        # CRLF in a cookie/UA could inject a header downstream -> 422, not accepted.
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop:
+            mock_loop.return_value.getaddrinfo = AsyncMock(
+                return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]
+            )
+            response = await client.post(
+                "/crawl",
+                json={"domain": "example.com", "cookies": "cf_clearance=a\r\nEvil: 1"},
+                headers=auth_headers,
+            )
+        assert response.status_code == 422
 
     async def test_emit_content_off_omits_flag(self, client, auth_headers):
         mock_process = AsyncMock()

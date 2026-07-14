@@ -8,6 +8,7 @@ Accepts --domain, --output, --status-file as command-line arguments.
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -219,7 +220,9 @@ def main():
             "Raw Cookie-header string ('cf_clearance=...; __cf_bm=...') sent with every "
             "request via Scrapy's cookie jar. Use to reuse a browser-solved Cloudflare "
             "clearance cookie. Pair with a matching --user-agent: cf_clearance is bound to "
-            "the User-Agent (and usually the IP) that solved the challenge."
+            "the User-Agent (and usually the IP) that solved the challenge. Prefer the "
+            "YOKO_CRAWL_COOKIES env var over this flag for a real (secret) cookie -- an "
+            "argv value is world-readable via the process table; the API uses the env var."
         ),
     )
     parser.add_argument(
@@ -274,6 +277,12 @@ def main():
         _write_failed_status(args.status_file, str(exc))
         sys.exit(1)
 
+    # The cookie is a secret (a browser-solved cf_clearance), so the API/job manager passes
+    # it via the YOKO_CRAWL_COOKIES env var (readable only by the same uid) rather than argv
+    # (world-readable via the process table). The --cookies flag stays for manual/dev use;
+    # the env var wins when both are set.
+    cookies = os.environ.get("YOKO_CRAWL_COOKIES") or args.cookies
+
     process = CrawlerProcess(settings=build_settings(args))
     process.crawl(
         WebsiteSpider,
@@ -283,7 +292,7 @@ def main():
         keep_pagination=0,
         emit_content=1 if args.emit_content else 0,
         output_format=args.format,
-        cookies=args.cookies,
+        cookies=cookies,
     )
     process.start()
 

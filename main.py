@@ -14,7 +14,7 @@ import structlog
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from auth import verify_api_key
 from domain_validator import DomainValidationError, validate_domain
@@ -163,6 +163,16 @@ class CrawlRequest(BaseModel):
     # Override the User-Agent on every request. Required alongside a cf_clearance cookie so
     # the UA matches the one that solved the challenge (Cloudflare cross-checks UA vs cookie).
     user_agent: str | None = Field(default=None, max_length=512)
+
+    @field_validator("cookies", "user_agent")
+    @classmethod
+    def _reject_control_chars(cls, v: str | None) -> str | None:
+        """A CR/LF/NUL in either value could inject a header downstream (the cookie feeds
+        the Cookie header, the UA the User-Agent header). Reject rather than silently
+        mangle, so a caller sees the bad input."""
+        if v is not None and any(c in v for c in "\r\n\x00"):
+            raise ValueError("must not contain control characters (CR, LF, or NUL)")
+        return v
 
 
 # ---------------------------------------------------------------------------

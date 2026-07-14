@@ -305,12 +305,16 @@ class JobManager:
             job.jobdir.parent.mkdir(parents=True, exist_ok=True)
             cmd += ["--jobdir", str(job.jobdir)]
 
-        # Injected cookies + UA override (reuse a browser-solved cf_clearance): passed only
-        # when set, so an unset value never sends an empty arg.
-        if job.cookies:
-            cmd += ["--cookies", job.cookies]
+        # UA override (not a secret) rides on argv; passed only when set.
         if job.user_agent:
             cmd += ["--user-agent", job.user_agent]
+
+        # The cookie IS a secret (a browser-solved cf_clearance), so pass it via an env var
+        # -- readable only by the same uid -- rather than argv, which is world-readable via
+        # the process table (`ps`, /proc/<pid>/cmdline) for the crawl's whole lifetime.
+        env = None
+        if job.cookies:
+            env = {**os.environ, "YOKO_CRAWL_COOKIES": job.cookies}
 
         try:
             job.process = await asyncio.create_subprocess_exec(
@@ -318,6 +322,7 @@ class JobManager:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=log_fh,
                 cwd=str(Path(__file__).parent),
+                env=env,
             )
         except Exception:
             log_fh.close()

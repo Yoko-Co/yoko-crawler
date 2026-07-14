@@ -197,7 +197,9 @@ class TestJobManager:
         args = mock_exec.call_args.args
         assert args[args.index("--impersonate") + 1] == "off"
 
-    async def test_cookies_and_user_agent_passed_to_subprocess(self):
+    async def test_cookie_passed_via_env_not_argv(self):
+        # The cookie is a secret -> passed via the YOKO_CRAWL_COOKIES env var (same-uid
+        # readable), never argv (world-readable via the process table). UA rides on argv.
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process()
         with patch(
@@ -208,10 +210,12 @@ class TestJobManager:
             )
         assert job.cookies == "cf_clearance=tok" and job.user_agent == "Mozilla/5.0 X"
         args = mock_exec.call_args.args
-        assert args[args.index("--cookies") + 1] == "cf_clearance=tok"
+        assert "--cookies" not in args  # NOT on argv
+        assert "cf_clearance=tok" not in args
+        assert mock_exec.call_args.kwargs["env"]["YOKO_CRAWL_COOKIES"] == "cf_clearance=tok"
         assert args[args.index("--user-agent") + 1] == "Mozilla/5.0 X"
 
-    async def test_cookies_and_user_agent_omitted_when_unset(self):
+    async def test_no_env_override_when_no_cookie(self):
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process()
         with patch(
@@ -220,6 +224,8 @@ class TestJobManager:
             await jm.start_job("example.com")
         args = mock_exec.call_args.args
         assert "--cookies" not in args and "--user-agent" not in args
+        # env=None means inherit the parent environment (no injected cookie).
+        assert mock_exec.call_args.kwargs["env"] is None
 
     async def test_profile_and_emit_content_passed_to_subprocess(self):
         jm = JobManager(max_concurrent=3)

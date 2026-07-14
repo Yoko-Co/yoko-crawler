@@ -702,6 +702,13 @@ class TestInjectedCookies:
         assert spider._parse_cookie_string(None) == {}
         assert spider._parse_cookie_string("") == {}
 
+    def test_parse_cookie_string_strips_control_chars(self):
+        # A CRLF in a value must not survive into the cookie dict (no header injection).
+        spider = WebsiteSpider(domain="example.com")
+        parsed = spider._parse_cookie_string("cf_clearance=a\r\nEvil: 1\x00; b=2")
+        assert parsed == {"cf_clearance": "aEvil: 1", "b": "2"}
+        assert all("\r" not in v and "\n" not in v and "\x00" not in v for v in parsed.values())
+
     def test_no_cookies_by_default(self):
         spider = WebsiteSpider(domain="example.com")
         assert spider.injected_cookies == {}
