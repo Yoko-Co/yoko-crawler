@@ -13,7 +13,8 @@
 #     python3 -m venv .venv && . .venv/bin/activate
 #     pip install -r requirements.txt
 #
-# Run:
+# Run (turn OFF any corporate VPN first -- its exit IP is flagged like a datacenter; only a
+# plain residential connection gets past these blocks):
 #     . .venv/bin/activate
 #     ./scripts/local_scrape.sh urac.org
 #
@@ -44,8 +45,11 @@ LINES="$(wc -l < "${OUT}" | tr -d ' ')"
 echo
 echo ">> Done: ${OUT} (${LINES} page rows)."
 if [ "${LINES}" -lt 3 ]; then
-  echo ">> WARNING: very few rows -- the crawl may have been blocked even from this IP."
-  echo "   Check ${OUT} and /tmp/${DOMAIN}-local-scrape-status.json before ingesting."
+  echo ">> WARNING: very few rows -- the crawl looks blocked even from this machine."
+  echo "   Most common cause: you're on a CORPORATE VPN. Its exit IP is flagged like a"
+  echo "   datacenter -- turn the VPN OFF and re-run so the crawl uses your plain"
+  echo "   residential connection (that's what gets past Cloudflare)."
+  echo "   Then check ${OUT} and /tmp/${DOMAIN}-local-scrape-status.json before ingesting."
 fi
 echo
 echo "Next, get it into the corpus so it shows up in Discovery. From your Mac:"
