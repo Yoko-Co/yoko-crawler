@@ -117,6 +117,13 @@ ENRICHMENT_FIELD_NAMES = (
     "asset_link_count",
     "anchor_link_count",
     "image_count",
+    # Images in the counted content region that are NOT inside a slider/carousel container
+    # (issue #25). Distinguishes a media-heavy page (asset/layout lift) from one whose images
+    # merely fill a slider (interactive dev lift, counted by slider_count) -- so a carousel's
+    # images don't read as "image heavy". Equals image_count whenever no slider sits INSIDE the
+    # counted region (slider_count is page-wide, so a slider outside the content region -- e.g.
+    # a hero carousel in stripped chrome -- leaves standalone_image_count == image_count).
+    "standalone_image_count",
     "table_count",
     "form_count",
     "iframe_count",
@@ -126,6 +133,9 @@ ENRICHMENT_FIELD_NAMES = (
     # lightboxes) detected by container markers (issue #12). Real design+dev work that is
     # otherwise invisible (JS-hydrated) or laundered into word/image counts.
     "component_count",
+    # Count of image sliders/carousels specifically (the slider subset of component_count,
+    # issue #25) -- interactive component work, kept distinct from a plain wall of images.
+    "slider_count",
     "iframe_hosts",
     # The page's <link rel="canonical"> target, normalized (issue #10). "" when absent.
     # Downstream (yoko-corpus) uses it to collapse query-string/pagination/variant URLs to
@@ -464,6 +474,9 @@ def count_structure(
         "asset_link_count": asset_link_count,
         "anchor_link_count": anchor_link_count,
         "image_count": _count(".//img"),
+        # Images not inside a slider/carousel container (issue #25): the media-heavy signal,
+        # so a carousel's images aren't double-counted as standalone page images.
+        "standalone_image_count": _count(_STANDALONE_IMG_XPATH),
         "table_count": _count(".//table"),
         "form_count": _count(".//form"),
         "iframe_count": _count(".//iframe"),
@@ -505,6 +518,36 @@ def component_signals(subtree: etree._Element) -> dict:
     pre-JS HTML, so it catches components declared in markup (the common case for these
     libraries) even though they hydrate client-side. issue #12."""
     return {"component_count": len(subtree.xpath(_COMPONENT_XPATH))}
+
+
+# The SLIDER/CAROUSEL subset of the component tokens (issue #25): image sliders specifically,
+# NOT accordions/tabs/lightboxes/galleries/masonry. Kept as a strict subset of
+# _COMPONENT_CLASS_TOKENS / _COMPONENT_ATTR_PREDICATES so a slider always counts in BOTH
+# slider_count and component_count. Same class-token matching (whitespace-separated, so child
+# `swiper-slide`/`carousel-item` parts never match -- only the container).
+_SLIDER_CLASS_TOKENS = (
+    "swiper", "swiper-container", "slick-slider", "carousel", "splide", "owl-carousel",
+    "flickity-enabled", "flexslider", "tns-slider",
+)
+_SLIDER_ATTR_PREDICATES = ("@data-slider", "@data-carousel")
+# The boolean "is a slider container" test, reused two ways below.
+_SLIDER_MATCH = " or ".join(
+    [f"contains(concat(' ', normalize-space(@class), ' '), ' {t} ')" for t in _SLIDER_CLASS_TOKENS]
+    + list(_SLIDER_ATTR_PREDICATES)
+)
+# descendant-or-self so the passed subtree counts if it is itself a slider container.
+_SLIDER_XPATH = f"descendant-or-self::*[{_SLIDER_MATCH}]"
+# Images NOT inside any slider container -- the "standalone" (non-carousel) images.
+_STANDALONE_IMG_XPATH = f".//img[not(ancestor::*[{_SLIDER_MATCH}])]"
+
+
+def slider_signals(subtree: etree._Element) -> dict:
+    """Count image sliders/carousels over ``subtree`` (the full page <body> -- a slider lives
+    anywhere, like component detection). A strict subset of component_signals: matches only the
+    slider/carousel container tokens, so distinct slider containers are counted once each and
+    their child slides never inflate it. Interactive component work, kept apart from a plain
+    wall of images so the two deployment lifts read differently downstream. issue #25."""
+    return {"slider_count": len(subtree.xpath(_SLIDER_XPATH))}
 
 
 def embed_signals(

@@ -15,6 +15,7 @@ from content_extractor import (
     embed_signals,
     empty_enrichment,
     extract_content,
+    slider_signals,
 )
 from embed_allowlist import load_benign_hosts
 
@@ -454,14 +455,17 @@ class WebsiteSpider(scrapy.Spider):
                 # Embeds are page-wide: surprising iframes live in headers,
                 # footers, and sidebars, not just the main content region.
                 signals = embed_signals(result.body_subtree, self.benign_hosts)
-                # Interactive JS components are page-wide too (issue #12).
+                # Interactive JS components are page-wide too (issue #12); image sliders/
+                # carousels are the slider subset of that, counted page-wide (issue #25).
                 components = component_signals(result.body_subtree)
+                sliders = slider_signals(result.body_subtree)
                 fields = empty_enrichment()
                 fields.update(counts)
                 fields["content_hash"] = content_hash(result.normalized_text)
                 fields["main_content_extracted"] = result.main_content_extracted
                 fields["embed_count_nonbenign"] = signals["embed_count_nonbenign"]
                 fields["component_count"] = components["component_count"]
+                fields["slider_count"] = sliders["slider_count"]
                 fields["iframe_hosts"] = signals["iframe_hosts"]
                 content_text = result.normalized_text
             except Exception:
