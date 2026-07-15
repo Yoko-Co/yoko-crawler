@@ -784,3 +784,103 @@ class TestComponentSignals:
             '<body><div class="accordion"><div class="swiper">'
             '<div class="swiper-slide">a</div></div></div></body>'
         ) == 2
+
+
+class TestSliderSignals:
+    """issue #25: slider_count is the carousel/slider SUBSET of component_count -- an image
+    slider is interactive dev work, kept distinct from a wall of standalone images."""
+
+    def _n(self, html):
+        return ce.slider_signals(lxml_html.fromstring(html))["slider_count"]
+
+    def test_slider_container_counts_once_not_its_slides(self):
+        assert self._n(
+            '<body><div class="swiper"><div class="swiper-slide">a</div>'
+            '<div class="swiper-slide">b</div></div></body>'
+        ) == 1
+
+    def test_attribute_marker(self):
+        assert self._n('<body><section data-carousel="true">s</section></body>') == 1
+
+    def test_accordion_and_tabs_are_not_sliders(self):
+        # slider_count is a strict subset: non-slider components must NOT count here.
+        assert self._n('<body><div class="accordion">y</div></body>') == 0
+        assert self._n('<body><ul role="tablist"><li>t</li></ul></body>') == 0
+        assert self._n('<body><div class="lightbox">z</div></body>') == 0
+
+    def test_slider_is_always_also_a_component(self):
+        # Every slider token is in the component set, so a slider counts in both.
+        html = '<body><div class="owl-carousel">c</div></body>'
+        assert self._n(html) == 1
+        assert ce.component_signals(lxml_html.fromstring(html))["component_count"] == 1
+
+    def test_orphan_slide_not_matched(self):
+        assert self._n('<body><div class="carousel-item">orphan</div></body>') == 0
+
+
+class TestStandaloneImageCount:
+    """issue #25: standalone_image_count excludes images inside a slider/carousel container,
+    so a carousel's images aren't counted as standalone (media-heavy) page images."""
+
+    def _c(self, html):
+        return count_structure(
+            lxml_html.fromstring(html), "https://example.com/p",
+            is_internal=_internal, asset_extensions=ASSET_EXTS,
+        )
+
+    def test_carousel_images_excluded_from_standalone(self):
+        c = self._c(
+            '<body><div class="swiper"><img src="/s1.jpg"><img src="/s2.jpg">'
+            '<img src="/s3.jpg"></div><img src="/a.jpg"><img src="/b.jpg"></body>'
+        )
+        assert c["image_count"] == 5
+        assert c["standalone_image_count"] == 2  # the 3 carousel images are excluded
+
+    def test_no_slider_standalone_equals_image_count(self):
+        c = self._c('<body><img src="/1.jpg"><img src="/2.jpg"><img src="/3.jpg"></body>')
+        assert c["standalone_image_count"] == c["image_count"] == 3
+
+    def test_attribute_marker_slider_excludes_its_images(self):
+        # The @data-carousel branch of the slider predicate must also exclude images.
+        c = self._c(
+            '<body><section data-carousel="true"><img src="/s.jpg"></section>'
+            '<img src="/a.jpg"></body>'
+        )
+        assert c["image_count"] == 2 and c["standalone_image_count"] == 1
+
+    def test_child_part_class_does_not_exclude_its_image(self):
+        # A child-part class (`swiper-slide`, not the container token `swiper`) must NOT match,
+        # so an image whose only chrome-ish ancestor is a `swiper-slide` counts as standalone.
+        c = self._c('<body><div class="swiper-slide"><img src="/x.jpg"></div></body>')
+        assert c["standalone_image_count"] == 1
+
+    def test_empty_enrichment_defaults_new_fields_to_zero(self):
+        e = ce.empty_enrichment()
+        assert e["slider_count"] == 0 and e["standalone_image_count"] == 0
+
+
+class TestSliderStandaloneScope:
+    """issue #25: slider_count is page-wide (body_subtree) while standalone_image_count is
+    scoped to the counted content region -- so a slider OUTSIDE the content region is detected
+    yet leaves standalone_image_count == image_count (its images aren't in the region at all)."""
+
+    def test_slider_outside_content_region(self):
+        # A hero carousel sits in a <header> (site chrome, outside the located <main> region);
+        # the content region has only standalone images. slider_count (over body) sees the
+        # carousel; standalone_image_count (over the region) equals image_count there.
+        html = (
+            b"<!DOCTYPE html><html><head><title>T</title></head><body>"
+            b"<header><div class='swiper'><img src='/h1.jpg'><img src='/h2.jpg'></div></header>"
+            b"<main><h1>Gallery</h1><p>The rocky shelves along the northern coast hold dozens of "
+            b"tide pools that fill and drain with each turning of the sea revealing anemones and "
+            b"crabs to anyone who arrives before the lowest tide of the day here.</p>"
+            b"<img src='/a.jpg'><img src='/b.jpg'></main></body></html>"
+        )
+        result = extract_content(html)
+        counts = count_structure(
+            result.subtree, "https://example.com/p", is_internal=_internal, asset_extensions=ASSET_EXTS
+        )
+        # Content region: 2 standalone images, no in-region slider -> standalone == image_count.
+        assert counts["image_count"] == 2 and counts["standalone_image_count"] == 2
+        # But the page-wide slider signal still detects the hero carousel.
+        assert ce.slider_signals(result.body_subtree)["slider_count"] == 1
