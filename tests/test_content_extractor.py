@@ -603,6 +603,130 @@ class TestChromeAwareCounting:
         assert "/a" in hrefs and "/b" in hrefs  # div-soup nav survives (limitation)
 
 
+def _doc(inner: bytes) -> bytes:
+    """Wrap fixture markup in a well-formed document (lxml mis-parses a bare <body>
+    fragment, dropping <main>/<div>, which would defeat main-region location)."""
+    return b"<!DOCTYPE html><html lang=en><head><title>T</title></head><body>" + inner + b"</body></html>"
+
+
+# ~55 words of real prose -- enough to clear the _MIN_REGION_PROSE_WORDS gate, so a region
+# holding it is trusted verbatim (its own in-content nav/footer is counted, not stripped).
+_PROSE = (
+    b"The rocky shelves along the northern coast hold dozens of tide pools that fill and drain "
+    b"with each turning of the sea revealing anemones and crabs to anyone who arrives at the hour "
+    b"before the lowest tide and stays to watch the water recede across the flats. Naturalists "
+    b"have catalogued these pools for over a century, returning season after season to record them."
+)
+
+# A genuine content page (<main>, substantial prose) with its OWN in-content pagination nav and
+# a related-links footer. The reviewers' regression case: pre-#13-fix these link-dense but
+# legitimate in-content navs were counted; the fix must NOT strip them (region has real prose).
+_CONTENT_WITH_INPAGE_NAV = _doc(
+    b"<main class='entry-content'><h1>Chapter Seven</h1><p>" + _PROSE + b"</p>"
+    b"<nav class='pagination'><a href='/p1'>1</a><a href='/p2'>2</a><a href='/p3'>3</a>"
+    b"<a href='/p4'>4</a><a href='/p5'>5</a><a href='/p6'>6</a></nav>"
+    b"<footer class='related'><a href='/r1'>One</a><a href='/r2'>Two</a></footer></main>"
+)
+
+# A table-of-contents nav + entry footer inside a region that is a DESCENDANT of <article>
+# (the article carries a byline outside the nested role=main, so locate settles on role=main).
+# The adversarial finding: a deepcopy would sever the <article> ancestor and strip these. With
+# the prose gate this region is trusted verbatim, so ancestry is never consulted.
+_ARTICLE_DESCENDANT_TOC = _doc(
+    b"<article><header class='byline'>By Jane Doe, senior correspondent, filed Tuesday</header>"
+    b"<div role='main'><h1>Report Title</h1>"
+    b"<nav class='toc'><a href='#a'>A</a><a href='#b'>B</a><a href='#c'>C</a></nav>"
+    b"<p>" + _PROSE + b"</p>"
+    b"<footer class='entry-footer'><a href='/r1'>One</a><a href='/r2'>Two</a></footer></div></article>"
+)
+
+# A THIN page (prose < the region floor) whose title + hero image live in a <header>: the
+# prose-thin branch must keep this link-sparse header (title/hero is content, not chrome).
+_THIN_TITLE_HERO = _doc(
+    b"<main><header class='eh'><h1>Current Sponsors</h1><img src='/hero.png'></header>"
+    b"<p>Thank you to our sponsors this year.</p></main>"
+)
+
+
+class TestSuccessPathProseGate:
+    """issue #13: on the SUCCESS path a located region with real prose of its own is trusted
+    verbatim -- its in-content nav/footer/header is content, not chrome -- while only a
+    PROSE-THIN region (trafilatura latched onto the nav) has its leaked site menus stripped.
+    Guards the two reviewer findings: genuine content is never under-counted, and de-chroming
+    a real region (which a deepcopy would sever from its <article> ancestor) never happens."""
+
+    def _counts(self, subtree):
+        return count_structure(subtree, "https://example.com/p", is_internal=_internal, asset_extensions=ASSET_EXTS)
+
+    def test_content_region_with_inpage_nav_is_kept_verbatim(self):
+        # Real prose -> verbatim: the 6 pagination links + 2 related links are ALL counted.
+        result = extract_content(_CONTENT_WITH_INPAGE_NAV)
+        assert result.main_content_extracted is True
+        assert self._counts(result.subtree)["link_count"] == 8
+
+    def test_toc_inside_article_descendant_is_kept(self):
+        # The severed-ancestry case: TOC anchors + entry-footer links survive (region has prose).
+        result = extract_content(_ARTICLE_DESCENDANT_TOC)
+        hrefs = {a.get("href") for a in result.subtree.xpath(".//a[@href]")}
+        assert {"#a", "#b", "#c", "/r1", "/r2"} <= hrefs
+
+    def test_thin_region_keeps_link_sparse_title_and_hero(self):
+        # Prose-thin branch: the title heading and hero image (a link-sparse <header>) are kept.
+        result = extract_content(_THIN_TITLE_HERO)
+        c = self._counts(result.subtree)
+        assert c["heading_count"] == 1 and c["image_count"] == 1
+
+    def test_thin_navlatch_page_does_not_count_site_nav(self):
+        # A thin page dominated by a site nav + footer must not report them as page content:
+        # whichever prose-thin path handles it, only the single in-content link survives.
+        html = _doc(
+            b"<div class='site-inner'>"
+            b"<nav>" + b"".join(b"<a href='/nav%d'>Menu %d</a>" % (i, i) for i in range(12)) + b"</nav>"
+            b"<main><h1>Current Sponsors</h1><p>Thank you to <a href='/big'>Big Co</a>.</p></main>"
+            b"<footer role='contentinfo'><a href='/privacy'>Privacy</a><a href='/terms'>Terms</a>"
+            b"<a href='/map'>Sitemap</a><a href='/x'>X</a></footer></div>"
+        )
+        result = extract_content(html)
+        assert {a.get("href") for a in result.subtree.xpath(".//a[@href]")} == {"/big"}
+
+
+class TestDechromeMenus:
+    """issue #13: _dechrome_menus strips only LINK-DENSE chrome from a prose-thin region and is
+    ancestry-free (immune to the deepcopy that severs an <article> parent)."""
+
+    def test_strips_dense_menu_keeps_sparse_header_and_footer(self):
+        el = lxml_html.fromstring(
+            b"<div><nav><a href='/1'>1</a><a href='/2'>2</a><a href='/3'>3</a>"
+            b"<a href='/4'>4</a><a href='/5'>5</a></nav>"
+            b"<header><h1>Title</h1><img src='/hero.png'></header>"
+            b"<footer><a href='/only'>only</a></footer></div>"
+        )
+        out = ce._dechrome_menus(el)
+        hrefs = {a.get("href") for a in out.xpath(".//a[@href]")}
+        assert hrefs == {"/only"}  # 5-link nav dropped; 1-link footer kept
+        assert out.xpath("count(.//h1)") == 1 and out.xpath("count(.//img)") == 1  # header kept
+
+    def test_operates_on_a_copy(self):
+        el = lxml_html.fromstring(
+            b"<div><nav><a href='/1'>1</a><a href='/2'>2</a><a href='/3'>3</a><a href='/4'>4</a></nav><p>x</p></div>"
+        )
+        ce._dechrome_menus(el)
+        assert el.xpath("count(.//nav)") == 1  # original untouched
+
+    def test_nav_nested_in_hero_header_drops_only_the_nav(self):
+        # Standard markup: the site nav lives INSIDE the hero <header> alongside the title and
+        # logo. The header is a container (has an <h1>/<img>), so it must be kept and only its
+        # nested <nav> dropped -- not the whole header (which would zero the title + hero image).
+        el = lxml_html.fromstring(
+            b"<div><header class='hero'><img src='/logo.png'><h1>Our 2026 Sponsors</h1>"
+            b"<nav><a href='/home'>Home</a><a href='/about'>About</a>"
+            b"<a href='/sponsors'>Sponsors</a><a href='/contact'>Contact</a></nav></header></div>"
+        )
+        out = ce._dechrome_menus(el)
+        assert out.xpath("count(.//h1)") == 1 and out.xpath("count(.//img)") == 1  # title+hero kept
+        assert out.xpath("count(.//a[@href])") == 0  # the 4-link nav inside the header is dropped
+
+
 class TestComponentSignals:
     """issue #12: detect interactive JS components (sliders/carousels/accordions/tabs/
     galleries) by container markers -- real dev work otherwise invisible or miscounted."""

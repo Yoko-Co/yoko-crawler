@@ -84,6 +84,19 @@ _CONTENT_ANCESTOR_TAGS = frozenset({"article"})
 # A chrome block with more non-link prose than this is likely mis-wrapped real content.
 _MIN_CHROME_PROSE_WORDS = 25
 
+# Nav-latch handling on the SUCCESS path (issue #13). When a located main region carries at
+# least this many non-link prose words it is trusted verbatim -- its own in-content nav/footer
+# (TOC, pagination, byline, related links, title + hero image) is content and is counted, so a
+# genuine content page is never de-chromed (no under-count; no <article>-ancestry dependence).
+# Only a PROSE-THIN located region -- the pathology where trafilatura's "main text" is the nav
+# menu, so locate settles on a whole-page wrapper like div.Site-inner on a thin marketing/
+# sponsor page -- has its leaked site menus stripped. Same word floor as _MIN_CHROME_PROSE_WORDS.
+_MIN_REGION_PROSE_WORDS = _MIN_CHROME_PROSE_WORDS
+# Inside a prose-thin region, a nav/aside/header/footer (or navigation/banner/contentinfo/
+# search role) block with MORE than this many links is a leaked site menu and is dropped; a
+# link-sparse block (a page title + hero image, a one-line byline) is the page's own and kept.
+_LEAKED_MENU_LINK_FLOOR = 3
+
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -261,6 +274,47 @@ def _dechrome(body_el: etree._Element) -> etree._Element:
     to_drop = [el for el in clone.iter() if _is_chrome(el)]
     for el in to_drop:
         if el.getparent() is not None:  # skip anything already removed with an ancestor
+            el.drop_tree()
+    return clone
+
+
+def _is_leaked_menu(el: etree._Element) -> bool:
+    """Whether `el` is a leaked site menu inside a PROSE-THIN located region (issue #13): a
+    nav/aside/header/footer tag or navigation/banner/contentinfo/search role that is link-dense
+    (> _LEAKED_MENU_LINK_FLOOR links) AND holds no non-menu content of its own. Deliberately
+    link-count based and ancestry-FREE: it runs on a region already known to carry almost no
+    prose of its own, so there is no real in-content navigation to protect, and being
+    ancestry-free it is immune to the deepcopy that severs an <article> parent.
+
+    A block that holds its OWN title/media/prose -- a heading, an <img>, or non-link prose --
+    is a CONTAINER (e.g. a hero `<header>` wrapping the site nav), not a pure menu: it is kept
+    so its title + hero image survive, and its nested `<nav>` is dropped on its own (it matches
+    _is_leaked_menu independently). A link-sparse header/footer stays for the same reason."""
+    if not isinstance(el.tag, str):
+        return False  # comments / processing instructions
+    tag = el.tag.lower()
+    role = (el.get("role") or "").strip().lower()
+    if tag not in _CHROME_TAGS and role not in _CHROME_ROLES:
+        return False
+    if int(el.xpath("count(.//a[@href])")) <= _LEAKED_MENU_LINK_FLOOR:
+        return False  # link-sparse: the page's own header/footer, not a menu
+    # Link-dense, but a heading / image / real prose of its own means it merely WRAPS a menu
+    # (drop that nested menu instead) rather than being one -- don't take its title/hero with it.
+    if el.xpath("count(.//h1|.//h2|.//h3|.//h4|.//h5|.//h6|.//img)") > 0:
+        return False
+    return _prose_word_count(el) < _MIN_CHROME_PROSE_WORDS
+
+
+def _dechrome_menus(subtree: etree._Element) -> etree._Element:
+    """Return a COPY of a PROSE-THIN located `subtree` with its leaked site menus removed
+    (issue #13). Unlike _dechrome (body-fallback path), this strips only link-dense chrome
+    (_is_leaked_menu) and keeps link-sparse header/footer, so a thin page's title + hero image
+    survive while a swept-in nav/footer menu does not. Deep copy so `body_subtree` is untouched;
+    parent check so a nested menu isn't double-dropped."""
+    clone = copy.deepcopy(subtree)
+    to_drop = [el for el in clone.iter() if _is_leaked_menu(el)]
+    for el in to_drop:
+        if el.getparent() is not None:
             el.drop_tree()
     return clone
 
@@ -523,4 +577,17 @@ def extract_content(body: bytes) -> ExtractionResult:
         # (issue #9), but still hash the (better) main text.
         return ExtractionResult(_dechrome(body_el), body_el, False, normalized)
 
-    return ExtractionResult(subtree, body_el, True, normalized)
+    if _prose_word_count(subtree) >= _MIN_REGION_PROSE_WORDS:
+        # The located region carries real prose of its OWN: trust it verbatim. Its in-content
+        # nav/footer/header (TOC, pagination, byline, related links, title, hero image) is
+        # content and is counted -- we never de-chrome a genuine content region, so there is no
+        # under-count and no dependence on <article> ancestry (which a deepcopy would sever).
+        return ExtractionResult(subtree, body_el, True, normalized)
+
+    # Prose-thin located region (issue #13): trafilatura's "main text" was the nav menu, so
+    # locate settled on a whole-page wrapper (e.g. `div.Site-inner` on a thin marketing/sponsor
+    # page) that is almost entirely links. Counting it verbatim reports the site nav/footer as
+    # page content and falsely trips many_links / image_heavy. Strip only the link-dense menus
+    # it swept in (keeping a link-sparse title/hero header) rather than de-chroming a real
+    # region -- so the fix never touches genuine content pages.
+    return ExtractionResult(_dechrome_menus(subtree), body_el, True, normalized)
