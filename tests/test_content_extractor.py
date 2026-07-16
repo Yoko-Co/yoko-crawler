@@ -884,3 +884,78 @@ class TestSliderStandaloneScope:
         assert counts["image_count"] == 2 and counts["standalone_image_count"] == 2
         # But the page-wide slider signal still detects the hero carousel.
         assert ce.slider_signals(result.body_subtree)["slider_count"] == 1
+
+
+class TestScriptSignals:
+    """issue #28: third-party integrations via external <script src> hosts. Chat/forms/
+    booking/CRM widgets inject via script tags (not iframes) -- the surprise-integration
+    blind spot. Routine hosts (analytics/CDN/fonts) and the site's own scripts don't count."""
+
+    from script_allowlist import load_benign_script_hosts as _lbsh
+    BENIGN = _lbsh()
+    SELF = frozenset({"example.com", "www.example.com"})
+
+    def _s(self, body):
+        return ce.script_signals(body, self.BENIGN, self.SELF)
+
+    def test_flags_distinct_nonbenign_integrations(self):
+        body = (
+            b"<html><head>"
+            b"<script src='https://widget.intercom.io/w'></script>"
+            b"<script src='https://js.hsforms.net/forms/v2.js'></script>"
+            b"<script src='https://js.hsforms.net/forms/embed.js'></script>"  # same host, dedup
+            b"</head><body>x</body></html>"
+        )
+        r = self._s(body)
+        assert r["script_embed_count_nonbenign"] == 2  # intercom + hsforms (deduped)
+        assert r["script_hosts"] == ["widget.intercom.io", "js.hsforms.net"]
+
+    def test_benign_hosts_excluded(self):
+        body = (
+            b"<html><head>"
+            b"<script src='https://code.jquery.com/jquery.js'></script>"
+            b"<script src='https://www.googletagmanager.com/gtag/js'></script>"
+            b"<script src='https://drift.com/widget.js'></script>"
+            b"</head><body>x</body></html>"
+        )
+        r = self._s(body)
+        assert r["script_hosts"] == ["drift.com"]  # routine jQuery/GTM excluded, only the widget
+        assert r["script_embed_count_nonbenign"] == 1
+
+    def test_own_and_relative_scripts_skipped(self):
+        body = (
+            b"<html><head>"
+            b"<script src='/js/app.js'></script>"                       # relative
+            b"<script src='https://www.example.com/theme/main.js'></script>"  # own host
+            b"<script src='https://example.com/x.js'></script>"         # own apex
+            b"</head><body>x</body></html>"
+        )
+        r = self._s(body)
+        assert r["script_hosts"] == [] and r["script_embed_count_nonbenign"] == 0
+
+    def test_recaptcha_loader_not_flagged(self):
+        # www.google.com/recaptcha/api.js is on virtually every WP form page -- routine, not
+        # an integration surprise. (Regression for the allowlist-intent gap.)
+        r = self._s(b"<html><head><script src='https://www.google.com/recaptcha/api.js'></script></head><body>x</body></html>")
+        assert r["script_hosts"] == [] and r["script_embed_count_nonbenign"] == 0
+
+    def test_polyfill_io_is_flagged(self):
+        # polyfill.io (2024 supply-chain compromise) must be surfaced, not allowlisted.
+        r = self._s(b"<html><head><script src='https://cdn.polyfill.io/v3/polyfill.min.js'></script></head><body>x</body></html>")
+        assert r["script_hosts"] == ["cdn.polyfill.io"] and r["script_embed_count_nonbenign"] == 1
+
+    def test_protocol_relative_host_flagged(self):
+        r = self._s(b"<html><body><script src='//cdn.calendly.com/widget.js'></script></body></html>")
+        assert r["script_hosts"] == ["cdn.calendly.com"] and r["script_embed_count_nonbenign"] == 1
+
+    def test_inline_and_srcless_scripts_ignored(self):
+        r = self._s(b"<html><body><script>var x=1;</script><script></script></body></html>")
+        assert r["script_hosts"] == [] and r["script_embed_count_nonbenign"] == 0
+
+    def test_unparseable_and_empty_bodies(self):
+        assert self._s(b"")["script_hosts"] == []
+        assert self._s(b"\x00\xff not html")["script_embed_count_nonbenign"] == 0
+
+    def test_empty_enrichment_has_script_fields(self):
+        e = ce.empty_enrichment()
+        assert e["script_hosts"] == [] and e["script_embed_count_nonbenign"] == 0

@@ -15,9 +15,11 @@ from content_extractor import (
     embed_signals,
     empty_enrichment,
     extract_content,
+    script_signals,
     slider_signals,
 )
 from embed_allowlist import load_benign_hosts
+from script_allowlist import load_benign_script_hosts
 
 # Zero/empty enrichment defaults come from content_extractor.empty_enrichment()
 # (the single source of truth for field names). content_text is handled
@@ -172,8 +174,9 @@ class WebsiteSpider(scrapy.Spider):
         # Needed so iframe_hosts (a list) can be JSON-encoded for CSV output,
         # where a real array can't round-trip. Defaults to jsonlines.
         self.output_format = str(kwargs.get("output_format", "jsonlines")).lower()
-        # Resolve the benign-embed allowlist once per crawl.
+        # Resolve the benign-embed and benign-script allowlists once per crawl.
         self.benign_hosts = load_benign_hosts()
+        self.benign_script_hosts = load_benign_script_hosts()
 
         domain_arg = kwargs.get("domain")
         if not domain_arg:
@@ -187,6 +190,9 @@ class WebsiteSpider(scrapy.Spider):
         else:
             self.allowed_domains = [domain, f"www.{domain}"]
         self.start_urls = [f"https://{domain}/"]
+        # The site's own hosts -- a same-site <script src> is the site's own code, not a
+        # third-party integration, so script_signals skips it (issue #28).
+        self.self_hosts = frozenset(self.allowed_domains)
 
         # Build exclude sets for scheduling vs emitting
         if self.reach_pagination:
@@ -455,6 +461,11 @@ class WebsiteSpider(scrapy.Spider):
                 # Embeds are page-wide: surprising iframes live in headers,
                 # footers, and sidebars, not just the main content region.
                 signals = embed_signals(result.body_subtree, self.benign_hosts)
+                # Third-party integrations inject via <script src> anywhere on the page too
+                # (issue #28) -- the iframe blind spot's bigger sibling.
+                scripts = script_signals(
+                    response.body, self.benign_script_hosts, self.self_hosts
+                )
                 # Interactive JS components are page-wide too (issue #12); image sliders/
                 # carousels are the slider subset of that, counted page-wide (issue #25).
                 components = component_signals(result.body_subtree)
@@ -467,6 +478,8 @@ class WebsiteSpider(scrapy.Spider):
                 fields["component_count"] = components["component_count"]
                 fields["slider_count"] = sliders["slider_count"]
                 fields["iframe_hosts"] = signals["iframe_hosts"]
+                fields["script_embed_count_nonbenign"] = scripts["script_embed_count_nonbenign"]
+                fields["script_hosts"] = scripts["script_hosts"]
                 content_text = result.normalized_text
             except Exception:
                 # Never let one bad page drop the row (and its original five
@@ -491,10 +504,11 @@ class WebsiteSpider(scrapy.Spider):
         else:
             fields = empty_enrichment()
 
-        # CSV can't hold a real array; JSON-encode iframe_hosts so it round-trips.
-        # jsonlines keeps the native array (what yoko-corpus consumes).
+        # CSV can't hold a real array; JSON-encode the list fields so they round-trip.
+        # jsonlines keeps the native arrays (what yoko-corpus consumes).
         if self.output_format == "csv":
             fields["iframe_hosts"] = json.dumps(fields["iframe_hosts"])
+            fields["script_hosts"] = json.dumps(fields["script_hosts"])
 
         # content_text is the one conditional field: present only with
         # --emit-content (absent means "not requested", not "empty").
