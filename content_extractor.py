@@ -129,6 +129,11 @@ ENRICHMENT_FIELD_NAMES = (
     "iframe_count",
     "heading_count",
     "embed_count_nonbenign",
+    # Count of DISTINCT non-benign external <script src> hosts (issue #28): third-party
+    # integrations (chat, forms-as-a-service, booking, donation, CRM tags, social) that inject
+    # via a script rather than an iframe -- the surprise-integration blind spot. Routine hosts
+    # (analytics/CDN/fonts) and the site's own scripts are excluded.
+    "script_embed_count_nonbenign",
     # Count of interactive JS components (sliders/carousels/accordions/tabs/galleries/
     # lightboxes) detected by container markers (issue #12). Real design+dev work that is
     # otherwise invisible (JS-hydrated) or laundered into word/image counts.
@@ -137,6 +142,10 @@ ENRICHMENT_FIELD_NAMES = (
     # issue #25) -- interactive component work, kept distinct from a plain wall of images.
     "slider_count",
     "iframe_hosts",
+    # Distinct NON-BENIGN external <script src> hostnames (issue #28), first-seen order = the
+    # third-party integrations themselves (chat/forms/booking/CRM/social), so downstream can
+    # LIST them. script_embed_count_nonbenign == len(script_hosts). Excludes own + routine hosts.
+    "script_hosts",
     # The page's <link rel="canonical"> target, normalized (issue #10). "" when absent.
     # Downstream (yoko-corpus) uses it to collapse query-string/pagination/variant URLs to
     # their canonical page. Populated by the spider (it reads the response's <head>), not by
@@ -153,6 +162,7 @@ def empty_enrichment() -> dict:
     fields["content_hash"] = ""
     fields["main_content_extracted"] = False
     fields["iframe_hosts"] = []
+    fields["script_hosts"] = []
     fields["canonical"] = ""
     return fields
 
@@ -582,6 +592,60 @@ def embed_signals(
             nonbenign += 1
 
     return {"iframe_hosts": hosts, "embed_count_nonbenign": nonbenign}
+
+
+def script_signals(
+    body: bytes,
+    benign_hosts: frozenset[str],
+    self_hosts: frozenset[str],
+) -> dict:
+    """Compute the "third-party integration" signals from external ``<script src>`` hosts
+    across the whole page (issue #28).
+
+    Most third-party functionality (chat, forms-as-a-service, booking, donation, CRM tags,
+    social embeds) injects via a script tag, not an iframe -- the crawler was blind to all of
+    it. Returns ``script_hosts`` (distinct NON-BENIGN external script hostnames = the actual
+    third-party integrations, first-seen order) and ``script_embed_count_nonbenign`` (=
+    len(script_hosts) -- "how many separate integrations", not how many script tags).
+
+    We record only the non-benign hosts (not benign jQuery/GA noise) so the list IS the
+    integration list downstream needs, with no allowlist required corpus-side. This is a
+    DELIBERATE divergence from iframe_hosts (which records ALL hosts for re-classification):
+    the tradeoff is that if the allowlist changes, a re-crawl -- not old data -- reflects it.
+    That fits a re-crawling scoping tool, and keeps benign CDN noise out of the report. Takes
+    the RAW
+    body bytes and parses them fresh, because _parse_body drops <script> tags (to keep word
+    counts clean) -- so the stripped body_subtree has no scripts to scan. Scans <head> and
+    <body>. ``self_hosts`` (the site's own base + www) are its own code, not an integration;
+    ``benign_hosts`` (analytics/CDN/fonts) are routine infrastructure. Both are excluded. Both
+    sets are passed in (resolved once per crawl) so this stays a pure, env-free function.
+    """
+    empty = {"script_hosts": [], "script_embed_count_nonbenign": 0}
+    if not body or len(body) > MAX_BODY_BYTES:
+        return empty
+    try:
+        root = lxml_html.fromstring(body)
+    except (etree.ParserError, etree.XMLSyntaxError, ValueError):
+        return empty
+    if root is None:
+        return empty
+
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for script in root.iter("script"):
+        src = (script.get("src") or "").strip()
+        if not src:
+            continue
+        host = (urlparse(src).hostname or "").lower().rstrip(".")
+        if not host:
+            continue  # relative / same-origin path -- not a third-party host
+        if is_benign_host(host, self_hosts) or is_benign_host(host, benign_hosts):
+            continue  # the site's own code, or routine infrastructure -- not an integration
+        if host not in seen:
+            seen.add(host)
+            hosts.append(host)
+
+    return {"script_hosts": hosts, "script_embed_count_nonbenign": len(hosts)}
 
 
 def extract_content(body: bytes) -> ExtractionResult:
