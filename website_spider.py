@@ -516,6 +516,7 @@ class WebsiteSpider(scrapy.Spider):
         if self.output_format == "csv":
             fields["iframe_hosts"] = json.dumps(fields["iframe_hosts"])
             fields["script_hosts"] = json.dumps(fields["script_hosts"])
+            fields["internal_link_targets"] = json.dumps(fields["internal_link_targets"])
 
         # content_text is the one conditional field: present only with
         # --emit-content (absent means "not requested", not "empty").
