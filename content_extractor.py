@@ -108,6 +108,9 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # intentionally NOT here: it is conditional on --emit-content.
 ENRICHMENT_FIELD_NAMES = (
     "content_hash",
+    # Coarse structural fingerprint of the page's layout (issue #36): pages built from the same
+    # template share it regardless of content, so the corpus can cluster "N pages, ~M templates".
+    "structure_hash",
     "main_content_extracted",
     "word_count",
     "link_count",
@@ -160,6 +163,7 @@ def empty_enrichment() -> dict:
     bodies). Returns a new dict and a new iframe_hosts list every call."""
     fields = {name: 0 for name in ENRICHMENT_FIELD_NAMES}
     fields["content_hash"] = ""
+    fields["structure_hash"] = ""
     fields["main_content_extracted"] = False
     fields["iframe_hosts"] = []
     fields["script_hosts"] = []
@@ -215,6 +219,102 @@ def content_hash(normalized_text: str) -> str:
     if not normalized_text:
         return ""
     return hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+
+
+# Coarse structural fingerprint (issue #36) -- clusters pages into distinct TEMPLATES.
+_SKELETON_MAX_DEPTH = 4
+# Inline / text-carrying tags dropped from the skeleton: they are content, not layout, so
+# keeping them would let content differences split pages of the same template.
+_SKELETON_SKIP_TAGS = frozenset({
+    "a", "span", "b", "i", "em", "strong", "small", "sub", "sup", "u", "mark", "abbr",
+    "cite", "q", "br", "wbr", "img", "picture", "source", "svg", "label", "time", "code",
+    "bdi", "bdo", "font", "s", "del", "ins",
+})
+# Site chrome skipped when fingerprinting: page-invariant furniture that would only blur
+# distinct templates together (it dominates the skeleton once content sinks below the depth
+# budget). Excluding it makes the fingerprint about the CONTENT template, not the theme.
+# NOTE: <aside> is intentionally NOT here -- unlike nav/header/footer it is frequently CONTENT
+# (in-article TOC, related-posts rail, docs sidebar) and a real template discriminator, so a
+# sidebar-vs-no-sidebar difference must split, not merge.
+_CHROME_SKELETON_TAGS = frozenset({"nav", "header", "footer"})
+
+
+def _structural_children(el: etree._Element) -> list:
+    """Element children that carry layout: real tags, excluding inline/text tags and site
+    chrome (nav/header/footer/aside)."""
+    out = []
+    for child in el:
+        tag = child.tag
+        if not isinstance(tag, str):
+            continue  # comments / processing instructions
+        tag = tag.lower()
+        if tag in _SKELETON_SKIP_TAGS or tag in _CHROME_SKELETON_TAGS:
+            continue
+        out.append(child)
+    return out
+
+
+def _content_root(body_el: etree._Element) -> etree._Element:
+    """Descend from <body> past site chrome and pure single-child WRAPPER elements to the real
+    content container, so the depth budget is spent on content structure rather than the
+    theme/page-builder/SPA nesting boilerplate that wraps it (div#page > div.site-inner >
+    div.builder > main). Without this, on any wrapped site the content sinks below the depth
+    cutoff and every template collapses to one chrome-only hash -- a silent false-merge.
+
+    Descends only while there is exactly ONE structural child AND that child is itself a
+    container (has structural children of its own), so it never descends into a leaf and always
+    lands on the branching content root. Known coarse-pass limitation: two templates that differ
+    ONLY by a single-child semantic wrapper with identical inner structure (a bare <section> vs
+    <article> around the same content) descend to the same inner root and merge -- narrow, and
+    accepted for the first pass."""
+    cur = body_el
+    for _ in range(64):  # generous bound; real theme/builder nesting is a few levels deep
+        kids = _structural_children(cur)
+        if len(kids) == 1 and _structural_children(kids[0]):
+            cur = kids[0]
+        else:
+            break
+    return cur
+
+
+def _skeleton(el: etree._Element, depth: int) -> str:
+    """A depth-limited, content-free string of ``el``'s structural children (chrome + inline
+    excluded). Consecutive identical child tokens (tag + their own subtree) collapse to one, so
+    a listing of 10 vs 12 identical items -- or a gallery with N images -- produces the SAME
+    skeleton. Text and attributes are dropped entirely."""
+    if depth > _SKELETON_MAX_DEPTH:
+        return ""
+    parts: list[str] = []
+    prev: str | None = None
+    for child in _structural_children(el):
+        sub = _skeleton(child, depth + 1)
+        token = f"{child.tag.lower()}({sub})" if sub else child.tag.lower()
+        if token != prev:  # collapse consecutive identical runs (repeated cards / list items)
+            parts.append(token)
+            prev = token
+    return ",".join(parts)
+
+
+def structure_hash(body_el: etree._Element) -> str:
+    """A content-independent fingerprint of the page's coarse LAYOUT skeleton (issue #36):
+    the block-level tag tree of the CONTENT ROOT (chrome and wrapper boilerplate skipped),
+    depth-limited, with consecutive identical sibling-runs collapsed and all text/attributes
+    dropped. Pass the full <body> -- it locates the content root itself, and unlike the
+    trafilatura-located region the body is content-length-stable. Pages built from the same
+    template hash identically regardless of their content or how many items they list -- so
+    downstream can cluster pages into "N pages across ~M distinct templates".
+
+    Coarse EXACT-hash, first pass (best-guess per issue #36): it errs toward over-splitting
+    (an extra structural block -> its own cluster), the safe direction, and is tuned against
+    real crawls. Empty when the content root has no structural children (asset/empty page)."""
+    if body_el is None:
+        return ""
+    root = _content_root(body_el)
+    skeleton = _skeleton(root, 1)
+    if not skeleton:
+        return ""  # no structural content -- no fingerprint (excluded from clustering)
+    root_tag = root.tag.lower() if isinstance(root.tag, str) else "x"
+    return hashlib.sha256(f"{root_tag}({skeleton})".encode("utf-8")).hexdigest()
 
 
 def _tokens(text: str) -> list[str]:
