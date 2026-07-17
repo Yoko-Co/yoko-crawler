@@ -17,6 +17,7 @@ from content_extractor import (
     extract_content,
     script_signals,
     slider_signals,
+    structure_hash,
 )
 from embed_allowlist import load_benign_hosts
 from script_allowlist import load_benign_script_hosts
@@ -473,6 +474,12 @@ class WebsiteSpider(scrapy.Spider):
                 fields = empty_enrichment()
                 fields.update(counts)
                 fields["content_hash"] = content_hash(result.normalized_text)
+                # Structural fingerprint over the FULL body -- clusters into templates (#36).
+                # Uses body_subtree, not the located content region: the located subtree shifts
+                # with content length (trafilatura), which would split same-template pages; the
+                # body is content-stable, and shared chrome is constant across all pages so it
+                # doesn't blur distinct templates.
+                fields["structure_hash"] = structure_hash(result.body_subtree)
                 fields["main_content_extracted"] = result.main_content_extracted
                 fields["embed_count_nonbenign"] = signals["embed_count_nonbenign"]
                 fields["component_count"] = components["component_count"]

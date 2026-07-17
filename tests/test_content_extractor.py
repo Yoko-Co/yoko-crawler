@@ -959,3 +959,86 @@ class TestScriptSignals:
     def test_empty_enrichment_has_script_fields(self):
         e = ce.empty_enrichment()
         assert e["script_hosts"] == [] and e["script_embed_count_nonbenign"] == 0
+
+
+class TestStructureHash:
+    """issue #36: a content-independent fingerprint of the page's layout, over the full body,
+    so pages built from the same template cluster regardless of content or item counts."""
+
+    def _doc(self, inner):
+        return (b"<!DOCTYPE html><html><head><title>T</title></head><body>"
+                b"<header><nav><a>Home</a><a>About</a></nav></header>"
+                + inner + b"<footer><a>Privacy</a></footer></body></html>")
+
+    def _h(self, inner):
+        return ce.structure_hash(extract_content(self._doc(inner)).body_subtree)
+
+    def _listing(self, n, words):
+        cards = b"".join(b"<div class='card'><h3>Item %d</h3><p>%s</p><img src=/x.jpg></div>" % (i, words)
+                         for i in range(n))
+        return b"<main><h1>Directory</h1><div class='grid'>" + cards + b"</div></main>"
+
+    def _article(self, body):
+        return b"<main><article><h1>Title</h1><p>" + body + b"</p><p>" + body + b"</p></article></main>"
+
+    def test_same_template_different_item_count_clusters(self):
+        # A listing with 3 vs 12 cards (different content) -> identical fingerprint.
+        assert self._h(self._listing(3, b"alpha")) == self._h(self._listing(12, b"quite different text"))
+
+    def test_content_length_independent(self):
+        # Same article template, long vs short body -> identical (not sensitive to word count).
+        long_body = b"word " * 60
+        assert self._h(self._article(long_body)) == self._h(self._article(b"short"))
+
+    def test_distinct_templates_differ(self):
+        listing = self._h(self._listing(4, b"x"))
+        article = self._h(self._article(b"y"))
+        landing = self._h(b"<main><section><div class='swiper'><div>a</div></div></section>"
+                          b"<section><table><tr><td>z</td></tr></table></section></main>")
+        assert len({listing, article, landing}) == 3
+
+    def test_wrapper_chains_do_not_false_merge(self):
+        # Regression: real themes/builders wrap content in div#page > div.site-inner >
+        # div.builder > main. The fingerprint must skip chrome + unwrap to the content root,
+        # or every template collapses to one chrome-only hash (a silent false-merge).
+        def wrap(main):
+            return (b"<!DOCTYPE html><html><head><title>T</title></head><body>"
+                    b"<div id='page'><header><nav><a>Home</a></nav></header>"
+                    b"<div class='site-inner'><div class='builder'>" + main + b"</div></div>"
+                    b"<footer><a>Privacy</a></footer></div></body></html>")
+        article = self._raw(wrap(b"<main><article><h1>T</h1><p>x</p><blockquote>q</blockquote></article></main>"))
+        landing = self._raw(wrap(b"<main><section><div><h2>a</h2><p>b</p></div></section>"
+                                 b"<section><div><table><tr><td>c</td></tr></table></div></section></main>"))
+        assert article != landing  # distinct templates survive the wrapper chain
+        # And same template through the wrapper, different content length -> still clusters.
+        a2 = self._raw(wrap(b"<main><article><h1>Different Title Entirely</h1><p>" + b"word " * 50
+                            + b"</p><blockquote>q</blockquote></article></main>"))
+        assert article == a2
+
+    def _raw(self, doc):
+        return ce.structure_hash(extract_content(doc).body_subtree)
+
+    def test_sidebar_is_a_template_discriminator(self):
+        # <aside> is content (TOC / related rail / sidebar), NOT chrome: a template WITH a
+        # sidebar must not merge with one WITHOUT, and the tag choice (<aside> vs div.sidebar)
+        # must not change clustering.
+        no_side = self._doc(b"<main><article><h1>T</h1><p>x</p><p>y</p></article></main>")
+        aside = self._doc(b"<main><article><h1>T</h1><p>x</p><p>y</p></article>"
+                          b"<aside><div><a>Related</a></div></aside></main>")
+        div_side = self._doc(b"<main><article><h1>T</h1><p>x</p><p>y</p></article>"
+                             b"<div class='sidebar'><div><a>Related</a></div></div></main>")
+        h_no, h_aside, h_div = (ce.structure_hash(extract_content(d).body_subtree)
+                                for d in (no_side, aside, div_side))
+        assert h_aside != h_no and h_div != h_no
+
+    def test_empty_or_structureless_is_blank(self):
+        assert ce.structure_hash(lxml_html.fromstring(b"<body></body>")) == ""
+        # A body of only inline/text tags (no block structure) has no fingerprint.
+        assert ce.structure_hash(lxml_html.fromstring(b"<body><span>hi</span><a>x</a></body>")) == ""
+
+    def test_empty_enrichment_has_blank_structure_hash(self):
+        assert ce.empty_enrichment()["structure_hash"] == ""
+
+    def test_deterministic(self):
+        a = self._listing(5, b"one")
+        assert self._h(a) == self._h(a)
