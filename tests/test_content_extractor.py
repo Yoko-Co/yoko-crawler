@@ -1042,3 +1042,34 @@ class TestStructureHash:
     def test_deterministic(self):
         a = self._listing(5, b"one")
         assert self._h(a) == self._h(a)
+
+
+class TestInternalLinkTargets:
+    """issue #45: the content-region internal link edge list -- distinct, fragment-stripped,
+    with external / in-page-anchor / self-page links excluded, and capped."""
+
+    def _c(self, html):
+        return count_structure(
+            lxml_html.fromstring(html), "https://example.com/p",
+            is_internal=_internal, asset_extensions=ASSET_EXTS,
+        )
+
+    def test_distinct_internal_targets_only(self):
+        c = self._c(
+            "<body>"
+            '<a href="/a">a</a><a href="/a#sec">a again</a>'   # one target, fragment stripped
+            '<a href="/b">b</a>'
+            '<a href="https://other.com/x">ext</a>'            # external -> excluded
+            '<a href="#top">anchor</a>'                        # in-page anchor -> excluded
+            '<a href="/p">self</a>'                            # self page -> excluded
+            "</body>"
+        )
+        assert set(c["internal_link_targets"]) == {
+            "https://example.com/a",
+            "https://example.com/b",
+        }
+
+    def test_targets_capped(self):
+        links = "".join(f'<a href="/p{i}">l</a>' for i in range(150))
+        c = self._c(f"<body>{links}</body>")
+        assert len(c["internal_link_targets"]) == 100  # _MAX_INTERNAL_TARGETS
