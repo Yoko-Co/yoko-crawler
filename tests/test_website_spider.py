@@ -313,6 +313,16 @@ class TestIframeHostsEncoding:
         # Round-trips back to the host list.
         assert json.loads(row["iframe_hosts"]) == ["public.tableau.com"]
 
+    def test_csv_json_encodes_internal_link_targets(self):
+        # issue #45: the edge list is a peer of iframe_hosts/script_hosts -- it must also survive
+        # CSV export as a JSON string, not a comma-mangled raw list.
+        import json
+
+        spider = WebsiteSpider(domain="example.com", output_format="csv")
+        row = _emit_one(spider, _html_response())
+        assert isinstance(row["internal_link_targets"], str)
+        assert isinstance(json.loads(row["internal_link_targets"]), list)
+
     def test_csv_with_emit_content_has_both_fields(self):
         spider = WebsiteSpider(
             domain="example.com", output_format="csv", emit_content=1

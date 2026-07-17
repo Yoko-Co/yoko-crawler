@@ -115,6 +115,11 @@ ENRICHMENT_FIELD_NAMES = (
     "word_count",
     "link_count",
     "internal_link_count",
+    # Distinct internal link TARGETS from the content region (issue #45), fragment-stripped and
+    # capped. The corpus builds the internal link graph from these -- inbound counts (which
+    # pages are most linked-to = promotion) and total link volume (301/redirect + link-
+    # replacement cost). Content-scoped (post de-chrome) so site-wide nav links don't dominate.
+    "internal_link_targets",
     "external_link_count",
     "pdf_link_count",
     "asset_link_count",
@@ -167,6 +172,7 @@ def empty_enrichment() -> dict:
     fields["main_content_extracted"] = False
     fields["iframe_hosts"] = []
     fields["script_hosts"] = []
+    fields["internal_link_targets"] = []
     fields["canonical"] = ""
     return fields
 
@@ -536,6 +542,9 @@ def _is_anchor_link(href: str, page_url: str) -> bool:
     return base == page_url.partition("#")[0]
 
 
+_MAX_INTERNAL_TARGETS = 100  # per-page edge-list cap (issue #45): bounds a link-farm row
+
+
 def count_structure(
     subtree: etree._Element,
     page_url: str,
@@ -556,6 +565,10 @@ def count_structure(
 
     link_count = internal_link_count = pdf_link_count = 0
     asset_link_count = anchor_link_count = 0
+    # Distinct internal link targets (issue #45): the edge list the corpus turns into the link
+    # graph. Fragment-stripped so /a and /a#sec are one edge; ordered-dedup via dict; capped so
+    # a runaway link farm can't bloat a row. Own-page anchors are excluded (not an edge).
+    internal_targets: dict[str, None] = {}
     for a in subtree.xpath(".//a[@href]"):
         href = a.get("href", "")
         if not href:
@@ -566,6 +579,9 @@ def count_structure(
         resolved = urljoin(page_url, href)
         if is_internal(resolved):
             internal_link_count += 1
+            target = resolved.partition("#")[0]
+            if target and target != page_url.partition("#")[0] and len(internal_targets) < _MAX_INTERNAL_TARGETS:
+                internal_targets[target] = None
         path = _href_path(resolved)
         if path.endswith(".pdf"):
             pdf_link_count += 1
@@ -591,6 +607,7 @@ def count_structure(
         "form_count": _count(".//form"),
         "iframe_count": _count(".//iframe"),
         "heading_count": _count(".//h1|.//h2|.//h3|.//h4|.//h5|.//h6"),
+        "internal_link_targets": list(internal_targets),
     }
 
 
