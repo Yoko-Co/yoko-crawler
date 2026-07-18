@@ -592,15 +592,69 @@ class TestChromeAwareCounting:
         assert self._counts(result.subtree)["link_count"] == 0
         assert result.normalized_text != ""  # hash input non-empty
 
-    def test_div_soup_chrome_is_not_stripped_known_limitation(self):
-        # Documented limitation: non-semantic chrome (<div class='menu'>) has no tag/role
-        # signal, so it is NOT stripped -- the fix helps semantic-HTML sites only.
+    def test_div_soup_nav_stripped_by_classname(self):
+        # issue #53: non-semantic chrome built from plain <div>s (no nav tag / role) is now
+        # stripped by class-name token, so a theme like ndba.com's div.mobileNavDiv no longer
+        # leaks its whole site menu into the content link count.
         body = lxml_html.fromstring(
             b"<body><div class='menu'><a href='/a'>A</a><a href='/b'>B</a></div><p>x</p></body>"
         )
-        dechromed = ce._dechrome(body)
-        hrefs = {a.get("href") for a in dechromed.xpath(".//a[@href]")}
-        assert "/a" in hrefs and "/b" in hrefs  # div-soup nav survives (limitation)
+        hrefs = {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+        assert "/a" not in hrefs and "/b" not in hrefs  # div-soup nav stripped
+
+    def test_camelcase_nav_div_stripped(self):
+        # The real ndba.com shape: a camelCase class 'mobileNavDiv' -> {mobile,nav,div} hits 'nav'.
+        body = lxml_html.fromstring(
+            b"<body><div class='mobileNavDiv'><a href='/x'>Advocacy</a><a href='/y'>About</a>"
+            b"</div><p>real page text</p></body>"
+        )
+        hrefs = {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+        assert "/x" not in hrefs and "/y" not in hrefs
+
+    def test_content_div_with_navish_class_but_prose_is_kept(self):
+        # The content guard still wins: a block whose class matches a token but which holds real
+        # prose (>= _MIN_CHROME_PROSE_WORDS) is NOT stripped -- widening chrome NAMES never
+        # widens the removal conditions.
+        prose = b" ".join([b"word"] * 40)
+        body = lxml_html.fromstring(
+            b"<body><div class='menu-section'><a href='/keep'>k</a><p>" + prose + b"</p></div></body>"
+        )
+        hrefs = {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+        assert "/keep" in hrefs  # prose-bearing block survives despite the 'menu' token
+
+    def test_masthead_hero_with_title_image_kept_on_fallback(self):
+        # issue #53 review: a name-matched hero (masthead/menu class) holding the page H1 + hero
+        # image must NOT be stripped on the body-fallback path, even with <25 prose words -- and
+        # both strip paths must agree (no asymmetry).
+        body = lxml_html.fromstring(
+            b"<body><div class='masthead'><h1>Our Story</h1><img src='/hero.jpg'>"
+            b"<a href='/read'>Read more</a></div></body>"
+        )
+        assert ce._dechrome(body).xpath("count(.//h1)") == 1
+        assert ce._dechrome(body).xpath("count(.//img)") == 1
+        assert ce._dechrome_menus(body).xpath("count(.//h1)") == 1  # parity
+
+    def test_menu_classed_gallery_images_kept_on_fallback(self):
+        # A 'menu-gallery' of image tiles is content (images), not a nav menu -> images survive.
+        tiles = b"".join(b"<a href='/p%d'><img src='/i%d.jpg'></a>" % (i, i) for i in range(6))
+        body = lxml_html.fromstring(b"<body><div class='menu-gallery'>" + tiles + b"</div></body>")
+        assert ce._dechrome(body).xpath("count(.//img)") == 6
+
+    def test_pure_navlist_no_heading_or_image_still_stripped(self):
+        # The ndba shape: a nav-classed div of link items with NO heading/image/prose is chrome.
+        body = lxml_html.fromstring(
+            b"<body><div class='mobileNavDiv'><ul><li><a href='/a'>A</a></li>"
+            b"<li><a href='/b'>B</a></li></ul></div><p>x</p></body>"
+        )
+        assert "/a" not in {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+
+    def test_name_tokens_precision(self):
+        # 'nav'/'menu' as whole tokens hit; substrings inside real words do not.
+        assert ce._has_chrome_name(lxml_html.fromstring(b"<div class='site-nav'></div>"))
+        assert ce._has_chrome_name(lxml_html.fromstring(b"<div id='mainMenu'></div>"))
+        assert not ce._has_chrome_name(lxml_html.fromstring(b"<div class='canvas'></div>"))
+        assert not ce._has_chrome_name(lxml_html.fromstring(b"<div class='navel-gazing'></div>"))
+        assert not ce._has_chrome_name(lxml_html.fromstring(b"<div class='main-content'></div>"))
 
 
 def _doc(inner: bytes) -> bytes:

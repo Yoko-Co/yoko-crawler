@@ -80,6 +80,20 @@ _NONCONTENT_TAGS = ("script", "style", "noscript", "template", "svg")
 #     real content isn't silently emptied.
 _CHROME_TAGS = ("nav", "aside", "header", "footer")
 _CHROME_ROLES = frozenset({"navigation", "banner", "contentinfo", "search"})
+# Class/id name tokens that mark chrome on themes using plain <div>s instead of semantic
+# nav/header/footer -- e.g. ASP.NET / Foundation themes where the site menu is a
+# `div.mobileNavDiv` (issue #53: this leaked nav inflated link_count and made 83% of a real
+# banking site read as "listings"). Matched as a camelCase/separated TOKEN so "mobileNavDiv" ->
+# {mobile,nav,div} hits "nav", while content classes like "canvas"/"navel"/"main-content" do
+# not. The same content-preservation guards (holds-content / prose / heading+image) still apply,
+# so a mislabeled content block is never dropped -- this only widens WHAT can be considered
+# chrome, not the conditions under which it's removed.
+_CHROME_NAME_TOKENS = frozenset({
+    "nav", "navbar", "navigation", "navmenu", "mainnav", "topnav", "subnav", "sitenav",
+    "menu", "mainmenu", "megamenu", "mobilenav", "mobilemenu", "navmobile", "hamburger",
+    "masthead", "topbar", "breadcrumb", "breadcrumbs",
+})
+_NAME_TOKEN_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|\d+")
 _CONTENT_ANCESTOR_TAGS = frozenset({"article"})
 # A chrome block with more non-link prose than this is likely mis-wrapped real content.
 _MIN_CHROME_PROSE_WORDS = 25
@@ -369,23 +383,37 @@ def _prose_word_count(el: etree._Element) -> int:
 
 
 def _holds_content(el: etree._Element) -> bool:
-    """True when a chrome-tagged/role'd element actually holds main content (a theme misusing
-    a chrome element to wrap real content), so de-chroming must NOT drop it and zero out a
-    real page. Signals: an <article>/<main> descendant, or substantial non-link prose."""
+    """True when an element flagged as chrome actually holds real content, so de-chroming must
+    NOT drop it and zero out a page. Signals: an <article>/<main> descendant; its OWN heading or
+    image (a hero/masthead/gallery holds a title or media, not just a menu -- mirrors
+    _is_leaked_menu's guard so the two strip paths agree, issue #53 review); or substantial
+    non-link prose."""
     if el.find(".//article") is not None or el.find(".//main") is not None:
+        return True
+    if el.xpath("count(.//h1|.//h2|.//h3|.//h4|.//h5|.//h6|.//img)") > 0:
         return True
     return _prose_word_count(el) >= _MIN_CHROME_PROSE_WORDS
 
 
+def _has_chrome_name(el: etree._Element) -> bool:
+    """True when `el`'s class or id carries a nav/menu chrome token (issue #53) -- for themes
+    that build the site menu from plain <div>s with no semantic tag or ARIA role. Tokenized on
+    camelCase + separators so a whole-word 'nav'/'menu' matches but 'canvas'/'navel' does not."""
+    if not isinstance(el.tag, str):
+        return False
+    name = (el.get("class") or "") + " " + (el.get("id") or "")
+    return any(t.lower() in _CHROME_NAME_TOKENS for t in _NAME_TOKEN_RE.findall(name))
+
+
 def _is_chrome(el: etree._Element) -> bool:
     """Whether `el` is site chrome to drop on the body-fallback path: a nav/aside/header/
-    footer tag or a navigation/banner/contentinfo/search ARIA role, that is NOT inside an
-    <article> and does NOT itself hold real content."""
+    footer tag, a navigation/banner/contentinfo/search ARIA role, OR a nav/menu class-name
+    (issue #53), that is NOT inside an <article> and does NOT itself hold real content."""
     if not isinstance(el.tag, str):
         return False  # comments / processing instructions
     tag = el.tag.lower()
     role = (el.get("role") or "").strip().lower()
-    if tag not in _CHROME_TAGS and role not in _CHROME_ROLES:
+    if tag not in _CHROME_TAGS and role not in _CHROME_ROLES and not _has_chrome_name(el):
         return False
     return not _within_content(el) and not _holds_content(el)
 
@@ -420,7 +448,7 @@ def _is_leaked_menu(el: etree._Element) -> bool:
         return False  # comments / processing instructions
     tag = el.tag.lower()
     role = (el.get("role") or "").strip().lower()
-    if tag not in _CHROME_TAGS and role not in _CHROME_ROLES:
+    if tag not in _CHROME_TAGS and role not in _CHROME_ROLES and not _has_chrome_name(el):
         return False
     if int(el.xpath("count(.//a[@href])")) <= _LEAKED_MENU_LINK_FLOOR:
         return False  # link-sparse: the page's own header/footer, not a menu
