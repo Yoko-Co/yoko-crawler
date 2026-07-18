@@ -383,10 +383,14 @@ def _prose_word_count(el: etree._Element) -> int:
 
 
 def _holds_content(el: etree._Element) -> bool:
-    """True when a chrome-tagged/role'd element actually holds main content (a theme misusing
-    a chrome element to wrap real content), so de-chroming must NOT drop it and zero out a
-    real page. Signals: an <article>/<main> descendant, or substantial non-link prose."""
+    """True when an element flagged as chrome actually holds real content, so de-chroming must
+    NOT drop it and zero out a page. Signals: an <article>/<main> descendant; its OWN heading or
+    image (a hero/masthead/gallery holds a title or media, not just a menu -- mirrors
+    _is_leaked_menu's guard so the two strip paths agree, issue #53 review); or substantial
+    non-link prose."""
     if el.find(".//article") is not None or el.find(".//main") is not None:
+        return True
+    if el.xpath("count(.//h1|.//h2|.//h3|.//h4|.//h5|.//h6|.//img)") > 0:
         return True
     return _prose_word_count(el) >= _MIN_CHROME_PROSE_WORDS
 

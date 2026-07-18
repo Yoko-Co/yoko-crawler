@@ -622,6 +622,32 @@ class TestChromeAwareCounting:
         hrefs = {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
         assert "/keep" in hrefs  # prose-bearing block survives despite the 'menu' token
 
+    def test_masthead_hero_with_title_image_kept_on_fallback(self):
+        # issue #53 review: a name-matched hero (masthead/menu class) holding the page H1 + hero
+        # image must NOT be stripped on the body-fallback path, even with <25 prose words -- and
+        # both strip paths must agree (no asymmetry).
+        body = lxml_html.fromstring(
+            b"<body><div class='masthead'><h1>Our Story</h1><img src='/hero.jpg'>"
+            b"<a href='/read'>Read more</a></div></body>"
+        )
+        assert ce._dechrome(body).xpath("count(.//h1)") == 1
+        assert ce._dechrome(body).xpath("count(.//img)") == 1
+        assert ce._dechrome_menus(body).xpath("count(.//h1)") == 1  # parity
+
+    def test_menu_classed_gallery_images_kept_on_fallback(self):
+        # A 'menu-gallery' of image tiles is content (images), not a nav menu -> images survive.
+        tiles = b"".join(b"<a href='/p%d'><img src='/i%d.jpg'></a>" % (i, i) for i in range(6))
+        body = lxml_html.fromstring(b"<body><div class='menu-gallery'>" + tiles + b"</div></body>")
+        assert ce._dechrome(body).xpath("count(.//img)") == 6
+
+    def test_pure_navlist_no_heading_or_image_still_stripped(self):
+        # The ndba shape: a nav-classed div of link items with NO heading/image/prose is chrome.
+        body = lxml_html.fromstring(
+            b"<body><div class='mobileNavDiv'><ul><li><a href='/a'>A</a></li>"
+            b"<li><a href='/b'>B</a></li></ul></div><p>x</p></body>"
+        )
+        assert "/a" not in {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+
     def test_name_tokens_precision(self):
         # 'nav'/'menu' as whole tokens hit; substrings inside real words do not.
         assert ce._has_chrome_name(lxml_html.fromstring(b"<div class='site-nav'></div>"))
