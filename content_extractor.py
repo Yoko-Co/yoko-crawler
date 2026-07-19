@@ -134,6 +134,9 @@ ENRICHMENT_FIELD_NAMES = (
     # pages are most linked-to = promotion) and total link volume (301/redirect + link-
     # replacement cost). Content-scoped (post de-chrome) so site-wide nav links don't dominate.
     "internal_link_targets",
+    # Distinct EXTERNAL link hostnames from the content region (issue #57): a link to a sibling
+    # members./portal./login.<domain> subdomain flags a gated portal / SSO; also external systems.
+    "external_link_hosts",
     "external_link_count",
     "pdf_link_count",
     "asset_link_count",
@@ -187,6 +190,7 @@ def empty_enrichment() -> dict:
     fields["iframe_hosts"] = []
     fields["script_hosts"] = []
     fields["internal_link_targets"] = []
+    fields["external_link_hosts"] = []
     fields["canonical"] = ""
     return fields
 
@@ -571,6 +575,7 @@ def _is_anchor_link(href: str, page_url: str) -> bool:
 
 
 _MAX_INTERNAL_TARGETS = 100  # per-page edge-list cap (issue #45): bounds a link-farm row
+_MAX_EXTERNAL_HOSTS = 50  # per-page distinct external-host cap (issue #57)
 
 
 def count_structure(
@@ -597,6 +602,10 @@ def count_structure(
     # graph. Fragment-stripped so /a and /a#sec are one edge; ordered-dedup via dict; capped so
     # a runaway link farm can't bloat a row. Own-page anchors are excluded (not an edge).
     internal_targets: dict[str, None] = {}
+    # Distinct EXTERNAL link hostnames (issue #57): a page linking to a sibling subdomain like
+    # members./portal./login.<domain> reveals a gated member portal / SSO the corpus can flag as
+    # migration complexity; also surfaces external systems + sister orgs. Ordered-dedup, capped.
+    external_hosts: dict[str, None] = {}
     for a in subtree.xpath(".//a[@href]"):
         href = a.get("href", "")
         if not href:
@@ -610,6 +619,10 @@ def count_structure(
             target = resolved.partition("#")[0]
             if target and target != page_url.partition("#")[0] and len(internal_targets) < _MAX_INTERNAL_TARGETS:
                 internal_targets[target] = None
+        else:
+            host = (urlparse(resolved).hostname or "").lower()
+            if host and len(external_hosts) < _MAX_EXTERNAL_HOSTS:
+                external_hosts[host] = None
         path = _href_path(resolved)
         if path.endswith(".pdf"):
             pdf_link_count += 1
@@ -636,6 +649,7 @@ def count_structure(
         "iframe_count": _count(".//iframe"),
         "heading_count": _count(".//h1|.//h2|.//h3|.//h4|.//h5|.//h6"),
         "internal_link_targets": list(internal_targets),
+        "external_link_hosts": list(external_hosts),
     }
 
 

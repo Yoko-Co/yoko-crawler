@@ -1127,3 +1127,23 @@ class TestInternalLinkTargets:
         links = "".join(f'<a href="/p{i}">l</a>' for i in range(150))
         c = self._c(f"<body>{links}</body>")
         assert len(c["internal_link_targets"]) == 100  # _MAX_INTERNAL_TARGETS
+
+
+class TestExternalLinkHosts:
+    """issue #57: distinct external link hostnames (sibling members./portal. subdomains flag a
+    gated portal); internal links excluded, deduped, capped."""
+
+    def _c(self, html):
+        return count_structure(lxml_html.fromstring(html), "https://example.com/p",
+                               is_internal=_internal, asset_extensions=ASSET_EXTS)
+
+    def test_distinct_external_hosts_internal_excluded(self):
+        c = self._c(
+            "<body>"
+            '<a href="https://members.example.com/login">portal</a>'
+            '<a href="https://members.example.com/dues">again</a>'   # same host -> 1
+            '<a href="/about">internal</a>'                          # internal -> excluded
+            '<a href="https://www.facebook.com/x">fb</a>'
+            "</body>"
+        )
+        assert set(c["external_link_hosts"]) == {"members.example.com", "www.facebook.com"}
