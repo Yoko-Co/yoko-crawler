@@ -517,6 +517,7 @@ class WebsiteSpider(scrapy.Spider):
             fields["iframe_hosts"] = json.dumps(fields["iframe_hosts"])
             fields["script_hosts"] = json.dumps(fields["script_hosts"])
             fields["internal_link_targets"] = json.dumps(fields["internal_link_targets"])
+            fields["external_link_hosts"] = json.dumps(fields["external_link_hosts"])
 
         # content_text is the one conditional field: present only with
         # --emit-content (absent means "not requested", not "empty").
