@@ -129,6 +129,12 @@ ENRICHMENT_FIELD_NAMES = (
     "word_count",
     "link_count",
     "internal_link_count",
+    # Inline member-login / sign-in CTAs in the content region (corpus #61): an internal link to
+    # a login/auth handler (OAuth login trigger, ReturnURL-style come-back-after-login param, or a
+    # /login·/signin·wp-login path). A same-domain member-gating signal #57's portal-SUBDOMAIN
+    # check misses. These are gate CTAs, not content, so they are EXCLUDED from link_count /
+    # internal_link_count / internal_link_targets and counted only here.
+    "member_login_link_count",
     # Distinct internal link TARGETS from the content region (issue #45), fragment-stripped and
     # capped. The corpus builds the internal link graph from these -- inbound counts (which
     # pages are most linked-to = promotion) and total link volume (301/redirect + link-
@@ -577,6 +583,35 @@ def _is_anchor_link(href: str, page_url: str) -> bool:
 _MAX_INTERNAL_TARGETS = 100  # per-page edge-list cap (issue #45): bounds a link-farm row
 _MAX_EXTERNAL_HOSTS = 50  # per-page distinct external-host cap (issue #57)
 
+# Inline member-login / sign-in CTAs (corpus #61). High-precision markers only -- the #55-57
+# review lesson is that over-broad markers (a bare `redirect_to=`) false-positive on ordinary
+# navigation. A login link is an internal <a> whose resolved URL carries an OAuth-login trigger
+# or a ReturnURL-style "come back after login" param, OR whose path is a login/sign-in handler.
+# Only an UNAMBIGUOUS login trigger. `do_oauth_login=` is a login-only OAuth param. `returnurl=`/
+# `return_url=` were dropped after PR #39 review: they are generic "come back after this action"
+# params that also ride donation/checkout return links (`/donate?return_url=/thanks`), so they
+# over-match. A same-domain login that lacks this param is still caught by the path segment below.
+_LOGIN_QUERY_MARKERS = ("do_oauth_login=",)
+# Matched as a WHOLE path SEGMENT, not a substring: `/login` must not swallow `/login-help`,
+# `/signin` must not swallow `/signing-bonus`, `/sign-in` must not swallow `/sign-in-sheet`
+# (PR #39 review). A bare `login`/`signin` segment also catches deeper handlers like
+# /account/login, /members/login, and /en/login without listing each prefix. Hyphen + underscore
+# variants cover WP (`/login`), Rails/Devise (`/users/sign_in`), and `/log-in` themes.
+_LOGIN_PATH_SEGMENTS = frozenset({"login", "log-in", "signin", "sign-in", "sign_in", "wp-login.php"})
+# Known misses left as a follow-up (higher false-positive risk, want more crawls first): WooCommerce
+# `/my-account`, and bare `/auth`·/`sso`·`/oauth`. Tracked on corpus #61.
+
+
+def _is_member_login_link(resolved_url: str) -> bool:
+    """True when an internal link is a login / sign-in CTA (corpus #61) rather than content.
+    An unambiguous OAuth-login query trigger, OR a login/sign-in PATH SEGMENT (segment-exact, not
+    a substring, so `/login-help`/`/signing-bonus`/`/sign-in-sheet` are NOT misread as logins).
+    Validated at 100% precision on the sais.org crawl (86/86 flagged links were real logins)."""
+    parts = urlparse(resolved_url.lower())
+    if any(m in (parts.query or "") for m in _LOGIN_QUERY_MARKERS):
+        return True
+    return any(seg in _LOGIN_PATH_SEGMENTS for seg in (parts.path or "").split("/"))
+
 
 def count_structure(
     subtree: etree._Element,
@@ -597,7 +632,7 @@ def count_structure(
     word_count = len(_WORD_RE.findall(" ".join(subtree.itertext())))
 
     link_count = internal_link_count = pdf_link_count = 0
-    asset_link_count = anchor_link_count = 0
+    asset_link_count = anchor_link_count = member_login_link_count = 0
     # Distinct internal link targets (issue #45): the edge list the corpus turns into the link
     # graph. Fragment-stripped so /a and /a#sec are one edge; ordered-dedup via dict; capped so
     # a runaway link farm can't bloat a row. Own-page anchors are excluded (not an edge).
@@ -610,10 +645,16 @@ def count_structure(
         href = a.get("href", "")
         if not href:
             continue
+        resolved = urljoin(page_url, href)
+        # Inline member-login / sign-in CTA (corpus #61): a gate, not content. Count it on its own
+        # and skip ALL other tallies so link_count / internal / targets reflect real content links
+        # only (and external_link_count = link_count - internal stays balanced).
+        if is_internal(resolved) and _is_member_login_link(resolved):
+            member_login_link_count += 1
+            continue
         link_count += 1
         if _is_anchor_link(href, page_url):
             anchor_link_count += 1
-        resolved = urljoin(page_url, href)
         if is_internal(resolved):
             internal_link_count += 1
             target = resolved.partition("#")[0]
@@ -636,6 +677,7 @@ def count_structure(
         "word_count": word_count,
         "link_count": link_count,
         "internal_link_count": internal_link_count,
+        "member_login_link_count": member_login_link_count,
         "external_link_count": link_count - internal_link_count,
         "pdf_link_count": pdf_link_count,
         "asset_link_count": asset_link_count,
