@@ -535,6 +535,12 @@ def _dechrome_site_frame(subtree: etree._Element) -> etree._Element:
     touches <nav>/<aside> or link-sparse frame, so a genuine content region's own in-content
     navigation is preserved. Deep copy so `body_subtree` is untouched; parent check so a nested
     match isn't double-dropped."""
+    # If the located region is ITSELF inside an <article>, the whole region is article content:
+    # its <header>/<footer> are the article's own (byline, tags), never the site frame. Skip the
+    # strip entirely -- this also sidesteps the deepcopy severing the <article> ancestor, which
+    # would otherwise misclassify an in-article header/footer as site frame (issue #54 review).
+    if _within_content(subtree):
+        return subtree
     clone = copy.deepcopy(subtree)
     to_drop = [el for el in clone.iter() if _is_site_frame_menu(el)]
     for el in to_drop:

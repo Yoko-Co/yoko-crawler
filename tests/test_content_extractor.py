@@ -905,6 +905,19 @@ class TestDechromeSiteFrame:
         hrefs = {a.get("href") for a in ce._dechrome_site_frame(el).xpath(".//a[@href]")}
         assert len([h for h in hrefs if h.startswith("/g")]) == 8
 
+    def test_region_inside_article_is_left_verbatim(self):
+        # Ancestry guard (#54 review): when the located region is itself inside an <article>, the
+        # whole region is article content -- even a link-dominated <footer> in it is the article's
+        # own, and the deepcopy would sever the <article> ancestor -- so strip nothing.
+        article = lxml_html.fromstring(
+            b"<article><div role='main'><h1>Story</h1><p>Body prose here.</p>"
+            b"<footer>" + b"".join(b"<a href='/t%d'>Tag Number %d</a>" % (i, i) for i in range(6))
+            + b"</footer></div></article>"
+        )
+        region = article.xpath(".//div[@role='main']")[0]
+        hrefs = {a.get("href") for a in ce._dechrome_site_frame(region).xpath(".//a[@href]")}
+        assert len([h for h in hrefs if h.startswith("/t")]) == 6  # in-article footer kept verbatim
+
     def test_leaves_in_content_nav_untouched(self):
         # A link-dominated in-content <nav> (not header/footer) is NOT site frame -> kept verbatim,
         # preserving the issue-#13 "trust the region's own navigation" guarantee.
