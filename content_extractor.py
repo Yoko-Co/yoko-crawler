@@ -562,6 +562,15 @@ def _dechrome_site_frame(subtree: etree._Element) -> etree._Element:
     # would otherwise misclassify an in-container header/footer as site frame (issue #54 review).
     if _within_main_or_article(subtree):
         return subtree
+    # Strip ONLY when the region positively WRAPS a <main>/<article> (locate over-captured a
+    # wrapper): the content is in that container, so a link-dominated <header>/<footer> OUTSIDE it
+    # is unambiguously the site frame. Without an inner container -- a div-soup page (Elementor/
+    # Divi/older WP emit no <main>/<article>) -- we cannot tell the page's OWN entry-header (title
+    # + hero + taxonomy links) from the site frame, so we leave the region verbatim rather than
+    # risk stripping the page's title/hero. That's an over-count (the safe direction) (issue #54
+    # review P2).
+    if subtree.find(".//main") is None and subtree.find(".//article") is None:
+        return subtree
     clone = copy.deepcopy(subtree)
     to_drop = [el for el in clone.iter() if _is_site_frame_menu(el)]
     for el in to_drop:

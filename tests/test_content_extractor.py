@@ -734,14 +734,13 @@ class TestChromeAwareCounting:
 
     def test_link_list_page_in_a_nav_is_not_zeroed_on_fallback(self):
         # issue #54 review (P0 guard): a genuine HTML sitemap / A-Z index whose CONTENT is a link
-        # list wrapped in <nav> (with a heading) must NOT be zeroed on the body-fallback path --
-        # the link-dominated heuristic is confined to the trusted-path site frame, never here.
+        # list wrapped in <nav> WITH a heading must NOT be zeroed on the body-fallback path -- the
+        # heading-guard in _holds_content keeps it (the reverted #54 change no longer rejects it for
+        # being link-dominated). Properly nested via _doc so the <nav> is NOT the drop-immune root.
         links = b"".join(b"<li><a href='/term-%d'>Glossary Term %d</a></li>" % (i, i) for i in range(30))
-        body = lxml_html.fromstring(
-            b"<body><nav role='navigation'><h1>A to Z Site Directory</h1><ul>" + links + b"</ul></nav></body>"
-        )
-        c = self._counts(ce._dechrome(body))
-        assert c["internal_link_count"] == 30 and c["word_count"] > 0  # directory content survives
+        result = extract_content(_doc(b"<nav role='navigation'><h1>A to Z Site Directory</h1><ul>" + links + b"</ul></nav>"))
+        c = self._counts(result.subtree)
+        assert c["internal_link_count"] == 30 and c["word_count"] > 0  # headed directory survives
 
     def test_is_link_dominated_menu_discriminator(self):
         # The link-domination tell used by the site-frame strip: > floor links AND more link-text
@@ -914,6 +913,22 @@ class TestDechromeSiteFrame:
         el = lxml_html.fromstring(b"<div><footer class='gallery'>" + tiles + b"</footer></div>")
         hrefs = {a.get("href") for a in ce._dechrome_site_frame(el).xpath(".//a[@href]")}
         assert len([h for h in hrefs if h.startswith("/g")]) == 8
+
+    def test_div_soup_page_with_no_container_is_left_verbatim(self):
+        # issue #54 review (P2 guard): a div-soup page (Elementor/Divi/older WP -- no <main>/
+        # <article> anywhere) whose title + hero + taxonomy byline live in a link-dominated
+        # <header class='entry-header'> must NOT be stripped. With no content container we can't
+        # tell the page's own header from the site frame, so strip nothing (over-count is safe).
+        region = lxml_html.fromstring(
+            b"<div class='post'><header class='entry-header'><h1>The Coastal Survey Results</h1>"
+            b"<p>by <a href='/author/jane'>Jane Doe</a> in <a href='/cat/news'>News</a> "
+            + b" ".join(b"<a href='/tag/t%d'>topic%d</a>" % (i, i) for i in range(6)) + b"</p>"
+            b"<img src='/feat.jpg'></header>"
+            b"<div class='content'><p>Forty five words of real article prose go right here.</p></div></div>"
+        )
+        out = ce._dechrome_site_frame(region)
+        assert out.xpath("count(.//h1)") == 1 and out.xpath("count(.//img)") == 1  # title + hero kept
+        assert "/author/jane" in {a.get("href") for a in out.xpath(".//a[@href]")}
 
     def test_main_based_entry_header_with_title_hero_and_byline_is_kept(self):
         # issue #54 review (P1 guard): a <main>-based post whose in-content <header> carries the
