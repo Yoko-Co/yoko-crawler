@@ -732,6 +732,38 @@ class TestChromeAwareCounting:
         )
         assert "/a" not in {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
 
+    def test_link_list_page_in_a_nav_is_not_zeroed_on_fallback(self):
+        # issue #54 review (P0 guard): a genuine HTML sitemap / A-Z index whose CONTENT is a link
+        # list wrapped in <nav> WITH a heading must NOT be zeroed on the body-fallback path -- the
+        # heading-guard in _holds_content keeps it (the reverted #54 change no longer rejects it for
+        # being link-dominated). Properly nested via _doc so the <nav> is NOT the drop-immune root.
+        links = b"".join(b"<li><a href='/term-%d'>Glossary Term %d</a></li>" % (i, i) for i in range(30))
+        result = extract_content(_doc(b"<nav role='navigation'><h1>A to Z Site Directory</h1><ul>" + links + b"</ul></nav>"))
+        c = self._counts(result.subtree)
+        assert c["internal_link_count"] == 30 and c["word_count"] > 0  # headed directory survives
+
+    def test_is_link_dominated_menu_discriminator(self):
+        # The link-domination tell used by the site-frame strip: > floor links AND more link-text
+        # than prose. A menu is dominated; a prose colophon and an image gallery are not; and a
+        # text-bearing named anchor (no href) counts as PROSE, not link-words (traversal parity).
+        menu = lxml_html.fromstring(
+            b"<footer>" + b"".join(b"<a href='/s%d'>Section Number %d</a>" % (i, i) for i in range(8)) + b"</footer>"
+        )
+        assert ce._is_link_dominated_menu(menu) is True
+        colophon = lxml_html.fromstring(
+            b"<footer><p>" + b" ".join([b"word"] * 40) + b" see <a href='/src'>source</a>.</p></footer>"
+        )
+        assert ce._is_link_dominated_menu(colophon) is False  # prose outweighs the lone link
+        gallery = lxml_html.fromstring(
+            b"<footer>" + b"".join(b"<a href='/g%d'><img src='/i%d.jpg'></a>" % (i, i) for i in range(8)) + b"</footer>"
+        )
+        assert ce._is_link_dominated_menu(gallery) is False  # links wrap images: ~0 link-words
+        named = lxml_html.fromstring(
+            b"<footer><a name='top'>Jump To The Very Top Of This Long Page Section Here</a>"
+            b"<a href='/1'>A</a><a href='/2'>B</a><a href='/3'>C</a><a href='/4'>D</a></footer>"
+        )
+        assert ce._is_link_dominated_menu(named) is False  # named-anchor text is prose, not a label
+
     def test_name_tokens_precision(self):
         # 'nav'/'menu' as whole tokens hit; substrings inside real words do not.
         assert ce._has_chrome_name(lxml_html.fromstring(b"<div class='site-nav'></div>"))
@@ -843,6 +875,98 @@ class TestDechromeMenus:
         hrefs = {a.get("href") for a in out.xpath(".//a[@href]")}
         assert hrefs == {"/only"}  # 5-link nav dropped; 1-link footer kept
         assert out.xpath("count(.//h1)") == 1 and out.xpath("count(.//img)") == 1  # header kept
+
+
+class TestDechromeSiteFrame:
+    """issue #54: on the trusted (prose-rich) path, locate can settle on a wide wrapper that also
+    holds the SITE frame. Only a link-DOMINATED site <header>/<footer> is stripped; in-content
+    <nav> (pagination), link-sparse footers, in-article footers, and galleries are kept."""
+
+    def test_strips_link_dominated_frame_keeps_content_pagination_and_sparse_footer(self):
+        # The openprimaries shape: a wrapper holding a site header (link menu), a <main> with prose
+        # + in-content pagination + a link-sparse related footer, and a site footer (link menu).
+        el = lxml_html.fromstring(
+            b"<div class='wrap'>"
+            b"<header class='site'>" + b"".join(b"<a href='/h%d'>Header Link %d</a>" % (i, i) for i in range(8)) + b"</header>"
+            b"<main><h1>Title</h1><p>Real prose content of the page goes here.</p>"
+            b"<nav class='pagination'><a href='/p1'>1</a><a href='/p2'>2</a><a href='/p3'>3</a><a href='/p4'>4</a></nav>"
+            b"<footer class='related'><a href='/r1'>One</a><a href='/r2'>Two</a></footer></main>"
+            b"<footer class='site'><h4>ABOUT</h4>" + b"".join(b"<a href='/f%d'>Footer Link %d</a>" % (i, i) for i in range(6)) + b"</footer>"
+            b"</div>"
+        )
+        hrefs = {a.get("href") for a in ce._dechrome_site_frame(el).xpath(".//a[@href]")}
+        assert not any(h.startswith("/h") or h.startswith("/f") for h in hrefs)  # site frame stripped
+        assert {"/p1", "/p2", "/p3", "/p4", "/r1", "/r2"} <= hrefs  # pagination + sparse footer kept
+
+    def test_in_article_footer_is_kept(self):
+        # An article's OWN footer (within content) is not the site frame, even if link-dominated.
+        el = lxml_html.fromstring(
+            b"<div><article><p>Body.</p><footer>"
+            + b"".join(b"<a href='/t%d'>Tag Number %d</a>" % (i, i) for i in range(6))
+            + b"</footer></article></div>"
+        )
+        assert any(h.startswith("/t") for h in {a.get("href") for a in ce._dechrome_site_frame(el).xpath(".//a[@href]")})
+
+    def test_image_gallery_footer_is_kept(self):
+        # A footer of image tiles: links wrap images (link-word-sparse), so NOT link-dominated.
+        tiles = b"".join(b"<a href='/g%d'><img src='/i%d.jpg'></a>" % (i, i) for i in range(8))
+        el = lxml_html.fromstring(b"<div><footer class='gallery'>" + tiles + b"</footer></div>")
+        hrefs = {a.get("href") for a in ce._dechrome_site_frame(el).xpath(".//a[@href]")}
+        assert len([h for h in hrefs if h.startswith("/g")]) == 8
+
+    def test_div_soup_page_with_no_container_is_left_verbatim(self):
+        # issue #54 review (P2 guard): a div-soup page (Elementor/Divi/older WP -- no <main>/
+        # <article> anywhere) whose title + hero + taxonomy byline live in a link-dominated
+        # <header class='entry-header'> must NOT be stripped. With no content container we can't
+        # tell the page's own header from the site frame, so strip nothing (over-count is safe).
+        region = lxml_html.fromstring(
+            b"<div class='post'><header class='entry-header'><h1>The Coastal Survey Results</h1>"
+            b"<p>by <a href='/author/jane'>Jane Doe</a> in <a href='/cat/news'>News</a> "
+            + b" ".join(b"<a href='/tag/t%d'>topic%d</a>" % (i, i) for i in range(6)) + b"</p>"
+            b"<img src='/feat.jpg'></header>"
+            b"<div class='content'><p>Forty five words of real article prose go right here.</p></div></div>"
+        )
+        out = ce._dechrome_site_frame(region)
+        assert out.xpath("count(.//h1)") == 1 and out.xpath("count(.//img)") == 1  # title + hero kept
+        assert "/author/jane" in {a.get("href") for a in out.xpath(".//a[@href]")}
+
+    def test_main_based_entry_header_with_title_hero_and_byline_is_kept(self):
+        # issue #54 review (P1 guard): a <main>-based post whose in-content <header> carries the
+        # title (h1) + hero image + a link-dominated byline (author/category/tags) must NOT be
+        # stripped -- it is the content container's OWN header, not the site frame.
+        region = lxml_html.fromstring(
+            b"<main><header class='entry-header'><h1>Brief</h1>"
+            b"<p>by <a href='/author/jane'>Jane Doe</a> in <a href='/cat/news'>News</a> "
+            + b" ".join(b"<a href='/tag/t%d'>topic%d</a>" % (i, i) for i in range(6)) + b"</p>"
+            b"<img src='/feat.jpg' alt='featured'></header>"
+            b"<div class='content'><p>Forty five words of real article prose go right here.</p></div></main>"
+        )
+        out = ce._dechrome_site_frame(region)
+        assert out.xpath("count(.//h1)") == 1 and out.xpath("count(.//img)") == 1  # title + hero kept
+        assert {"/author/jane", "/cat/news", "/tag/t0"} <= {a.get("href") for a in out.xpath(".//a[@href]")}
+
+    def test_region_inside_article_is_left_verbatim(self):
+        # Ancestry guard (#54 review): when the located region is itself inside an <article>, the
+        # whole region is article content -- even a link-dominated <footer> in it is the article's
+        # own, and the deepcopy would sever the <article> ancestor -- so strip nothing.
+        article = lxml_html.fromstring(
+            b"<article><div role='main'><h1>Story</h1><p>Body prose here.</p>"
+            b"<footer>" + b"".join(b"<a href='/t%d'>Tag Number %d</a>" % (i, i) for i in range(6))
+            + b"</footer></div></article>"
+        )
+        region = article.xpath(".//div[@role='main']")[0]
+        hrefs = {a.get("href") for a in ce._dechrome_site_frame(region).xpath(".//a[@href]")}
+        assert len([h for h in hrefs if h.startswith("/t")]) == 6  # in-article footer kept verbatim
+
+    def test_leaves_in_content_nav_untouched(self):
+        # A link-dominated in-content <nav> (not header/footer) is NOT site frame -> kept verbatim,
+        # preserving the issue-#13 "trust the region's own navigation" guarantee.
+        el = lxml_html.fromstring(
+            b"<div><main><p>Prose.</p><nav>"
+            + b"".join(b"<a href='/n%d'>Nav Item %d</a>" % (i, i) for i in range(8))
+            + b"</nav></main></div>"
+        )
+        assert len({a.get("href") for a in ce._dechrome_site_frame(el).xpath(".//a[@href]")}) == 8
 
     def test_operates_on_a_copy(self):
         el = lxml_html.fromstring(
