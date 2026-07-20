@@ -732,40 +732,38 @@ class TestChromeAwareCounting:
         )
         assert "/a" not in {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
 
-    def test_link_dominated_site_footer_stripped_despite_heading_and_prose(self):
-        # issue #54: a site <footer> carrying section headings + a short tagline AND a link menu is
-        # link-DOMINATED (more link text than prose) -> chrome. The heading/prose guards no longer
-        # keep it, so its nav links stop leaking into the counts.
-        footer = (
-            b"<footer class='footer'><div><h4>ABOUT</h4>"
-            b"<p>A coalition to enact open primaries.</p></div><div><h4>EXPLORE</h4><ul>"
-            + b"".join(b"<li><a href='/s%d'>Section Number %d</a></li>" % (i, i) for i in range(8))
-            + b"</ul></div></footer>"
-        )
-        body = lxml_html.fromstring(b"<body><main><p>Real article body text here.</p></main>" + footer + b"</body>")
-        hrefs = {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
-        assert not any(h.startswith("/s") for h in hrefs)  # link-dominated footer menu stripped
-
-    def test_named_anchor_text_counts_as_prose_not_link_words(self):
-        # Review: link-word and link-count must describe the SAME anchors (@href). A text-bearing
-        # named anchor (no href) is in-content text, so it must not tip a prose-rich block into
-        # "link-dominated" and get it stripped.
+    def test_link_list_page_in_a_nav_is_not_zeroed_on_fallback(self):
+        # issue #54 review (P0 guard): a genuine HTML sitemap / A-Z index whose CONTENT is a link
+        # list wrapped in <nav> (with a heading) must NOT be zeroed on the body-fallback path --
+        # the link-dominated heuristic is confined to the trusted-path site frame, never here.
+        links = b"".join(b"<li><a href='/term-%d'>Glossary Term %d</a></li>" % (i, i) for i in range(30))
         body = lxml_html.fromstring(
-            b"<body><footer><a name='top'>Jump To The Very Top Of This Long Page Section</a>"
-            b"<p>Substantial real prose that clearly outweighs the short menu list beneath it here.</p>"
-            b"<a href='/1'>A</a><a href='/2'>B</a><a href='/3'>C</a><a href='/4'>D</a></footer></body>"
+            b"<body><nav role='navigation'><h1>A to Z Site Directory</h1><ul>" + links + b"</ul></nav></body>"
         )
-        # prose (named-anchor text + paragraph) outweighs the 4 one-letter links -> footer kept.
-        assert {"/1", "/2", "/3", "/4"} <= {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+        c = self._counts(ce._dechrome(body))
+        assert c["internal_link_count"] == 30 and c["word_count"] > 0  # directory content survives
 
-    def test_prose_dominant_footer_is_kept(self):
-        # The guard still protects real content: a <footer> whose PROSE outweighs its few links is
-        # not link-dominated -> kept (a byline/colophon with a citation link, not a nav menu).
-        prose = b" ".join([b"word"] * 40)
-        body = lxml_html.fromstring(
-            b"<body><footer><p>" + prose + b" see <a href='/keep'>source</a>.</p></footer></body>"
+    def test_is_link_dominated_menu_discriminator(self):
+        # The link-domination tell used by the site-frame strip: > floor links AND more link-text
+        # than prose. A menu is dominated; a prose colophon and an image gallery are not; and a
+        # text-bearing named anchor (no href) counts as PROSE, not link-words (traversal parity).
+        menu = lxml_html.fromstring(
+            b"<footer>" + b"".join(b"<a href='/s%d'>Section Number %d</a>" % (i, i) for i in range(8)) + b"</footer>"
         )
-        assert "/keep" in {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+        assert ce._is_link_dominated_menu(menu) is True
+        colophon = lxml_html.fromstring(
+            b"<footer><p>" + b" ".join([b"word"] * 40) + b" see <a href='/src'>source</a>.</p></footer>"
+        )
+        assert ce._is_link_dominated_menu(colophon) is False  # prose outweighs the lone link
+        gallery = lxml_html.fromstring(
+            b"<footer>" + b"".join(b"<a href='/g%d'><img src='/i%d.jpg'></a>" % (i, i) for i in range(8)) + b"</footer>"
+        )
+        assert ce._is_link_dominated_menu(gallery) is False  # links wrap images: ~0 link-words
+        named = lxml_html.fromstring(
+            b"<footer><a name='top'>Jump To The Very Top Of This Long Page Section Here</a>"
+            b"<a href='/1'>A</a><a href='/2'>B</a><a href='/3'>C</a><a href='/4'>D</a></footer>"
+        )
+        assert ce._is_link_dominated_menu(named) is False  # named-anchor text is prose, not a label
 
     def test_name_tokens_precision(self):
         # 'nav'/'menu' as whole tokens hit; substrings inside real words do not.
@@ -916,6 +914,21 @@ class TestDechromeSiteFrame:
         el = lxml_html.fromstring(b"<div><footer class='gallery'>" + tiles + b"</footer></div>")
         hrefs = {a.get("href") for a in ce._dechrome_site_frame(el).xpath(".//a[@href]")}
         assert len([h for h in hrefs if h.startswith("/g")]) == 8
+
+    def test_main_based_entry_header_with_title_hero_and_byline_is_kept(self):
+        # issue #54 review (P1 guard): a <main>-based post whose in-content <header> carries the
+        # title (h1) + hero image + a link-dominated byline (author/category/tags) must NOT be
+        # stripped -- it is the content container's OWN header, not the site frame.
+        region = lxml_html.fromstring(
+            b"<main><header class='entry-header'><h1>Brief</h1>"
+            b"<p>by <a href='/author/jane'>Jane Doe</a> in <a href='/cat/news'>News</a> "
+            + b" ".join(b"<a href='/tag/t%d'>topic%d</a>" % (i, i) for i in range(6)) + b"</p>"
+            b"<img src='/feat.jpg' alt='featured'></header>"
+            b"<div class='content'><p>Forty five words of real article prose go right here.</p></div></main>"
+        )
+        out = ce._dechrome_site_frame(region)
+        assert out.xpath("count(.//h1)") == 1 and out.xpath("count(.//img)") == 1  # title + hero kept
+        assert {"/author/jane", "/cat/news", "/tag/t0"} <= {a.get("href") for a in out.xpath(".//a[@href]")}
 
     def test_region_inside_article_is_left_verbatim(self):
         # Ancestry guard (#54 review): when the located region is itself inside an <article>, the

@@ -415,13 +415,16 @@ def _holds_content(el: etree._Element) -> bool:
     NOT drop it and zero out a page. Signals: an <article>/<main> descendant; its OWN heading or
     image (a hero/masthead/gallery holds a title or media, not just a menu -- mirrors
     _is_leaked_menu's guard so the two strip paths agree, issue #53 review); or substantial
-    non-link prose. A link-DOMINATED menu is chrome even when it carries a logo/heading/tagline,
-    so that check runs FIRST -- otherwise a prose-rich site footer (copyright + address + a link
-    menu) would be kept and leak its nav links into the counts (issue #54)."""
+    non-link prose.
+
+    NOTE (issue #54 review): this deliberately does NOT reject a link-dominated block. An HTML
+    sitemap / A-Z index / resources roundup whose real content IS a curated link list, wrapped in
+    a <nav>/<aside> or a nav-named div, is link-dominated yet genuine content -- rejecting it here
+    would ZERO that page on the body-fallback path (the worst under-count for a scoping tool). The
+    link-dominated site-frame leak is handled ONLY on the trusted path, and only for a frame that
+    sits OUTSIDE the content container (see _dechrome_site_frame), where zeroing is impossible."""
     if el.find(".//article") is not None or el.find(".//main") is not None:
         return True
-    if _is_link_dominated_menu(el):
-        return False
     if el.xpath("count(.//h1|.//h2|.//h3|.//h4|.//h5|.//h6|.//img)") > 0:
         return True
     return _prose_word_count(el) >= _MIN_CHROME_PROSE_WORDS
@@ -510,23 +513,39 @@ def _dechrome_menus(subtree: etree._Element) -> etree._Element:
 # must be kept, and a site navbar usually lives inside the <header> anyway (dropped with it).
 _SITE_FRAME_TAGS = frozenset({"header", "footer"})
 _SITE_FRAME_ROLES = frozenset({"banner", "contentinfo"})
+# The content containers whose OWN header/footer (an entry-header with the title+hero, an article
+# byline) must never be mistaken for the site frame (issue #54 review). Broader than
+# _CONTENT_ANCESTOR_TAGS (article-only) because the frame strip must protect a <main>-based post's
+# in-content header -- but this is used ONLY by the site-frame strip, never to widen _dechrome.
+_CONTENT_CONTAINER_TAGS = frozenset({"article", "main"})
+
+
+def _within_main_or_article(el: etree._Element) -> bool:
+    """True when `el` is inside a <main>/<article> content container. Used only by the site-frame
+    strip so a container's OWN header/footer (a <main>-based post's entry-header with the title +
+    hero image + byline) is never stripped as site frame (issue #54 review)."""
+    for ancestor in el.iterancestors():
+        if isinstance(ancestor.tag, str) and ancestor.tag.lower() in _CONTENT_CONTAINER_TAGS:
+            return True
+    return False
 
 
 def _is_site_frame_menu(el: etree._Element) -> bool:
     """A link-dominated SITE header/footer that `_locate_main_subtree` swept into a trusted
     content region (issue #54). When locate settles on a wide wrapper (e.g. `div.main_section`
-    holding <main> AND the site header/footer as siblings), the region has real prose so it's
+    holding <main> AND the site header/footer as SIBLINGS), the region has real prose so it's
     trusted verbatim -- and the frame's global nav / footer menu leaks into the counts. Strip only
-    the unambiguous frame: a <header>/<footer> tag or banner/contentinfo role, NOT inside an
-    <article> and not wrapping <article>/<main> content, that is link-DOMINATED. An in-content
-    <nav> (pagination/TOC) and a link-sparse related-links footer are left untouched."""
+    the unambiguous frame: a <header>/<footer> tag or banner/contentinfo role that sits OUTSIDE any
+    <main>/<article> content container, wraps none itself, and is link-DOMINATED. A container's OWN
+    header/footer (an entry-header with the page title + hero, a byline), an in-content <nav>
+    (pagination/TOC), and a link-sparse related-links footer are all left untouched."""
     if not isinstance(el.tag, str):
         return False
     tag = el.tag.lower()
     role = (el.get("role") or "").strip().lower()
     if tag not in _SITE_FRAME_TAGS and role not in _SITE_FRAME_ROLES:
         return False
-    if _within_content(el) or el.find(".//article") is not None or el.find(".//main") is not None:
+    if _within_main_or_article(el) or el.find(".//article") is not None or el.find(".//main") is not None:
         return False
     return _is_link_dominated_menu(el)
 
@@ -534,14 +553,14 @@ def _is_site_frame_menu(el: etree._Element) -> bool:
 def _dechrome_site_frame(subtree: etree._Element) -> etree._Element:
     """Return a COPY of a trusted (prose-rich) located `subtree` with only a swept-in link-
     dominated SITE header/footer removed (issue #54). Far narrower than _dechrome: it never
-    touches <nav>/<aside> or link-sparse frame, so a genuine content region's own in-content
-    navigation is preserved. Deep copy so `body_subtree` is untouched; parent check so a nested
-    match isn't double-dropped."""
-    # If the located region is ITSELF inside an <article>, the whole region is article content:
-    # its <header>/<footer> are the article's own (byline, tags), never the site frame. Skip the
-    # strip entirely -- this also sidesteps the deepcopy severing the <article> ancestor, which
-    # would otherwise misclassify an in-article header/footer as site frame (issue #54 review).
-    if _within_content(subtree):
+    touches <nav>/<aside>, link-sparse frame, or a content container's OWN header/footer, so a
+    genuine content region is never under-counted. Deep copy so `body_subtree` is untouched;
+    parent check so a nested match isn't double-dropped."""
+    # If the located region is ITSELF inside a <main>/<article>, the whole region is that
+    # container's content: its <header>/<footer> are the container's own, never the site frame.
+    # Skip the strip -- this also sidesteps the deepcopy severing the container ancestor, which
+    # would otherwise misclassify an in-container header/footer as site frame (issue #54 review).
+    if _within_main_or_article(subtree):
         return subtree
     clone = copy.deepcopy(subtree)
     to_drop = [el for el in clone.iter() if _is_site_frame_menu(el)]
