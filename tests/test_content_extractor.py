@@ -746,6 +746,18 @@ class TestChromeAwareCounting:
         hrefs = {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
         assert not any(h.startswith("/s") for h in hrefs)  # link-dominated footer menu stripped
 
+    def test_named_anchor_text_counts_as_prose_not_link_words(self):
+        # Review: link-word and link-count must describe the SAME anchors (@href). A text-bearing
+        # named anchor (no href) is in-content text, so it must not tip a prose-rich block into
+        # "link-dominated" and get it stripped.
+        body = lxml_html.fromstring(
+            b"<body><footer><a name='top'>Jump To The Very Top Of This Long Page Section</a>"
+            b"<p>Substantial real prose that clearly outweighs the short menu list beneath it here.</p>"
+            b"<a href='/1'>A</a><a href='/2'>B</a><a href='/3'>C</a><a href='/4'>D</a></footer></body>"
+        )
+        # prose (named-anchor text + paragraph) outweighs the 4 one-letter links -> footer kept.
+        assert {"/1", "/2", "/3", "/4"} <= {a.get("href") for a in ce._dechrome(body).xpath(".//a[@href]")}
+
     def test_prose_dominant_footer_is_kept(self):
         # The guard still protects real content: a <footer> whose PROSE outweighs its few links is
         # not link-dominated -> kept (a byline/colophon with a citation link, not a nav menu).

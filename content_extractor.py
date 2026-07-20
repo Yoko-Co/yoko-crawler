@@ -385,9 +385,11 @@ def _within_content(el: etree._Element) -> bool:
 
 
 def _link_word_count(el: etree._Element) -> int:
-    """Words of `el`'s text that ARE inside a link. A nav/footer MENU is link-word-heavy (menu
-    labels); a gallery's links wrap images, so its link-word count is ~0 despite many links."""
-    return sum(len(_WORD_RE.findall(" ".join(a.itertext()))) for a in el.iterfind(".//a"))
+    """Words of `el`'s text inside a navigable link (`<a href>`). A nav/footer MENU is
+    link-word-heavy (menu labels); a gallery's links wrap images, so its link-word count is ~0
+    despite many links. Filters on @href to match the link COUNT in `_is_link_dominated_menu`
+    (review): a text-bearing named anchor with no href is in-content text, not a menu label."""
+    return sum(len(_WORD_RE.findall(" ".join(a.itertext()))) for a in el.xpath(".//a[@href]"))
 
 
 def _prose_word_count(el: etree._Element) -> int:
