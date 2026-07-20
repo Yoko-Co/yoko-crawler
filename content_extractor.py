@@ -129,6 +129,12 @@ ENRICHMENT_FIELD_NAMES = (
     "word_count",
     "link_count",
     "internal_link_count",
+    # Inline member-login / sign-in CTAs in the content region (corpus #61): an internal link to
+    # a login/auth handler (OAuth login trigger, ReturnURL-style come-back-after-login param, or a
+    # /login·/signin·wp-login path). A same-domain member-gating signal #57's portal-SUBDOMAIN
+    # check misses. These are gate CTAs, not content, so they are EXCLUDED from link_count /
+    # internal_link_count / internal_link_targets and counted only here.
+    "member_login_link_count",
     # Distinct internal link TARGETS from the content region (issue #45), fragment-stripped and
     # capped. The corpus builds the internal link graph from these -- inbound counts (which
     # pages are most linked-to = promotion) and total link volume (301/redirect + link-
@@ -577,6 +583,25 @@ def _is_anchor_link(href: str, page_url: str) -> bool:
 _MAX_INTERNAL_TARGETS = 100  # per-page edge-list cap (issue #45): bounds a link-farm row
 _MAX_EXTERNAL_HOSTS = 50  # per-page distinct external-host cap (issue #57)
 
+# Inline member-login / sign-in CTAs (corpus #61). High-precision markers only -- the #55-57
+# review lesson is that over-broad markers (a bare `redirect_to=`) false-positive on ordinary
+# navigation. A login link is an internal <a> whose resolved URL carries an OAuth-login trigger
+# or a ReturnURL-style "come back after login" param, OR whose path is a login/sign-in handler.
+_LOGIN_QUERY_MARKERS = ("do_oauth_login=", "returnurl=", "return_url=")
+_LOGIN_PATH_MARKERS = ("/login", "/signin", "/sign-in", "/wp-login.php", "/account/login", "/user/login")
+
+
+def _is_member_login_link(resolved_url: str) -> bool:
+    """True when an internal link is a login / sign-in CTA (corpus #61) rather than content.
+    Query-param markers catch OAuth/ReturnURL login triggers; path markers catch login handlers.
+    Validated at 100% precision on the sais.org crawl (86/86 flagged links were real logins)."""
+    parts = urlparse(resolved_url.lower())
+    query = parts.query or ""
+    if any(m in query for m in _LOGIN_QUERY_MARKERS):
+        return True
+    path = parts.path or ""
+    return any(m in path for m in _LOGIN_PATH_MARKERS)
+
 
 def count_structure(
     subtree: etree._Element,
@@ -597,7 +622,7 @@ def count_structure(
     word_count = len(_WORD_RE.findall(" ".join(subtree.itertext())))
 
     link_count = internal_link_count = pdf_link_count = 0
-    asset_link_count = anchor_link_count = 0
+    asset_link_count = anchor_link_count = member_login_link_count = 0
     # Distinct internal link targets (issue #45): the edge list the corpus turns into the link
     # graph. Fragment-stripped so /a and /a#sec are one edge; ordered-dedup via dict; capped so
     # a runaway link farm can't bloat a row. Own-page anchors are excluded (not an edge).
@@ -610,10 +635,16 @@ def count_structure(
         href = a.get("href", "")
         if not href:
             continue
+        resolved = urljoin(page_url, href)
+        # Inline member-login / sign-in CTA (corpus #61): a gate, not content. Count it on its own
+        # and skip ALL other tallies so link_count / internal / targets reflect real content links
+        # only (and external_link_count = link_count - internal stays balanced).
+        if is_internal(resolved) and _is_member_login_link(resolved):
+            member_login_link_count += 1
+            continue
         link_count += 1
         if _is_anchor_link(href, page_url):
             anchor_link_count += 1
-        resolved = urljoin(page_url, href)
         if is_internal(resolved):
             internal_link_count += 1
             target = resolved.partition("#")[0]
@@ -636,6 +667,7 @@ def count_structure(
         "word_count": word_count,
         "link_count": link_count,
         "internal_link_count": internal_link_count,
+        "member_login_link_count": member_login_link_count,
         "external_link_count": link_count - internal_link_count,
         "pdf_link_count": pdf_link_count,
         "asset_link_count": asset_link_count,

@@ -196,6 +196,39 @@ class TestCountStructure:
         # "alpha beta gamma" (3) + "cell" (1) + "Title" (1) + "Sub" (1)
         assert c["word_count"] == 6
 
+    def test_member_login_links_counted_and_excluded_from_content(self):
+        # Inline member-login CTAs (corpus #61) are gates, not content: counted on their own and
+        # kept out of link_count / internal_link_count / internal_link_targets.
+        subtree = lxml_html.fromstring(
+            "<div>"
+            '<a href="/real-article">content</a>'                                  # real internal link
+            '<a href="https://example.com?ReturnURL=%2Fx&do_oauth_login=abc">Log in</a>'  # oauth login
+            '<a href="/account/login?redirect=/x">Sign in</a>'                     # login path
+            '<a href="/wp-login.php?redirect_to=/y">WP login</a>'                  # wp-login path
+            "</div>"
+        )
+        c = count_structure(
+            subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS
+        )
+        assert c["member_login_link_count"] == 3
+        # Only the one real internal link is counted as content; the three logins are excluded.
+        assert c["link_count"] == 1
+        assert c["internal_link_count"] == 1
+        assert c["internal_link_targets"] == ["https://example.com/real-article"]
+
+    def test_returnurl_marker_does_not_swallow_ordinary_links(self):
+        # Precision guard (the #55-57 review lesson): a plain internal link with no login marker
+        # is NOT a login CTA, and a bare `redirect_to=` alone (no login path/param) is not either.
+        subtree = lxml_html.fromstring(
+            '<div><a href="/blog/post">read</a>'
+            '<a href="/search?redirect_to=/home">search</a></div>'
+        )
+        c = count_structure(
+            subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS
+        )
+        assert c["member_login_link_count"] == 0
+        assert c["internal_link_count"] == 2
+
     def test_external_link_count_never_negative(self):
         subtree = lxml_html.fromstring("<div><p>no links here</p></div>")
         c = count_structure(
