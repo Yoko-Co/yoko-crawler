@@ -384,12 +384,28 @@ def _within_content(el: etree._Element) -> bool:
     return False
 
 
+def _link_word_count(el: etree._Element) -> int:
+    """Words of `el`'s text that ARE inside a link. A nav/footer MENU is link-word-heavy (menu
+    labels); a gallery's links wrap images, so its link-word count is ~0 despite many links."""
+    return sum(len(_WORD_RE.findall(" ".join(a.itertext()))) for a in el.iterfind(".//a"))
+
+
 def _prose_word_count(el: etree._Element) -> int:
     """Words of `el`'s text that are NOT inside a link. Real nav/footer/search is link-dense
     with little prose; a block of real content wrapped in a chrome tag has prose."""
     total = len(_WORD_RE.findall(" ".join(el.itertext())))
-    link_words = sum(len(_WORD_RE.findall(" ".join(a.itertext()))) for a in el.iterfind(".//a"))
-    return max(0, total - link_words)
+    return max(0, total - _link_word_count(el))
+
+
+def _is_link_dominated_menu(el: etree._Element) -> bool:
+    """True when `el` is link-DOMINATED: above the menu link floor AND with more text inside its
+    links than prose outside them (issue #54). This is the tell that separates a site nav/footer
+    menu -- even one carrying a logo, section headings, or a tagline+address -- from real content:
+    a hero/masthead is link-SPARSE, and a gallery's links wrap images so its link-word count is ~0,
+    so neither is link-dominated."""
+    if int(el.xpath("count(.//a[@href])")) <= _LEAKED_MENU_LINK_FLOOR:
+        return False
+    return _link_word_count(el) > _prose_word_count(el)
 
 
 def _holds_content(el: etree._Element) -> bool:
@@ -397,9 +413,13 @@ def _holds_content(el: etree._Element) -> bool:
     NOT drop it and zero out a page. Signals: an <article>/<main> descendant; its OWN heading or
     image (a hero/masthead/gallery holds a title or media, not just a menu -- mirrors
     _is_leaked_menu's guard so the two strip paths agree, issue #53 review); or substantial
-    non-link prose."""
+    non-link prose. A link-DOMINATED menu is chrome even when it carries a logo/heading/tagline,
+    so that check runs FIRST -- otherwise a prose-rich site footer (copyright + address + a link
+    menu) would be kept and leak its nav links into the counts (issue #54)."""
     if el.find(".//article") is not None or el.find(".//main") is not None:
         return True
+    if _is_link_dominated_menu(el):
+        return False
     if el.xpath("count(.//h1|.//h2|.//h3|.//h4|.//h5|.//h6|.//img)") > 0:
         return True
     return _prose_word_count(el) >= _MIN_CHROME_PROSE_WORDS
@@ -477,6 +497,46 @@ def _dechrome_menus(subtree: etree._Element) -> etree._Element:
     parent check so a nested menu isn't double-dropped."""
     clone = copy.deepcopy(subtree)
     to_drop = [el for el in clone.iter() if _is_leaked_menu(el)]
+    for el in to_drop:
+        if el.getparent() is not None:
+            el.drop_tree()
+    return clone
+
+
+# The page's outer frame: only <header>/<footer> tags and banner/contentinfo roles. A site NAV is
+# deliberately NOT here -- on the trusted (prose-rich) path an in-content <nav> (pagination, TOC)
+# must be kept, and a site navbar usually lives inside the <header> anyway (dropped with it).
+_SITE_FRAME_TAGS = frozenset({"header", "footer"})
+_SITE_FRAME_ROLES = frozenset({"banner", "contentinfo"})
+
+
+def _is_site_frame_menu(el: etree._Element) -> bool:
+    """A link-dominated SITE header/footer that `_locate_main_subtree` swept into a trusted
+    content region (issue #54). When locate settles on a wide wrapper (e.g. `div.main_section`
+    holding <main> AND the site header/footer as siblings), the region has real prose so it's
+    trusted verbatim -- and the frame's global nav / footer menu leaks into the counts. Strip only
+    the unambiguous frame: a <header>/<footer> tag or banner/contentinfo role, NOT inside an
+    <article> and not wrapping <article>/<main> content, that is link-DOMINATED. An in-content
+    <nav> (pagination/TOC) and a link-sparse related-links footer are left untouched."""
+    if not isinstance(el.tag, str):
+        return False
+    tag = el.tag.lower()
+    role = (el.get("role") or "").strip().lower()
+    if tag not in _SITE_FRAME_TAGS and role not in _SITE_FRAME_ROLES:
+        return False
+    if _within_content(el) or el.find(".//article") is not None or el.find(".//main") is not None:
+        return False
+    return _is_link_dominated_menu(el)
+
+
+def _dechrome_site_frame(subtree: etree._Element) -> etree._Element:
+    """Return a COPY of a trusted (prose-rich) located `subtree` with only a swept-in link-
+    dominated SITE header/footer removed (issue #54). Far narrower than _dechrome: it never
+    touches <nav>/<aside> or link-sparse frame, so a genuine content region's own in-content
+    navigation is preserved. Deep copy so `body_subtree` is untouched; parent check so a nested
+    match isn't double-dropped."""
+    clone = copy.deepcopy(subtree)
+    to_drop = [el for el in clone.iter() if _is_site_frame_menu(el)]
     for el in to_drop:
         if el.getparent() is not None:
             el.drop_tree()
@@ -886,11 +946,13 @@ def extract_content(body: bytes) -> ExtractionResult:
         return ExtractionResult(_dechrome(body_el), body_el, False, normalized)
 
     if _prose_word_count(subtree) >= _MIN_REGION_PROSE_WORDS:
-        # The located region carries real prose of its OWN: trust it verbatim. Its in-content
-        # nav/footer/header (TOC, pagination, byline, related links, title, hero image) is
-        # content and is counted -- we never de-chrome a genuine content region, so there is no
-        # under-count and no dependence on <article> ancestry (which a deepcopy would sever).
-        return ExtractionResult(subtree, body_el, True, normalized)
+        # The located region carries real prose of its OWN: trust its in-content nav/footer/header
+        # (TOC, pagination, byline, related links, title, hero image) as content. The ONE exception
+        # (issue #54): when locate settles on a wide wrapper that also holds the SITE frame (a
+        # global <header>/<footer> as a sibling of the content), that frame's menu links leak. Strip
+        # only that link-dominated site frame -- an in-content <nav> and link-sparse footers are
+        # untouched, so a genuine content region is never under-counted.
+        return ExtractionResult(_dechrome_site_frame(subtree), body_el, True, normalized)
 
     # Prose-thin located region (issue #13): trafilatura's "main text" was the nav menu, so
     # locate settled on a whole-page wrapper (e.g. `div.Site-inner` on a thin marketing/sponsor
