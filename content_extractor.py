@@ -587,20 +587,30 @@ _MAX_EXTERNAL_HOSTS = 50  # per-page distinct external-host cap (issue #57)
 # review lesson is that over-broad markers (a bare `redirect_to=`) false-positive on ordinary
 # navigation. A login link is an internal <a> whose resolved URL carries an OAuth-login trigger
 # or a ReturnURL-style "come back after login" param, OR whose path is a login/sign-in handler.
-_LOGIN_QUERY_MARKERS = ("do_oauth_login=", "returnurl=", "return_url=")
-_LOGIN_PATH_MARKERS = ("/login", "/signin", "/sign-in", "/wp-login.php", "/account/login", "/user/login")
+# Only an UNAMBIGUOUS login trigger. `do_oauth_login=` is a login-only OAuth param. `returnurl=`/
+# `return_url=` were dropped after PR #39 review: they are generic "come back after this action"
+# params that also ride donation/checkout return links (`/donate?return_url=/thanks`), so they
+# over-match. A same-domain login that lacks this param is still caught by the path segment below.
+_LOGIN_QUERY_MARKERS = ("do_oauth_login=",)
+# Matched as a WHOLE path SEGMENT, not a substring: `/login` must not swallow `/login-help`,
+# `/signin` must not swallow `/signing-bonus`, `/sign-in` must not swallow `/sign-in-sheet`
+# (PR #39 review). A bare `login`/`signin` segment also catches deeper handlers like
+# /account/login, /members/login, and /en/login without listing each prefix. Hyphen + underscore
+# variants cover WP (`/login`), Rails/Devise (`/users/sign_in`), and `/log-in` themes.
+_LOGIN_PATH_SEGMENTS = frozenset({"login", "log-in", "signin", "sign-in", "sign_in", "wp-login.php"})
+# Known misses left as a follow-up (higher false-positive risk, want more crawls first): WooCommerce
+# `/my-account`, and bare `/auth`·/`sso`·`/oauth`. Tracked on corpus #61.
 
 
 def _is_member_login_link(resolved_url: str) -> bool:
     """True when an internal link is a login / sign-in CTA (corpus #61) rather than content.
-    Query-param markers catch OAuth/ReturnURL login triggers; path markers catch login handlers.
+    An unambiguous OAuth-login query trigger, OR a login/sign-in PATH SEGMENT (segment-exact, not
+    a substring, so `/login-help`/`/signing-bonus`/`/sign-in-sheet` are NOT misread as logins).
     Validated at 100% precision on the sais.org crawl (86/86 flagged links were real logins)."""
     parts = urlparse(resolved_url.lower())
-    query = parts.query or ""
-    if any(m in query for m in _LOGIN_QUERY_MARKERS):
+    if any(m in (parts.query or "") for m in _LOGIN_QUERY_MARKERS):
         return True
-    path = parts.path or ""
-    return any(m in path for m in _LOGIN_PATH_MARKERS)
+    return any(seg in _LOGIN_PATH_SEGMENTS for seg in (parts.path or "").split("/"))
 
 
 def count_structure(

@@ -216,18 +216,69 @@ class TestCountStructure:
         assert c["internal_link_count"] == 1
         assert c["internal_link_targets"] == ["https://example.com/real-article"]
 
-    def test_returnurl_marker_does_not_swallow_ordinary_links(self):
-        # Precision guard (the #55-57 review lesson): a plain internal link with no login marker
-        # is NOT a login CTA, and a bare `redirect_to=` alone (no login path/param) is not either.
+    def test_generic_redirect_params_are_not_login_ctas(self):
+        # Precision guard (the #55-57 + PR #39 review lesson): generic "come back after this"
+        # params are NOT login CTAs. A bare redirect_to=, and a donation/checkout return_url=
+        # (dropped as a marker precisely because it rides non-login conversion links), must all
+        # stay content.
         subtree = lxml_html.fromstring(
             '<div><a href="/blog/post">read</a>'
-            '<a href="/search?redirect_to=/home">search</a></div>'
+            '<a href="/search?redirect_to=/home">search</a>'
+            '<a href="/donate?return_url=/thanks">donate</a>'
+            '<a href="/x?partner_returnurl=1">partner</a></div>'
         )
         c = count_structure(
             subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS
         )
         assert c["member_login_link_count"] == 0
-        assert c["internal_link_count"] == 2
+        assert c["internal_link_count"] == 4
+
+    def test_login_segment_variants_hyphen_and_underscore(self):
+        # /log-in (hyphen theme) and /users/sign_in (Rails/Devise underscore) are real logins.
+        subtree = lxml_html.fromstring(
+            '<div><a href="/log-in">a</a><a href="/users/sign_in">b</a></div>'
+        )
+        c = count_structure(
+            subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS
+        )
+        assert c["member_login_link_count"] == 2
+        assert c["internal_link_count"] == 0
+
+    def test_login_path_segment_matches_exactly_not_as_substring(self):
+        # PR #39 review (P2): a path that merely STARTS with a login marker is content, not a
+        # login CTA. /login-help, /signing-bonus, /sign-in-sheet, /bloginfo must all stay content;
+        # /account/login and /en/login (login as a whole segment) are real logins.
+        subtree = lxml_html.fromstring(
+            "<div>"
+            '<a href="/login-help">a</a>'      # starts with 'login' but different segment
+            '<a href="/signing-bonus">b</a>'   # starts with 'signin' but different segment
+            '<a href="/sign-in-sheet">c</a>'   # starts with 'sign-in' but different segment
+            '<a href="/bloginfo">d</a>'        # 'login' mid-segment
+            '<a href="/account/login">e</a>'   # real: login segment
+            '<a href="/en/login">f</a>'        # real: login segment under a locale prefix
+            "</div>"
+        )
+        c = count_structure(
+            subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS
+        )
+        assert c["member_login_link_count"] == 2  # only the two real logins
+        assert c["internal_link_count"] == 4      # the four content links survive
+
+    def test_login_links_keep_the_external_count_balanced(self):
+        # Balance invariant with a mix of external + login links present (review testing-gap).
+        subtree = lxml_html.fromstring(
+            "<div>"
+            '<a href="/real">a</a>'                                  # internal content
+            '<a href="https://other.org/x">b</a>'                    # external content
+            '<a href="https://example.com/login">c</a>'              # internal login (excluded)
+            "</div>"
+        )
+        c = count_structure(
+            subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS
+        )
+        assert c["member_login_link_count"] == 1
+        assert c["link_count"] == 2 and c["internal_link_count"] == 1
+        assert c["external_link_count"] == c["link_count"] - c["internal_link_count"] == 1
 
     def test_external_link_count_never_negative(self):
         subtree = lxml_html.fromstring("<div><p>no links here</p></div>")
