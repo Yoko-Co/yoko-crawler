@@ -311,29 +311,36 @@ class WebsiteSpider(scrapy.Spider):
         # Record robots fetch
         yield from self._emit_row(response)
 
-        # One-hop redirect follow
+        # One-hop redirect follow -- only on-domain (issue corpus#71). robots.txt should redirect
+        # within the site (http->https, apex->www); an off-domain hop is a handoff to another site,
+        # not our robots, so don't fetch it as ours.
         if response.status in self.REDIRECT_STATUSES:
             target = response.headers.get("Location")
             if target:
-                yield scrapy.Request(response.urljoin(target.decode("latin-1")), callback=self.parse_robots)
+                tgt = response.urljoin(target.decode("latin-1"))
+                if self.is_internal(tgt):
+                    yield scrapy.Request(tgt, callback=self.parse_robots)
             return
 
-        # Discover sitemaps
+        # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
         for line in response.text.splitlines():
             if line.lower().startswith("sitemap:"):
                 sm_url = line.split(":", 1)[1].strip()
-                if sm_url:
+                if sm_url and self.is_internal(sm_url):
                     yield scrapy.Request(sm_url, callback=self.parse_sitemap, dont_filter=True)
 
     def parse_sitemap(self, response):
         # Record sitemap fetch
         yield from self._emit_row(response)
 
-        # One-hop redirect follow
+        # One-hop redirect follow -- only on-domain (issue corpus#71): an off-domain sitemap redirect
+        # points at another site's sitemap, not ours.
         if response.status in self.REDIRECT_STATUSES:
             target = response.headers.get("Location")
             if target:
-                yield scrapy.Request(response.urljoin(target.decode("latin-1")), callback=self.parse_sitemap)
+                tgt = response.urljoin(target.decode("latin-1"))
+                if self.is_internal(tgt):
+                    yield scrapy.Request(tgt, callback=self.parse_sitemap)
             return
 
         # Skip non-text sitemaps like .gz
