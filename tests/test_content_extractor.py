@@ -280,6 +280,21 @@ class TestCountStructure:
         assert c["link_count"] == 2 and c["internal_link_count"] == 1
         assert c["external_link_count"] == c["link_count"] - c["internal_link_count"] == 1
 
+    def test_form_count_excludes_framework_wrapper_forms(self):
+        # issue corpus#67: an ASP.NET WebForms page-wrapper <form> (all-hidden __VIEWSTATE fields,
+        # no user-fillable control) is NOT a real form -- it must not count. A real contact/search
+        # form (text/email/textarea/select) does.
+        subtree = lxml_html.fromstring(
+            b"<div>"
+            b"<form action='./'><input type='hidden' name='__VIEWSTATE'>"
+            b"<input type='hidden' name='__EVENTVALIDATION'><input type='submit'></form>"  # wrapper -> 0
+            b"<form><input type='text' name='name'><input type='email'><textarea></textarea></form>"  # real -> 1
+            b"<form><input type='search' name='q'></form>"  # search -> 1
+            b"</div>"
+        )
+        c = count_structure(subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS)
+        assert c["form_count"] == 2  # the two real forms; the __VIEWSTATE wrapper excluded
+
     def test_external_link_count_never_negative(self):
         subtree = lxml_html.fromstring("<div><p>no links here</p></div>")
         c = count_structure(

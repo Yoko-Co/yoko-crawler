@@ -709,6 +709,28 @@ def _is_member_login_link(resolved_url: str) -> bool:
     return any(seg in _LOGIN_PATH_SEGMENTS for seg in (parts.path or "").split("/"))
 
 
+# Input controls that are NOT user-fillable: framework/tracking hidden fields (ASP.NET __VIEWSTATE
+# etc.) and buttons. A <form> whose ONLY controls are these is not a real form a user fills -- it's
+# the ASP.NET WebForms page-wrapper <form> (issue corpus#67, the ndba case: every page carried one,
+# all __VIEWSTATE hidden fields), so it must not count as a form to rebuild.
+_NONFILLABLE_INPUT_TYPES = frozenset({"hidden", "submit", "button", "image", "reset"})
+
+
+def _has_fillable_control(form: etree._Element) -> bool:
+    """True when a <form> has a control a user actually fills (a text/email/search/checkbox input,
+    a <textarea>, or a <select>) -- vs only framework hidden fields + buttons."""
+    if form.find(".//textarea") is not None or form.find(".//select") is not None:
+        return True
+    return any((i.get("type") or "text").strip().lower() not in _NONFILLABLE_INPUT_TYPES
+               for i in form.iterfind(".//input"))
+
+
+def _real_form_count(subtree: etree._Element) -> int:
+    """Forms with a user-fillable control (issue corpus#67). Excludes the ASP.NET WebForms
+    page-wrapper <form> (all-hidden __VIEWSTATE fields) that otherwise counts as 1 form per page."""
+    return sum(1 for f in subtree.xpath(".//form") if _has_fillable_control(f))
+
+
 def count_structure(
     subtree: etree._Element,
     page_url: str,
@@ -783,7 +805,7 @@ def count_structure(
         # so a carousel's images aren't double-counted as standalone page images.
         "standalone_image_count": _count(_STANDALONE_IMG_XPATH),
         "table_count": _count(".//table"),
-        "form_count": _count(".//form"),
+        "form_count": _real_form_count(subtree),
         "iframe_count": _count(".//iframe"),
         "heading_count": _count(".//h1|.//h2|.//h3|.//h4|.//h5|.//h6"),
         "internal_link_targets": list(internal_targets),
