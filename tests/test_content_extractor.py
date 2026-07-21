@@ -280,6 +280,36 @@ class TestCountStructure:
         assert c["link_count"] == 2 and c["internal_link_count"] == 1
         assert c["external_link_count"] == c["link_count"] - c["internal_link_count"] == 1
 
+    def test_form_count_excludes_framework_wrapper_forms(self):
+        # issue corpus#67: an ASP.NET WebForms page-wrapper <form> (all-hidden __VIEWSTATE fields,
+        # no user-fillable control) is NOT a real form -- it must not count. A real contact/search
+        # form (text/email/textarea/select) does.
+        subtree = lxml_html.fromstring(
+            b"<div>"
+            b"<form action='./'><input type='hidden' name='__VIEWSTATE'>"
+            b"<input type='hidden' name='__EVENTVALIDATION'><input type='submit'></form>"  # wrapper -> 0
+            b"<form><input type='text' name='name'><input type='email'><textarea></textarea></form>"  # real -> 1
+            b"<form><input type='search' name='q'></form>"  # search -> 1
+            b"</div>"
+        )
+        c = count_structure(subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS)
+        assert c["form_count"] == 2  # the two real forms; the __VIEWSTATE wrapper excluded
+
+    def test_form_count_button_only_and_edge_controls(self):
+        # Review: a button-only ACTION form (apply/subscribe) is real; non-text fillable inputs
+        # count; but a page-wrapper form (__VIEWSTATE) is not real even when it wraps page buttons.
+        subtree = lxml_html.fromstring(
+            b"<div>"
+            b"<form action='/apply'><input type='hidden' name='job' value='42'><button type='submit'>Apply</button></form>"  # 1
+            b"<form><input type='checkbox' name='ok'><button>Go</button></form>"  # 1 (checkbox fillable)
+            b"<form action='./'><input type='hidden' name='__VIEWSTATE'><button>Menu</button></form>"  # 0 (wrapper)
+            b"<form id='app'></form>"  # 0 (empty / JS-hydrated)
+            b"<form><button type='button'>Toggle</button></form>"  # 0 (non-submit button only)
+            b"</div>"
+        )
+        c = count_structure(subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS)
+        assert c["form_count"] == 2
+
     def test_external_link_count_never_negative(self):
         subtree = lxml_html.fromstring("<div><p>no links here</p></div>")
         c = count_structure(

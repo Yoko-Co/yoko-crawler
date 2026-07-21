@@ -709,6 +709,43 @@ def _is_member_login_link(resolved_url: str) -> bool:
     return any(seg in _LOGIN_PATH_SEGMENTS for seg in (parts.path or "").split("/"))
 
 
+# Input controls that are NOT user-fillable: framework/tracking hidden fields (ASP.NET __VIEWSTATE
+# etc.) and buttons. A <form> whose ONLY controls are these is not a real form a user fills -- it's
+# the ASP.NET WebForms page-wrapper <form> (issue corpus#67, the ndba case: every page carried one,
+# all __VIEWSTATE hidden fields), so it must not count as a form to rebuild.
+_NONFILLABLE_INPUT_TYPES = frozenset({"hidden", "submit", "button", "image", "reset"})
+
+
+def _is_framework_wrapper(form: etree._Element) -> bool:
+    """True when a <form> carries ASP.NET WebForms framework hidden fields (__VIEWSTATE /
+    __EVENTVALIDATION / __EVENTTARGET / ...). These wrap the WHOLE page body, so any buttons inside
+    are page chrome, not a real form's submit -- the discriminator that keeps a real button-only
+    form counting while the ndba-style page wrapper doesn't (issue corpus#67)."""
+    return any((i.get("name") or "").startswith("__") for i in form.xpath(".//input[@type='hidden']"))
+
+
+def _is_real_form(form: etree._Element) -> bool:
+    """True when a <form> is a real user-facing form to rebuild (issue corpus#67): it has a fillable
+    control (a non-hidden/non-button <input>, a <textarea>, or a <select>), OR a submit <button> and
+    is not the ASP.NET page wrapper. A <form> whose only controls are framework hidden fields (the
+    __VIEWSTATE wrapper on every ASP.NET WebForms page -- the ndba case) is NOT a form to rebuild.
+    A JS-hydrated empty <form> reads as 0 -- an accepted rendered-surface limitation."""
+    if form.find(".//textarea") is not None or form.find(".//select") is not None:
+        return True
+    if any((i.get("type") or "text").strip().lower() not in _NONFILLABLE_INPUT_TYPES
+           for i in form.iterfind(".//input")):
+        return True
+    # A button-only action form (subscribe / apply / add-to-cart) is real -- unless it's the ASP.NET
+    # page wrapper whose buttons are page chrome swept into the whole-page <form>.
+    return not _is_framework_wrapper(form) and bool(form.xpath(".//button[not(@type) or @type='submit']"))
+
+
+def _real_form_count(subtree: etree._Element) -> int:
+    """Count real user-facing forms (issue corpus#67). Excludes the ASP.NET WebForms page-wrapper
+    <form> (all-hidden __VIEWSTATE fields) that otherwise counts as 1 form per page."""
+    return sum(1 for f in subtree.xpath(".//form") if _is_real_form(f))
+
+
 def count_structure(
     subtree: etree._Element,
     page_url: str,
@@ -783,7 +820,7 @@ def count_structure(
         # so a carousel's images aren't double-counted as standalone page images.
         "standalone_image_count": _count(_STANDALONE_IMG_XPATH),
         "table_count": _count(".//table"),
-        "form_count": _count(".//form"),
+        "form_count": _real_form_count(subtree),
         "iframe_count": _count(".//iframe"),
         "heading_count": _count(".//h1|.//h2|.//h3|.//h4|.//h5|.//h6"),
         "internal_link_targets": list(internal_targets),
