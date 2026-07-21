@@ -793,3 +793,23 @@ class TestInfraRedirectsStayOnDomain:
                                   "https://example.com/sitemap-1.xml")
         reqs = _requests(spider.parse_sitemap(resp))
         assert [r.url for r in reqs] == ["https://example.com/sitemap-1.xml"]
+
+    def test_redirect_relative_location_resolves_and_is_followed(self):
+        # A relative Location (the common same-site form) resolves via urljoin against the response
+        # URL and stays internal -- must still be followed.
+        spider = WebsiteSpider(domain="example.com")
+        resp = _redirect_response("https://example.com/sitemap.xml", "/sitemap-1.xml")
+        reqs = _requests(spider.parse_sitemap(resp))
+        assert [r.url for r in reqs] == ["https://example.com/sitemap-1.xml"]
+
+    def test_subdomain_redirect_respects_include_subdomains(self):
+        # A redirect to a sibling subdomain: dropped by default, followed when subdomains are in scope
+        # (guards the is_internal subdomain branch these guards depend on).
+        target = "https://blog.example.com/sitemap.xml"
+        default = WebsiteSpider(domain="example.com")
+        assert _requests(default.parse_sitemap(
+            _redirect_response("https://example.com/sitemap.xml", target))) == []
+        subs = WebsiteSpider(domain="example.com", include_subdomains="1")
+        followed = _requests(subs.parse_sitemap(
+            _redirect_response("https://example.com/sitemap.xml", target)))
+        assert [r.url for r in followed] == [target]
