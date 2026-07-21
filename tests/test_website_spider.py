@@ -734,3 +734,62 @@ class TestInjectedCookies:
         assert len(reqs) == 2
         for r in reqs:
             assert r.cookies == {"cf_clearance": "tok", "a": "1"}
+
+
+from scrapy.http import TextResponse  # noqa: E402
+
+
+def _redirect_response(url, location, status=301, cb_response=Response):
+    return cb_response(
+        url=url, status=status,
+        headers={"Location": location},
+        request=Request(url),
+    )
+
+
+def _requests(rows):
+    return [r for r in rows if isinstance(r, Request)]
+
+
+class TestInfraRedirectsStayOnDomain:
+    """Issue corpus#71: robots/sitemap must not follow a redirect or a listed sitemap URL
+    off-domain -- that fetches another site's infra (the cross-domain contamination class)."""
+
+    def test_robots_redirect_off_domain_not_followed(self):
+        spider = WebsiteSpider(domain="example.com")
+        resp = _redirect_response("https://example.com/robots.txt",
+                                  "https://evil.cdn.net/robots.txt")
+        reqs = _requests(spider.parse_robots(resp))
+        assert reqs == []
+
+    def test_robots_redirect_on_domain_followed(self):
+        spider = WebsiteSpider(domain="example.com")
+        resp = _redirect_response("http://example.com/robots.txt",
+                                  "https://www.example.com/robots.txt")
+        reqs = _requests(spider.parse_robots(resp))
+        assert [r.url for r in reqs] == ["https://www.example.com/robots.txt"]
+
+    def test_robots_lists_off_domain_sitemap_not_scheduled(self):
+        spider = WebsiteSpider(domain="example.com")
+        body = (b"User-agent: *\n"
+                b"Sitemap: https://cdn.thirdparty.com/sitemap.xml\n"
+                b"Sitemap: https://example.com/sitemap.xml\n")
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        urls = [r.url for r in _requests(spider.parse_robots(resp))]
+        assert urls == ["https://example.com/sitemap.xml"]
+
+    def test_sitemap_redirect_off_domain_not_followed(self):
+        spider = WebsiteSpider(domain="example.com")
+        resp = _redirect_response("https://example.com/sitemap.xml",
+                                  "https://other.org/sitemap.xml")
+        reqs = _requests(spider.parse_sitemap(resp))
+        assert reqs == []
+
+    def test_sitemap_redirect_on_domain_followed(self):
+        spider = WebsiteSpider(domain="example.com")
+        resp = _redirect_response("https://example.com/sitemap.xml",
+                                  "https://example.com/sitemap-1.xml")
+        reqs = _requests(spider.parse_sitemap(resp))
+        assert [r.url for r in reqs] == ["https://example.com/sitemap-1.xml"]
