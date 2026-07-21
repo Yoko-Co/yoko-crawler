@@ -716,19 +716,34 @@ def _is_member_login_link(resolved_url: str) -> bool:
 _NONFILLABLE_INPUT_TYPES = frozenset({"hidden", "submit", "button", "image", "reset"})
 
 
-def _has_fillable_control(form: etree._Element) -> bool:
-    """True when a <form> has a control a user actually fills (a text/email/search/checkbox input,
-    a <textarea>, or a <select>) -- vs only framework hidden fields + buttons."""
+def _is_framework_wrapper(form: etree._Element) -> bool:
+    """True when a <form> carries ASP.NET WebForms framework hidden fields (__VIEWSTATE /
+    __EVENTVALIDATION / __EVENTTARGET / ...). These wrap the WHOLE page body, so any buttons inside
+    are page chrome, not a real form's submit -- the discriminator that keeps a real button-only
+    form counting while the ndba-style page wrapper doesn't (issue corpus#67)."""
+    return any((i.get("name") or "").startswith("__") for i in form.xpath(".//input[@type='hidden']"))
+
+
+def _is_real_form(form: etree._Element) -> bool:
+    """True when a <form> is a real user-facing form to rebuild (issue corpus#67): it has a fillable
+    control (a non-hidden/non-button <input>, a <textarea>, or a <select>), OR a submit <button> and
+    is not the ASP.NET page wrapper. A <form> whose only controls are framework hidden fields (the
+    __VIEWSTATE wrapper on every ASP.NET WebForms page -- the ndba case) is NOT a form to rebuild.
+    A JS-hydrated empty <form> reads as 0 -- an accepted rendered-surface limitation."""
     if form.find(".//textarea") is not None or form.find(".//select") is not None:
         return True
-    return any((i.get("type") or "text").strip().lower() not in _NONFILLABLE_INPUT_TYPES
-               for i in form.iterfind(".//input"))
+    if any((i.get("type") or "text").strip().lower() not in _NONFILLABLE_INPUT_TYPES
+           for i in form.iterfind(".//input")):
+        return True
+    # A button-only action form (subscribe / apply / add-to-cart) is real -- unless it's the ASP.NET
+    # page wrapper whose buttons are page chrome swept into the whole-page <form>.
+    return not _is_framework_wrapper(form) and bool(form.xpath(".//button[not(@type) or @type='submit']"))
 
 
 def _real_form_count(subtree: etree._Element) -> int:
-    """Forms with a user-fillable control (issue corpus#67). Excludes the ASP.NET WebForms
-    page-wrapper <form> (all-hidden __VIEWSTATE fields) that otherwise counts as 1 form per page."""
-    return sum(1 for f in subtree.xpath(".//form") if _has_fillable_control(f))
+    """Count real user-facing forms (issue corpus#67). Excludes the ASP.NET WebForms page-wrapper
+    <form> (all-hidden __VIEWSTATE fields) that otherwise counts as 1 form per page."""
+    return sum(1 for f in subtree.xpath(".//form") if _is_real_form(f))
 
 
 def count_structure(
