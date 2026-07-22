@@ -4,7 +4,7 @@ import json
 import re
 
 import scrapy
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse, urljoin
 from w3lib.url import canonicalize_url
 from scrapy.http import TextResponse
 
@@ -48,6 +48,9 @@ class WebsiteSpider(scrapy.Spider):
           use -a keep_pagination=1
       - Allow other subdomains (besides www):
           use -a include_subdomains=1
+      - Contains faceted search: collapses facet slot-order permutations and skips
+        filter selections deeper than MAX_FACET_DEPTH (issue #49):
+          use -a max_facet_depth=N
     """
 
     name = "website_spider"
@@ -136,6 +139,26 @@ class WebsiteSpider(scrapy.Spider):
     # Separable so we can treat pagination differently for scheduling vs emitting
     PAGINATION_PARAMS = {"page", "p", "offset", "start", "sort", "order", "dir"}
 
+    # Faceted search (issue #49). A multi-select facet UI emits one query param per
+    # selected filter, which fans out combinatorially: every SUBSET is a URL, and every
+    # ORDERING of a subset is another URL. On naeyc.org that turned one Drupal Search API
+    # page into 1,491 crawled URLs -- 77.6% of the crawl, leaving the real 430-page site
+    # under-crawled -- and made one search page contribute 25 of the 30 "pages with forms".
+    #
+    # An indexed array param: `f[0]`, `tid[2]`, `field_topics[1]`. The trailing [N] is a
+    # slot number, so the base name identifies the family. Anchored both ends so a param
+    # merely CONTAINING brackets isn't misread as a facet.
+    _FACET_INDEX_RE = re.compile(r"^(.+?)\[\d+\]$")
+    # Bare facet params used without an index by common search stacks (Solr/Search API,
+    # Algolia, WooCommerce-style filters).
+    FACET_PARAM_NAMES = {"fq", "facet", "facets", "filter", "filters",
+                         "refine", "refinement", "refinements"}
+    # Filters deep enough to be a duplicate VIEW of a result set rather than a distinct
+    # page. Keeps the unfiltered page plus shallow combinations (on naeyc.org: 5 URLs
+    # instead of 1,491) -- a redesign builds the search template once, not once per filter
+    # combination. Override with -a max_facet_depth=N.
+    MAX_FACET_DEPTH = 2
+
     # <link rel=canonical> href, matched case-insensitively and as a whitespace-separated
     # token (so `rel="canonical alternate"` and `rel="CANONICAL"` both match). issue #10.
     _CANONICAL_XPATH = (
@@ -156,6 +179,15 @@ class WebsiteSpider(scrapy.Spider):
         self.seen = set()              # scheduled (normalized in schedule-mode)
         self.emitted = set()           # already written (normalized in emit-mode)
         self.first_referrer = {}       # schedule-norm URL -> emit-norm first referrer
+
+        # Faceted-search depth cap (issue #49). Non-numeric/negative input falls back to
+        # the class default rather than failing the crawl or disabling the cap.
+        try:
+            self.max_facet_depth = int(kwargs.get("max_facet_depth", self.MAX_FACET_DEPTH))
+        except (TypeError, ValueError):
+            self.max_facet_depth = self.MAX_FACET_DEPTH
+        if self.max_facet_depth < 0:
+            self.max_facet_depth = self.MAX_FACET_DEPTH
 
         keep_pagination = str(kwargs.get("keep_pagination", "")).lower() in {"1", "true", "yes"}
         self.reach_pagination = str(kwargs.get("reach_pagination", "")).lower() in {"1", "true", "yes"}
@@ -273,6 +305,66 @@ class WebsiteSpider(scrapy.Spider):
     def normalize_url(self, url: str, *, exclude_params) -> str:
         cleaned = self.strip_unwanted_queries(url, exclude_params=exclude_params)
         return canonicalize_url(cleaned, keep_fragments=False)
+
+    # ---------- Faceted-search containment (issue #49) ----------
+
+    @classmethod
+    def facet_family(cls, key: str) -> str | None:
+        """The family a query param belongs to when it looks like one slot of a
+        multi-select facet, else None.
+
+        Two shapes qualify. An INDEXED array param (`f[0]`, `tid[2]`,
+        `field_topics[1]`) -> `f[]` / `tid[]` / `field_topics[]`: the index is a slot
+        number, not meaning, so `f[0]=a&f[1]=b` and `f[0]=b&f[1]=a` are the same
+        selection. Or a bare well-known facet param name (`fq`, `facet`, `filter`).
+
+        Deliberately narrow: an identity param (`?id=5`, `?product=hat`) is NOT a facet
+        family, so neither the depth cap nor the order-insensitive dedup below can ever
+        collapse two genuinely different product/detail pages onto one key.
+        """
+        match = cls._FACET_INDEX_RE.match(key)
+        if match:
+            return f"{match.group(1)}[]"
+        return key.lower() if key.lower() in cls.FACET_PARAM_NAMES else None
+
+    @classmethod
+    def facet_depth(cls, url: str) -> int:
+        """How many facet-shaped params the URL carries -- its filter depth. Non-facet
+        params (`?id=5&color=red`) count 0, so only faceted search is ever capped."""
+        return sum(1 for key, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)
+                   if cls.facet_family(key) is not None)
+
+    def facet_dedup_key(self, url: str) -> str:
+        """A scheduling identity that is INSENSITIVE to facet slot order, so the many
+        orderings of one facet selection collapse to a single key (issue #49).
+
+        `?f[0]=187&f[1]=79` and `?f[0]=79&f[1]=187` are the same result set under
+        different URLs. `w3lib.canonicalize_url` sorts params by NAME, and `f[0]`/`f[1]`
+        are different names, so it cannot collapse them -- on naeyc.org that let one
+        search page fan out to 1,491 crawled URLs (77.6% of the whole crawl).
+
+        This is a dedup KEY only, never a URL we fetch: the first ordering seen is
+        requested with its own real, working URL; later permutations merely hit the key
+        in `self.seen` and are dropped. A URL with no facet params returns unchanged, so
+        ordinary pages keep their exact identity.
+        """
+        parsed = urlparse(url)
+        families: dict = {}
+        plain = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            family = self.facet_family(key)
+            if family is None:
+                plain.append((key, value))
+            else:
+                families.setdefault(family, set()).add(value)
+        if not families:
+            return url
+        # Sort values WITHIN each family (slot order carries no meaning) and the families
+        # against each other, so every permutation of one selection yields one string.
+        flattened = [(family, value)
+                     for family in sorted(families)
+                     for value in sorted(families[family])]
+        return urlunparse(parsed._replace(query=urlencode(sorted(plain) + flattened)))
 
     def is_asset_url(self, url: str) -> bool:
         path = (urlparse(url).path or "").lower()
@@ -557,8 +649,12 @@ class WebsiteSpider(scrapy.Spider):
                     exclude_params=self.exclude_params_emit
                 )
 
-        # First referrer, if we have it (prefer what we captured at schedule time)
-        current_schedule = self.normalize_url(response.url, exclude_params=self.exclude_params_schedule)
+        # First referrer, if we have it (prefer what we captured at schedule time).
+        # Looked up by the same facet-dedup key `_schedule` stored it under (issue #49),
+        # so a facet URL still resolves its referrer.
+        current_schedule = self.facet_dedup_key(
+            self.normalize_url(response.url, exclude_params=self.exclude_params_schedule)
+        )
         referrer = self.first_referrer.get(current_schedule, "")
 
         # Fallback to actual Referer header if not captured earlier
@@ -592,25 +688,34 @@ class WebsiteSpider(scrapy.Spider):
         if not self.is_internal(url):
             return
         normalized = self.normalize_url(url, exclude_params=self.exclude_params_schedule)
-        if normalized in self.seen:
+        # Faceted search (issue #49): dedup on a slot-order-insensitive key so the many
+        # orderings of one filter selection collapse, and drop selections deeper than the
+        # cap -- those are duplicate views of a result set, not pages a redesign builds.
+        # Checked BEFORE `seen` so a capped URL is never recorded as visited.
+        if self.facet_depth(normalized) > self.max_facet_depth:
+            self.crawler.stats.inc_value("facet_urls_skipped")
+            self.logger.debug("Skipping deep facet URL: %s", normalized)
+            return
+        seen_key = self.facet_dedup_key(normalized)
+        if seen_key in self.seen:
             return
 
         if self.is_login_url(normalized):
-            self.seen.add(normalized)
+            self.seen.add(seen_key)
             self.crawler.stats.inc_value("login_urls_skipped")
             self.logger.debug("Skipping login/auth URL: %s", normalized)
             return
 
         if self.is_infra_url(normalized):
-            self.seen.add(normalized)
+            self.seen.add(seen_key)
             self.crawler.stats.inc_value("infra_urls_skipped")
             self.logger.debug("Skipping infrastructure URL: %s", normalized)
             return
 
         if self.is_asset_url(normalized):
-            self.seen.add(normalized)
+            self.seen.add(seen_key)
             if referrer_emit:
-                self.first_referrer.setdefault(normalized, referrer_emit)
+                self.first_referrer.setdefault(seen_key, referrer_emit)
             self.logger.info("Fetching headers for asset URL: %s", normalized)
             yield scrapy.Request(
                 normalized,
@@ -620,11 +725,14 @@ class WebsiteSpider(scrapy.Spider):
             )
             return
 
-        # Store first referrer for this scheduled target (schedule-norm key, emit-norm value)
+        # Store first referrer for this scheduled target (facet-dedup key, emit-norm value)
         if referrer_emit:
-            self.first_referrer.setdefault(normalized, referrer_emit)
+            self.first_referrer.setdefault(seen_key, referrer_emit)
 
-        self.seen.add(normalized)
+        self.seen.add(seen_key)
+        # Request the URL as NORMALIZED, not as the dedup key: the key reorders facet
+        # slots into a canonical form that the site may not serve. The first ordering we
+        # saw is a real, working URL.
         yield scrapy.Request(normalized, callback=self.parse, dont_filter=True)
 
     def parse_asset(self, response):
