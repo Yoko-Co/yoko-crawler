@@ -455,16 +455,31 @@ class WebsiteSpider(scrapy.Spider):
 
     # ---------- Entry points ----------
 
+    def _stat(self, name, count=1):
+        """Bump a crawl stat, tolerating a spider built without a crawler (unit tests)."""
+        crawler = getattr(self, "crawler", None)
+        stats = getattr(crawler, "stats", None) if crawler else None
+        if stats is not None:
+            stats.inc_value(name, count)
+
     def _seed_requests(self):
         """The crawl's seed requests: the start URL(s) plus robots.txt (which fans out to
         the sitemaps). Shared by `start` and `start_requests` so the two entry points can
-        never drift."""
+        never drift.
+
+        Every seed is counted (`seeding/seeds_emitted`) so a crawl can PROVE this ran.
+        That is the tripwire for the bug class that killed it once already: Scrapy renamed
+        the seeding entry point, our method became unreachable, and nothing failed -- no
+        exception, no test, no log line. A crawl seeded by Scrapy's default instead of this
+        method reports 0 here, which `stats_extension` turns into a loud error."""
         # Seed the cookie jar with any injected cookies (e.g. a browser-solved
         # cf_clearance): setting them on the seed requests lets Scrapy's CookiesMiddleware
         # re-attach them to every followed request to the same domain automatically.
         cookies = self.injected_cookies or None
         for url in self.start_urls:
+            self._stat("seeding/seeds_emitted")
             yield scrapy.Request(url, callback=self.parse, cookies=cookies)
+        self._stat("seeding/seeds_emitted")
         yield scrapy.Request(
             urljoin(self.start_urls[0], "/robots.txt"),
             callback=self.parse_robots,
@@ -499,7 +514,10 @@ class WebsiteSpider(scrapy.Spider):
     # ---------- Robots & sitemaps ----------
 
     def parse_robots(self, response):
-        # Record robots fetch
+        # Record robots fetch. Counted so a crawl can show sitemap discovery actually
+        # happened -- a site with no robots.txt still 404s here, so a ZERO means the seed
+        # never went out, not that the site lacks one.
+        self._stat("seeding/robots_fetched")
         yield from self._emit_row(response)
 
         # One-hop redirect follow -- only on-domain (issue corpus#71). robots.txt should redirect
@@ -521,7 +539,9 @@ class WebsiteSpider(scrapy.Spider):
                     yield scrapy.Request(sm_url, callback=self.parse_sitemap, dont_filter=True)
 
     def parse_sitemap(self, response):
-        # Record sitemap fetch
+        # Record sitemap fetch. `sitemaps_fetched` vs `seeding/robots_fetched` distinguishes
+        # "we asked for robots.txt and the site listed no sitemap" from "we never asked".
+        self._stat("seeding/sitemaps_fetched")
         yield from self._emit_row(response)
 
         # One-hop redirect follow -- only on-domain (issue corpus#71): an off-domain sitemap redirect

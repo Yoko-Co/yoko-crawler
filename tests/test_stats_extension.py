@@ -185,3 +185,65 @@ def test_close_reason_surfaced_on_safety_valve_stop(tmp_path):
     assert data["close_reason"] == "closespider_timeout"
     assert data["urls_crawled"] == 1200
     assert data["urls_discovered"] == 5000
+
+
+class TestSeedingTripwire:
+    """issue #52: a runtime signal for the bug class that silently disabled sitemap
+    discovery. Scrapy renamed the seeding entry point, `WebsiteSpider.start_requests`
+    became unreachable, Scrapy's default seeded instead -- and crawls kept succeeding,
+    just with fewer pages. No exception, no failing test, no log line, for months.
+
+    The invariant: our own seeding method counts every seed it emits, so `seeds_emitted
+    == 0` on a crawl that fetched pages means something else did the seeding."""
+
+    def test_status_file_reports_seeding_counters(self, tmp_path):
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "seeding/seeds_emitted": 2,
+             "seeding/robots_fetched": 1, "seeding/sitemaps_fetched": 3},
+            reason="finished",
+        )
+        assert data["seeding"] == {"seeds_emitted": 2, "robots_fetched": 1,
+                                   "sitemaps_fetched": 3}
+
+    def test_zero_seeds_on_a_crawl_that_fetched_pages_is_logged_as_an_error(self, tmp_path, caplog):
+        import logging
+        with caplog.at_level(logging.ERROR):
+            _write_and_read(
+                tmp_path,
+                {"response_received_count": 40, "seeding/seeds_emitted": 0},
+                reason="finished",
+            )
+        assert "SEEDING DID NOT RUN" in caplog.text
+
+    def test_healthy_crawl_does_not_trip_the_wire(self, tmp_path, caplog):
+        import logging
+        with caplog.at_level(logging.ERROR):
+            _write_and_read(
+                tmp_path,
+                {"response_received_count": 40, "seeding/seeds_emitted": 2},
+                reason="finished",
+            )
+        assert "SEEDING DID NOT RUN" not in caplog.text
+
+    def test_empty_crawl_does_not_trip_the_wire(self, tmp_path, caplog):
+        """A crawl that fetched nothing (SSRF-blocked, DNS failure) legitimately has no
+        seeds counted; that is a different failure and already reported as such."""
+        import logging
+        with caplog.at_level(logging.ERROR):
+            _write_and_read(
+                tmp_path,
+                {"response_received_count": 0, "seeding/seeds_emitted": 0},
+                reason="finished",
+            )
+        assert "SEEDING DID NOT RUN" not in caplog.text
+
+    def test_degraded_crawl_is_not_failed(self, tmp_path):
+        """A link-following-only crawl is degraded, not worthless -- failing it would
+        discard real pages over a defect the operator can fix and re-run."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "seeding/seeds_emitted": 0},
+            reason="finished",
+        )
+        assert data["status"] == "completed"
