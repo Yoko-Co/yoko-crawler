@@ -91,7 +91,13 @@ Other status codes: `409` (domain already crawling), `429` (concurrency limit), 
 
 ### `GET /crawl/{id}`
 
-Returns job status, including `impersonate`, `delay`, `profile`, and `emit_content`, plus `urls_discovered`/`urls_crawled`. A crawl where every host was SSRF-blocked (nothing fetched) is reported as `failed` with an explanatory `error`. A wholesale bot-block (all-403) is **not** failed — the crawl `completed`s and emits its `403` rows so the consumer (yoko-corpus) can retry with impersonation and/or present an honest "we couldn't read this site" report; the `waf_challenge_count` stat records recognized Cloudflare/WAF challenge pages (which are emitted but not mined for content or followed).
+Returns job status, including `impersonate`, `delay`, `profile`, and `emit_content`, plus `urls_discovered`/`urls_crawled`, `close_reason`, and `failure_reason`. `failure_reason` is a **structured discriminator** (issue #44) a consumer switches on instead of scraping the `error` prose — `null` on a real crawl, otherwise one of:
+
+- `unreachable` — the crawl fetched **nothing** and every request errored at the transport layer (DNS / connection / TLS); almost always a wrong or mistyped address. Reported as `failed` (previously a misleading `completed` with 0 pages).
+- `ssrf_blocked` — every candidate host resolved to a private/reserved range and was dropped by the SSRF guard (nothing fetched); `failed` with an explanatory `error`.
+- `crawl_error` — an abnormal Scrapy close (e.g. `memusage_exceeded`).
+
+Only a **wholly empty** crawl is reclassified: any crawl that fetched even one page is left `completed` with `failure_reason: null`. A wholesale bot-block (all-403) is **not** failed — the crawl `completed`s and emits its `403` rows so the consumer (yoko-corpus) can retry with impersonation and/or present an honest "we couldn't read this site" report; the `waf_challenge_count` stat records recognized Cloudflare/WAF challenge pages (which are emitted but not mined for content or followed).
 
 ### `GET /crawl/{id}/results`
 

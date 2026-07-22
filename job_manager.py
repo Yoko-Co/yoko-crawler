@@ -577,6 +577,11 @@ class JobManager:
             # (`closespider_timeout`/`closespider_itemcount`) that only partially
             # crawled the site, even though both report status "completed".
             "close_reason": status_data.get("close_reason"),
+            # Structured failure token (issue #44): a stable discriminator
+            # (unreachable / ssrf_blocked / crawl_error) the corpus maps onto its own
+            # failure_class, instead of scraping the humanized `error` prose. None
+            # unless the crawl failed with a classified cause.
+            "failure_reason": status_data.get("failure_reason"),
             "started_at": (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(job.started_at))
             ),
