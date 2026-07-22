@@ -1,6 +1,6 @@
 fastapi>=0.100
 uvicorn[standard]>=0.27
-scrapy>=2.11
+scrapy>=2.13,<3  # >=2.13 for the `async def start()` seed entry point (2.17 removed start_requests and its call sites, silently killing cookie injection + robots/sitemap seeding); cap major since spider/scheduler APIs move between majors
 scrapy-impersonate>=1.7,<2  # browser TLS-fingerprint impersonation (curl_cffi); cap major since the handler is referenced by import path
 trafilatura==2.1.0  # main-content extraction; pinned exactly because extraction heuristics change content_hash between versions (a deliberate upgrade is a hash-epoch change)
 aiofiles
