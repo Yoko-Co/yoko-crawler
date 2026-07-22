@@ -337,6 +337,28 @@ class TestJobManager:
         assert response["impersonate"] == "chrome"
         assert response["delay"] == 2.5
         assert 59 <= response["elapsed_seconds"] <= 61
+        # A running job has no classified failure yet.
+        assert response["failure_reason"] is None
+
+    async def test_get_status_response_propagates_failure_reason(self):
+        # failure_reason written to status.json must reach the GET /crawl/{id} payload
+        # (issue #44) -- the whole point of the field. Mirrors the close_reason contract.
+        jm = JobManager()
+        proc = make_fake_process(returncode=0)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("exmaple.com", resumable=True)
+        job.status_file.write_text(
+            json.dumps({
+                "status": "failed",
+                "failure_reason": "unreachable",
+                "error": "target unreachable",
+                "close_reason": "finished",
+            })
+        )
+        await jm._monitor(job.job_id)
+        response = await jm.get_status_response(job)
+        assert response["status"] == "failed"
+        assert response["failure_reason"] == "unreachable"
 
     def test_startup_sweep(self, tmp_path):
         """Startup sweep should delete old orphaned files."""

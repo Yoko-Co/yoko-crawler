@@ -91,7 +91,17 @@ Other status codes: `409` (domain already crawling), `429` (concurrency limit), 
 
 ### `GET /crawl/{id}`
 
-Returns job status, including `impersonate`, `delay`, `profile`, and `emit_content`, plus `urls_discovered`/`urls_crawled`. A crawl where every host was SSRF-blocked (nothing fetched) is reported as `failed` with an explanatory `error`. A wholesale bot-block (all-403) is **not** failed — the crawl `completed`s and emits its `403` rows so the consumer (yoko-corpus) can retry with impersonation and/or present an honest "we couldn't read this site" report; the `waf_challenge_count` stat records recognized Cloudflare/WAF challenge pages (which are emitted but not mined for content or followed).
+Returns job status, including `impersonate`, `delay`, `profile`, and `emit_content`, plus `urls_discovered`/`urls_crawled`, `close_reason`, and `failure_reason`. `failure_reason` is a **structured discriminator** (issue #44) a consumer switches on instead of scraping the `error` prose — `null` on a real crawl, otherwise one of:
+
+- `unreachable` — the crawl fetched **nothing** and every request errored at the transport layer (DNS / connection / TLS); almost always a wrong or mistyped address. Reported as `failed` (previously a misleading `completed` with 0 pages).
+- `ssrf_blocked` — every candidate host resolved to a private/reserved range and was dropped by the SSRF guard (nothing fetched); `failed` with an explanatory `error`.
+- `crawl_error` — an abnormal Scrapy close (e.g. `memusage_exceeded`).
+
+Only a **wholly empty** crawl is reclassified: any crawl that fetched even one page is left `completed` with `failure_reason: null`.
+
+**Consumer contract:** key on `status` (and `failure_reason`), **not** `close_reason`. A reclassified empty crawl keeps the raw Scrapy `close_reason: "finished"` (Scrapy did drain its schedule — every request just errored), so `status: "failed"` + `close_reason: "finished"` is expected, same as the pre-existing `ssrf_blocked` case. Conversely, `failure_reason` is `null` for a **job-manager-level** failure that never reaches the Scrapy close (subprocess spawn failure, watchdog timeout, monitor crash): those surface as `status: "failed"` with `failure_reason: null`, so treat `null` as "unclassified", not "succeeded".
+
+A wholesale bot-block (all-403) is **not** failed — the crawl `completed`s and emits its `403` rows so the consumer (yoko-corpus) can retry with impersonation and/or present an honest "we couldn't read this site" report; the `waf_challenge_count` stat records recognized Cloudflare/WAF challenge pages (which are emitted but not mined for content or followed).
 
 ### `GET /crawl/{id}/results`
 

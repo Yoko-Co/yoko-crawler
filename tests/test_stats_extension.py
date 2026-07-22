@@ -68,6 +68,78 @@ def test_ssrf_blocked_into_emptiness_marked_failed(tmp_path):
     )
     assert data["status"] == "failed"
     assert "SSRF guard" in data["error"]
+    assert data["failure_reason"] == "ssrf_blocked"  # issue #44
+
+
+def test_unreachable_target_marked_failed(tmp_path):
+    # Fetched NOTHING because every request errored at the transport layer (DNS /
+    # connection) -> a mistyped/unreachable address, surfaced as failed/unreachable
+    # instead of a misleading "completed" with 0 pages (issue #44).
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 0, "downloader/exception_count": 5},
+        reason="finished",
+    )
+    assert data["status"] == "failed"
+    assert data["failure_reason"] == "unreachable"
+    assert "unreachable" in data["error"]
+
+
+def test_ssrf_wins_over_transport_exceptions_when_both_empty(tmp_path):
+    # An SSRF-dropped host also raises a transport exception; the SSRF cause is the
+    # more specific one and must win.
+    data = _write_and_read(
+        tmp_path,
+        {"ssrf_guard/blocked": 2, "downloader/exception_count": 2, "response_received_count": 0},
+        reason="finished",
+    )
+    assert data["failure_reason"] == "ssrf_blocked"
+
+
+def test_empty_finish_without_cause_stays_completed(tmp_path):
+    # 0 pages, no SSRF drops, no transport errors (e.g. everything robots-disallowed):
+    # a genuinely empty finish -- unchanged behavior, still completed, no failure token.
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 0},
+        reason="finished",
+    )
+    assert data["status"] == "completed"
+    assert data["failure_reason"] is None
+
+
+def test_transport_exceptions_with_pages_are_unaffected(tmp_path):
+    # A real crawl that fetched pages but hit a few transport errors on stray links is
+    # NOT reclassified -- only a wholly-empty crawl is.
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 30, "downloader/exception_count": 3},
+        reason="finished",
+    )
+    assert data["status"] == "completed"
+    assert data["failure_reason"] is None
+
+
+def test_abnormal_close_gets_generic_failure_token(tmp_path):
+    # A non-completed Scrapy close (OOM) that fetched pages fails with the generic token.
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 10, "downloader/exception_count": 0},
+        reason="memusage_exceeded",
+    )
+    assert data["status"] == "failed"
+    assert data["failure_reason"] == "crawl_error"
+    assert data["error"] == "memusage_exceeded"
+
+
+def test_failure_reason_absent_on_success(tmp_path):
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 20, "scheduler/enqueued": 20},
+        reason="finished",
+    )
+    assert data["status"] == "completed"
+    assert data["failure_reason"] is None
 
 
 def test_ssrf_block_with_fetched_pages_completes(tmp_path):
