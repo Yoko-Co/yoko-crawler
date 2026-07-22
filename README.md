@@ -89,6 +89,14 @@ Response `202`:
 
 Other status codes: `409` (domain already crawling), `429` (concurrency limit), `422` (validation).
 
+A `422` domain-validation rejection carries a structured **`code`** alongside the human `detail`, so a consumer switches on the code instead of substring-matching the message (issue #48):
+
+```json
+{ "detail": "Domain does not resolve: exmaple.com", "code": "unresolvable" }
+```
+
+Codes: `unresolvable` (no DNS answer / resolution timeout — almost always a wrong/mistyped address), `private_address` (resolves only to a blocked/reserved range), `is_ip` (a bare IP was supplied), `bad_format` (empty, too long, or fails the hostname regex). `detail` remains a human string.
+
 ### `GET /crawl/{id}`
 
 Returns job status, including `impersonate`, `delay`, `profile`, and `emit_content`, plus `urls_discovered`/`urls_crawled`, `close_reason`, and `failure_reason`. `failure_reason` is a **structured discriminator** (issue #44) a consumer switches on instead of scraping the `error` prose — `null` on a real crawl, otherwise one of:

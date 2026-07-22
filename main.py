@@ -186,7 +186,11 @@ async def start_crawl(request: CrawlRequest):
     try:
         domain = await validate_domain(request.domain)
     except DomainValidationError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        # Carry the structured `code` alongside the human `detail` (issue #48) so the corpus
+        # switches on it instead of substring-matching the message. `detail` stays a string
+        # (consumers still read it); a JSONResponse keeps that shape (a dict HTTPException
+        # detail would nest it under `detail`).
+        return JSONResponse(status_code=422, content={"detail": str(e), "code": e.code})
 
     jm: JobManager = app.state.job_manager
 
