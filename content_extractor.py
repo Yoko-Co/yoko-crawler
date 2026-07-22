@@ -307,6 +307,37 @@ def _content_root(body_el: etree._Element) -> etree._Element:
     return cur
 
 
+def _semantic_content_root(body_el: etree._Element) -> etree._Element | None:
+    """The page's OWN declared content container -- <main>, [role=main], or a lone <article> --
+    wherever it sits in the tree. The RESCUE root for `structure_hash`, used only when the
+    ordinary descent finds no structure at all.
+
+    Why it can't be found by descending: lxml/libxml2 is not an HTML5 parser, so it does not
+    apply the auto-close rules for `<li>`/`<p>`/etc. A theme that ships unclosed `<li>`s in a
+    mega-menu (very common) leaves that element open, and everything after it -- `<main>`,
+    `<footer>`, the whole page -- gets nested INSIDE `<header>`, even though the source closes
+    `</header>` first. `<header>` is skipped as chrome, so the body has no structural children,
+    the skeleton is empty, and EVERY page of the site fingerprints as "" -> no template clusters
+    -> the report reads "Not analyzed" despite a complete crawl (Sarah, sais.org: 525 pages, 0
+    templates). A document-wide search for the semantic root steps over the mis-nesting.
+
+    Deliberately NOT a fallback to "descend including chrome": on such a document that lands in
+    the nav's `<ul>`, which is identical on every page -- one 525-page "template" and a confident
+    under-quote. No fingerprint is better than a false merge; a real content root is better than
+    both. Several `<main>`s (invalid markup) -> the largest; several `<article>`s -> none, since
+    that is a listing OF articles, not an article page."""
+    mains = [el for el in body_el.iter("main") if isinstance(el.tag, str)]
+    if not mains:
+        mains = [el for el in body_el.iter()
+                 if isinstance(el.tag, str) and (el.get("role") or "").strip().lower() == "main"]
+    if not mains:
+        articles = [el for el in body_el.iter("article") if isinstance(el.tag, str)]
+        mains = articles if len(articles) == 1 else []
+    if not mains:
+        return None
+    return max(mains, key=lambda el: sum(1 for _ in el.iter()))
+
+
 def _skeleton(el: etree._Element, depth: int) -> str:
     """A depth-limited, content-free string of ``el``'s structural children (chrome + inline
     excluded). Consecutive identical child tokens (tag + their own subtree) collapse to one, so
@@ -336,11 +367,23 @@ def structure_hash(body_el: etree._Element) -> str:
 
     Coarse EXACT-hash, first pass (best-guess per issue #36): it errs toward over-splitting
     (an extra structural block -> its own cluster), the safe direction, and is tuned against
-    real crawls. Empty when the content root has no structural children (asset/empty page)."""
+    real crawls. Empty when the content root has no structural children (asset/empty page).
+
+    When the ordinary descent finds NO structure, retry from the page's declared semantic root
+    (`_semantic_content_root`) before giving up: on a site whose unclosed-tag markup makes the
+    non-HTML5 parser bury the whole page inside `<header>`, the descent lands on a chrome-only
+    body and every page would otherwise fingerprint as "". Ordering matters -- the descent stays
+    primary, so pages that fingerprint today keep the SAME hash and their clustering is
+    untouched; the semantic root only rescues the pages that produce nothing at all."""
     if body_el is None:
         return ""
     root = _content_root(body_el)
     skeleton = _skeleton(root, 1)
+    if not skeleton:
+        rescue = _semantic_content_root(body_el)
+        if rescue is not None:
+            root = rescue
+            skeleton = _skeleton(root, 1)
     if not skeleton:
         return ""  # no structural content -- no fingerprint (excluded from clustering)
     root_tag = root.tag.lower() if isinstance(root.tag, str) else "x"

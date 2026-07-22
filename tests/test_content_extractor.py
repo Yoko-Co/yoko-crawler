@@ -1336,6 +1336,74 @@ class TestStructureHash:
         assert self._h(a) == self._h(a)
 
 
+class TestStructureHashMisnestedChrome:
+    """A theme that ships unclosed tags in its header (very common) makes the non-HTML5 parser
+    nest the WHOLE page inside <header> -- which fingerprinting skips as chrome. Every page then
+    hashed to "", so the crawl produced no template clusters and the report read "Not analyzed"
+    over a complete crawl (Sarah, sais.org: 525 pages, ~0 templates). The page's own semantic
+    root rescues the fingerprint."""
+
+    # An unclosed <div> inside <header>: the source closes </header> before <main>, but the
+    # parser leaves the div open, so <main> and <footer> land INSIDE <header>.
+    _BAD_HEADER = (b"<header><div class=c><div class=r>"
+                   b"<nav><ul><li><a>Home</a></li></ul></nav></div></header>")
+    _GOOD_HEADER = b"<header><nav><a>Home</a></nav></header>"
+
+    def _doc(self, header, inner):
+        return (b"<!DOCTYPE html><html><head><title>T</title></head><body>"
+                + header + inner + b"<footer><a>Privacy</a></footer></body></html>")
+
+    def _h(self, header, inner):
+        return ce.structure_hash(extract_content(self._doc(header, inner)).body_subtree)
+
+    _ARTICLE = b"<main><article><h1>T</h1><p>a</p><p>b</p></article></main>"
+    _LISTING = (b"<main><h1>D</h1><div class=grid>"
+                b"<div class=card><h3>i</h3><p>x</p></div>"
+                b"<div class=card><h3>j</h3><p>y</p></div></div></main>")
+
+    def test_chrome_swallows_the_page_and_the_parser_confirms_it(self):
+        # Guards the premise: if a future parser change stops mis-nesting, this class is moot.
+        body = extract_content(self._doc(self._BAD_HEADER, self._ARTICLE)).body_subtree
+        assert [c.tag for c in body] == ["header"]  # <main>/<footer> swallowed by <header>
+        assert body.find(".//main") is not None
+
+    def test_misnested_page_still_fingerprints(self):
+        assert self._h(self._BAD_HEADER, self._ARTICLE) != ""
+
+    def test_distinct_templates_stay_distinct_when_misnested(self):
+        # The rescue must not collapse the site into ONE template: a confident "1 template,
+        # 525 pages" under-quote is worse than no fingerprint at all.
+        assert self._h(self._BAD_HEADER, self._ARTICLE) != self._h(self._BAD_HEADER, self._LISTING)
+
+    def test_same_template_different_content_still_clusters_when_misnested(self):
+        other = b"<main><article><h1>Different Title</h1><p>" + b"word " * 40 + b"</p><p>z</p></article></main>"
+        assert self._h(self._BAD_HEADER, self._ARTICLE) == self._h(self._BAD_HEADER, other)
+
+    def test_well_formed_pages_are_untouched(self):
+        # The rescue runs ONLY when the ordinary descent yields nothing, so pages that
+        # fingerprint today keep the exact same hash -- no re-clustering of working sites.
+        for inner in (self._ARTICLE, self._LISTING):
+            assert self._h(self._GOOD_HEADER, inner) == ce.structure_hash(
+                extract_content(self._doc(self._GOOD_HEADER, inner)).body_subtree
+            ) != ""
+
+    def test_no_semantic_root_stays_blank(self):
+        # No <main>/<article>/[role=main] to rescue with: still "" rather than descending into
+        # the nav (identical on every page -> a false merge).
+        div_page = b"<div class=wrap><h1>T</h1><p>a</p><div><p>b</p></div></div>"
+        assert self._h(self._BAD_HEADER, div_page) == ""
+
+    def test_role_main_is_a_rescue_root(self):
+        assert self._h(self._BAD_HEADER, b"<div role=main><h1>T</h1><p>a</p><p>b</p></div>") != ""
+
+    def test_several_articles_are_a_listing_not_a_rescue_root(self):
+        # Several <article>s = a listing OF articles; fingerprinting one card would merge the
+        # listing with the article template. Only a LONE <article> is a content root.
+        many = b"".join(b"<article><h2>t</h2><p>x</p></article>" for _ in range(3))
+        assert self._h(self._BAD_HEADER, many) == ""
+        assert self._h(self._BAD_HEADER, b"<article><h1>t</h1><p>x</p><p>y</p></article>") != ""
+
+
 class TestInternalLinkTargets:
     """issue #45: the content-region internal link edge list -- distinct, fragment-stripped,
     with external / in-page-anchor / self-page links excluded, and capped."""
