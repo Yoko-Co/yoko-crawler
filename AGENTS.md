@@ -23,6 +23,14 @@ Yoko Crawler — a Python/FastAPI service that runs Scrapy spiders as subprocess
 
 The enrichment field names have a single source of truth: `ENRICHMENT_FIELD_NAMES` in `content_extractor.py`. `website_spider` builds its zero/empty row defaults from `content_extractor.empty_enrichment()`, and `run_spider.BASE_FEED_FIELDS` is the original five fields plus `ENRICHMENT_FIELD_NAMES` — so adding a field in one place propagates everywhere (a sync test in `tests/test_website_spider.py::TestSchemaSync` guards this). New fields are additive only — the original five (`url`, `status`, `last_modified`, `redirected_to`, `referrer`) never change. `content_text` is the one conditional column (present only under `--emit-content`). See the README "Output format" section for field semantics and the hash/normalization spec.
 
+## Operator runbooks
+
+- **Bot-blocked prospect (datacenter IP refused):** `scripts/local_scrape.sh` crawls from an
+  operator's own machine and the NDJSON is hand-ingested into the corpus on the Discovery
+  droplet. Full flow — Mac setup, VPN caveat, `su -s /bin/bash yoko`, `python -m cli.main
+  ingest`/`analyze`, verification — is in `docs/local-scrape-runbook.md`. This is the stopgap
+  until a trusted-IP proxy lets the droplet do it directly.
+
 ## Deployment
 
 The service runs the same Python code in either environment:
