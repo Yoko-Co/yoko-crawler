@@ -1379,13 +1379,92 @@ class TestStructureHashMisnestedChrome:
         other = b"<main><article><h1>Different Title</h1><p>" + b"word " * 40 + b"</p><p>z</p></article></main>"
         assert self._h(self._BAD_HEADER, self._ARTICLE) == self._h(self._BAD_HEADER, other)
 
-    def test_well_formed_pages_are_untouched(self):
-        # The rescue runs ONLY when the ordinary descent yields nothing, so pages that
-        # fingerprint today keep the exact same hash -- no re-clustering of working sites.
+    def test_well_formed_pages_never_consult_the_rescue(self, monkeypatch):
+        # The load-bearing ordering claim: pages that fingerprint today keep the exact same
+        # hash because the rescue is never reached for them. Asserted by making the rescue
+        # fatal -- comparing structure_hash to itself would pass no matter what.
+        def _boom(_body):
+            raise AssertionError("rescue path taken for a well-formed page")
+
+        monkeypatch.setattr(ce, "_semantic_content_roots", _boom)
         for inner in (self._ARTICLE, self._LISTING):
-            assert self._h(self._GOOD_HEADER, inner) == ce.structure_hash(
-                extract_content(self._doc(self._GOOD_HEADER, inner)).body_subtree
-            ) != ""
+            assert self._h(self._GOOD_HEADER, inner) != ""
+
+    def test_empty_placeholder_root_falls_through_to_the_real_one(self):
+        # An SPA hydration shell <main id=root></main> beside the real content: picking the
+        # first/biggest candidate and giving up when its skeleton is empty reproduced the very
+        # "" this rescue exists to prevent (review). Candidates are tried until one works.
+        inner = (b"<main id=root></main>"
+                 b"<article><h1>T</h1><p>a</p><p>b</p><div><p>c</p></div></article>")
+        assert self._h(self._BAD_HEADER, inner) != ""
+
+    def test_biggest_candidate_is_not_always_the_structural_one(self):
+        # Two <main>s: the bigger one is bigger only in INLINE spans (empty skeleton), so the
+        # size tie-break alone would pick it and return "".
+        spans = b"".join(b"<span>x</span>" for _ in range(40))
+        inner = (b"<main>" + spans + b"</main>"
+                 b"<main><article><h1>T</h1><p>a</p></article><div><p>b</p></div></main>")
+        assert self._h(self._BAD_HEADER, inner) != ""
+
+    def test_empty_semantic_root_alone_stays_blank(self):
+        # A rescue root IS found but has no structure of its own, and there is no other
+        # candidate -- still "" rather than a hash of nothing.
+        assert self._h(self._BAD_HEADER, b"<main></main>") == ""
+
+    def test_nested_mains_pick_the_outer_structural_one(self):
+        # Invalid nesting: both are candidates, taken in DOCUMENT order, so the outer one (whose
+        # skeleton covers the inner) wins -- and the result is stable, not parser-order luck.
+        inner = b"<main><div><main><h1>T</h1><p>a</p></main></div><p>b</p></main>"
+        h = self._h(self._BAD_HEADER, inner)
+        assert h != "" and h == self._h(self._BAD_HEADER, inner)
+
+    def test_candidate_count_is_bounded(self):
+        # The page CHOOSES whether the rescue runs, so its cost must not scale with the page.
+        # Ranking candidates by subtree size walked each one whole: 250 nested <main>s over a
+        # 3.7MB body took 69s vs 0.04ms pre-diff -- one page stalling the crawl (review).
+        nested = b"<main>" * 250 + b"<h1>T</h1><p>a</p>" + b"</main>" * 250
+        body = extract_content(self._doc(self._BAD_HEADER, nested)).body_subtree
+        assert len(ce._semantic_content_roots(body)) <= ce._MAX_ROOT_CANDIDATES
+
+    def test_deeply_nested_rescue_is_fast(self):
+        # The bound above, end to end: the whole hash must stay far off the pathological path.
+        import time
+        nested = b"<main>" * 200 + b"<h1>T</h1>" + b"<p>x</p>" * 4000 + b"</main>" * 200
+        body = extract_content(self._doc(self._BAD_HEADER, nested)).body_subtree
+        started = time.monotonic()
+        ce.structure_hash(body)
+        assert time.monotonic() - started < 2.0
+
+    def test_footer_widget_is_not_a_rescue_root(self):
+        # A footer "related story" <article> is standard theme markup, identical on every page.
+        # Fingerprinting it would merge every rootless page into one bogus template -- the false
+        # merge this design rejects, arriving through the front door (review).
+        inner = (b"<div class=x><span>only inline</span></div>"
+                 b"<footer><article><h3>Related</h3><p>x</p></article></footer>")
+        assert self._h(self._BAD_HEADER, inner) == ""
+
+    def test_a_nav_ancestor_does_not_disqualify_a_rescue_root(self):
+        # The complement, and the reason <nav> is NOT excluded: on the real sais.org pages the
+        # swallowed <main> sits under nav.nav__main--menu inside header.header, so excluding
+        # <nav> would restore the empty fingerprint on all 525 pages. Only <footer> is exempt --
+        # source order means a footer can only ever swallow markup that comes AFTER it.
+        inner = b"<div class=x><span>only inline</span></div><nav><main><h1>M</h1><p>y</p></main></nav>"
+        assert self._h(self._BAD_HEADER, inner) != ""
+
+    def test_footer_widget_does_not_suppress_a_real_article_page(self):
+        # The lone-<article> rule counts AFTER chrome exclusion: a real article page that also
+        # carries a footer related-post card still has exactly ONE content article.
+        inner = (b"<article><h1>Post</h1><p>a</p><p>b</p></article>"
+                 b"<footer><article><h3>Related</h3><p>x</p></article></footer>")
+        assert self._h(self._BAD_HEADER, inner) != ""
+
+    def test_rescue_root_choice_is_content_length_independent(self):
+        # Same template, different content volume -> same fingerprint. Size-ranked selection
+        # made the CHOICE depend on length, so one template split as pages grew (review).
+        def page(n):
+            return (b"<main><h1>T</h1>" + b"<p>x</p>" * n + b"</main>"
+                    b"<main><div><span>chrome-ish</span></div></main>")
+        assert self._h(self._BAD_HEADER, page(3)) == self._h(self._BAD_HEADER, page(300))
 
     def test_no_semantic_root_stays_blank(self):
         # No <main>/<article>/[role=main] to rescue with: still "" rather than descending into
