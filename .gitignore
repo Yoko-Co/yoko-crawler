@@ -14,6 +14,8 @@ docs/references/
 # Dependencies
 node_modules/
 vendor/
+.venv/
+venv/
 
 # Build artifacts
 dist/
@@ -22,8 +24,11 @@ __pycache__/
 *.pyc
 
 # Crawl output / generated result files
+# (.ndjson is what scripts/local_scrape.sh emits -- multi-MB, and it contains a
+#  prospect's full page text. Never commit it.)
 *.csv
 *.jsonl
+*.ndjson
 
 # OS files
 .DS_Store
