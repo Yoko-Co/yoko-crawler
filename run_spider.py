@@ -91,6 +91,24 @@ def build_settings(args):
         # jar on the start request and CookiesMiddleware re-attaches to every followed
         # request to the same domain.
         "COOKIES_ENABLED": True,
+        # Breadth-first ordering (issue #52). Scrapy defaults to a LIFO queue -- depth-first
+        # -- with no depth limit, which makes an infinitely-branching subtree a TRAPDOOR
+        # rather than a tax: the crawler descends into it and never returns, because every
+        # page in it pushes more of it onto the stack. On naeyc.org the crawl fetched 430 real
+        # pages, hit a faceted-search subtree at row 430, and fetched ZERO real pages
+        # afterwards -- the remaining 1,491 requests all went to filter permutations.
+        #
+        # Under BFO a trap costs a slice of the crawl proportional to its branching and can
+        # never monopolize it, because shallow real pages are always served first. This is the
+        # GENERAL protection: #49's facet guard closes one trapdoor, but a path-based trap
+        # (a calendar walking /events/2027/03/ -> /04/ -> forever) is invisible to any
+        # query-param heuristic. FIFO disk queue keeps a big frontier off the heap.
+        "DEPTH_PRIORITY": 1,
+        "SCHEDULER_MEMORY_QUEUE": "scrapy.squeues.FifoMemoryQueue",
+        "SCHEDULER_DISK_QUEUE": "scrapy.squeues.PickleFifoDiskQueue",
+        # A session cap, NOT a crawl budget: on either close reason the corpus starts another
+        # resumable session against the same JOBDIR (yoko-corpus services/crawl.py), so a site
+        # bigger than one session still crawls to completion.
         "CLOSESPIDER_TIMEOUT": 7200,
         "CLOSESPIDER_ITEMCOUNT": 50000,
         "AUTOTHROTTLE_ENABLED": True,

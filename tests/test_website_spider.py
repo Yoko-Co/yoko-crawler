@@ -969,3 +969,99 @@ class TestFacetScheduling:
     def test_bad_max_facet_depth_falls_back_to_default(self):
         s = self._spider(max_facet_depth="nonsense")
         assert s.max_facet_depth == WebsiteSpider.MAX_FACET_DEPTH
+
+
+class TestResumableDedupState:
+    """issue #52: dedup state must survive between resumable crawler sessions.
+
+    yoko-corpus drives one logical crawl as N sessions against a shared per-domain JOBDIR.
+    JOBDIR persists Scrapy's frontier and dupefilter but NOT spider attributes, so `self.seen`
+    came back empty each session and every link on a resumed page was re-scheduled --
+    re-fetching work earlier sessions had done. Scrapy's dupefilter can't compensate because
+    `_schedule` emits `dont_filter=True` on purpose."""
+
+    def _open(self, state=None):
+        """Build a spider the way Scrapy does, then let SpiderState hand it `state`."""
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        if state is not None:
+            s.state = state
+        s._restore_dedup_state()
+        return s
+
+    def test_resumed_session_does_not_refetch(self):
+        state = {}
+        s1 = self._open(state)
+        urls = [f"https://example.com/p{i}" for i in range(5)]
+        assert sum(1 for u in urls if list(s1._schedule(u))) == 5
+
+        import pickle
+        persisted = pickle.loads(pickle.dumps(state))  # the JOBDIR round-trip
+        s2 = self._open(persisted)
+        assert sum(1 for u in urls if list(s2._schedule(u))) == 0
+
+    def test_resumed_session_still_crawls_new_pages(self):
+        """Resume must not freeze the crawl -- newly discovered URLs still schedule."""
+        state = {}
+        s1 = self._open(state)
+        list(s1._schedule("https://example.com/old"))
+        s2 = self._open(state)
+        assert len(list(s2._schedule("https://example.com/new"))) == 1
+
+    def test_state_is_picklable(self):
+        """SpiderState pickles `spider.state`; an unpicklable member would silently break
+        persistence at close, after the crawl has already run."""
+        import pickle
+        state = {}
+        s = self._open(state)
+        list(s._schedule("https://example.com/a"))
+        assert pickle.loads(pickle.dumps(state))["seen"] == s.seen
+
+    def test_emitted_and_referrers_persist_too(self):
+        state = {}
+        s = self._open(state)
+        list(s._schedule("https://example.com/a", referrer_emit="https://example.com/"))
+        assert "first_referrer" in state and "emitted" in state
+
+    def test_without_jobdir_behaviour_is_unchanged(self):
+        """No JOBDIR -> no `state` attribute -> the plain in-memory sets, exactly as before."""
+        s = self._open(state=None)
+        urls = [f"https://example.com/p{i}" for i in range(5)]
+        assert sum(1 for u in urls if list(s._schedule(u))) == 5
+
+    def test_mutations_after_restore_land_in_state(self):
+        """The attributes must BE the state's objects, not copies -- otherwise nothing is
+        actually persisted and the bug returns silently."""
+        state = {}
+        s = self._open(state)
+        list(s._schedule("https://example.com/a"))
+        assert s.seen is state["seen"]
+
+
+class TestBreadthFirstOrdering:
+    """issue #52: Scrapy defaults to a LIFO queue (depth-first) with no depth limit, which
+    turns an infinitely-branching subtree into a trapdoor -- on naeyc.org the crawl fetched
+    zero real pages after entering a faceted-search subtree at row 430."""
+
+    def _settings(self, **over):
+        import argparse, run_spider
+        args = argparse.Namespace(output="o.jsonl", format="jsonlines", emit_content=False,
+                                  user_agent=None, delay=1.0, profile="presale",
+                                  status_file="s.json", impersonate="off", jobdir=None,
+                                  cookies=None)
+        for k, v in over.items():
+            setattr(args, k, v)
+        return run_spider.build_settings(args)
+
+    def test_scheduler_is_breadth_first(self):
+        s = self._settings()
+        assert s["DEPTH_PRIORITY"] == 1
+        assert s["SCHEDULER_MEMORY_QUEUE"].endswith("FifoMemoryQueue")
+        assert s["SCHEDULER_DISK_QUEUE"].endswith("PickleFifoDiskQueue")
+
+    def test_breadth_first_applies_to_every_profile(self):
+        """A trap is not a politeness question -- BFO must hold for standard crawls too."""
+        s = self._settings(profile="standard")
+        assert s["DEPTH_PRIORITY"] == 1
+        assert s["SCHEDULER_MEMORY_QUEUE"].endswith("FifoMemoryQueue")

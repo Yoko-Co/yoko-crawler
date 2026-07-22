@@ -6,6 +6,7 @@ import re
 import scrapy
 from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse, urljoin
 from w3lib.url import canonicalize_url
+from scrapy import signals
 from scrapy.http import TextResponse
 
 from content_extractor import (
@@ -176,6 +177,9 @@ class WebsiteSpider(scrapy.Spider):
           - include_subdomains=1  Treat any subdomain of the base domain as internal.
         """
         super().__init__(*args, **kwargs)
+        # Dedup state. Rebound in `spider_opened` to live INSIDE `self.state` so it survives
+        # between resumable sessions (issue #52) -- these plain values are what a crawl with
+        # no JOBDIR uses, and the fallback if the extension never fires.
         self.seen = set()              # scheduled (normalized in schedule-mode)
         self.emitted = set()           # already written (normalized in emit-mode)
         self.first_referrer = {}       # schedule-norm URL -> emit-norm first referrer
@@ -239,6 +243,46 @@ class WebsiteSpider(scrapy.Spider):
                 base -= self.PAGINATION_PARAMS
             self.exclude_params_schedule = base
             self.exclude_params_emit = base
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        """Hook `spider_opened` so dedup state can be restored from JOBDIR (issue #52)."""
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        crawler.signals.connect(spider._restore_dedup_state, signal=signals.spider_opened)
+        return spider
+
+    def _restore_dedup_state(self):
+        """Move the dedup structures INTO `self.state` so they persist across resumable
+        sessions (issue #52).
+
+        `yoko-corpus` drives one logical crawl as N crawler sessions against a shared
+        per-domain JOBDIR. JOBDIR persists Scrapy's frontier and dupefilter, but NOT spider
+        attributes -- so `self.seen` came back empty each session and every link found on a
+        resumed page was re-scheduled, re-fetching pages earlier sessions had already done.
+        Scrapy's dupefilter could not compensate because `_schedule` emits every request with
+        `dont_filter=True` (deliberately: this spider does its own normalization-aware dedup,
+        which is stricter than a URL fingerprint). Ingest is idempotent so the DATA stayed
+        correct, which is why it went unnoticed -- but the crawl budget was spent re-fetching,
+        and the waste compounds with size: a 30k-page site is ~13 polite sessions.
+
+        Scrapy's `SpiderState` extension (default-enabled, `EXTENSIONS_BASE` priority 0)
+        pickles `self.state` into JOBDIR on close and restores it on open. Binding the
+        attributes to the SAME objects held in `self.state` means every mutation is captured
+        with no explicit save step. With no JOBDIR, `self.state` is a plain dict that starts
+        empty each run -- identical behaviour to before.
+        """
+        state = getattr(self, "state", None)
+        if state is None:  # extension disabled -> keep the __init__ values
+            return
+        # setdefault, so a RESTORED session keeps its sets and a fresh one seeds empties.
+        self.seen = state.setdefault("seen", self.seen)
+        self.emitted = state.setdefault("emitted", self.emitted)
+        self.first_referrer = state.setdefault("first_referrer", self.first_referrer)
+        if self.seen:
+            self.logger.info(
+                "Resumed dedup state: %d scheduled, %d emitted URLs carried over",
+                len(self.seen), len(self.emitted),
+            )
 
     @staticmethod
     def _parse_cookie_string(raw) -> dict:
