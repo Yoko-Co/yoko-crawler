@@ -26,6 +26,7 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
+from itertools import islice
 from typing import Callable
 from urllib.parse import urljoin, urlparse
 
@@ -307,6 +308,94 @@ def _content_root(body_el: etree._Element) -> etree._Element:
     return cur
 
 
+# How many rescue candidates `structure_hash` will skeleton before giving up. The page is
+# adversary-controlled and CHOOSES whether this path runs (it fires exactly when the body has no
+# non-chrome structural children), so the work is capped and candidates are taken in document
+# order -- never ranked by subtree size. Ranking meant walking every candidate's whole subtree:
+# a 3.7MB body of 250 nested <main>s (libxml2 caps nesting near 255) took 69s in structure_hash
+# versus 0.04ms before, ~15x the entire rest of the enrichment pipeline, from ONE page (review).
+_MAX_ROOT_CANDIDATES = 8
+# Chrome a rescue root may NOT live inside. `<footer>` ONLY, and the omissions are load-bearing:
+#   - `<header>`/`<nav>`: being buried under them IS the bug. On real sais.org pages the swallowed
+#     `<main>` sits under `nav.nav__main--menu` inside `header.header` -- excluding either brings
+#     back the empty fingerprint on all 525 pages. (Verified against live pages; a synthetic
+#     unclosed-<div> fixture nests only under <header>, which is why fixtures alone mislead here.)
+#   - `<footer>` is safe to exclude BECAUSE OF SOURCE ORDER: a footer can only swallow markup that
+#     follows it, so a candidate inside one is a widget, never the mis-nested page. And it must be
+#     excluded: a footer "related story" <article> is standard theme markup, identical on every
+#     page, so fingerprinting it merges every rootless page into one bogus template -- the exact
+#     false merge this design rejects, arriving through the front door (review).
+_RESCUE_EXCLUDED_ANCESTORS = frozenset({"footer"})
+
+
+def _under_excluded_chrome(el: etree._Element, body_el: etree._Element) -> bool:
+    """Is this candidate inside a `<footer>` widget rather than being the page's own content?"""
+    parent = el.getparent()
+    while parent is not None and parent is not body_el:
+        tag = parent.tag
+        if isinstance(tag, str) and tag.lower() in _RESCUE_EXCLUDED_ANCESTORS:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+def _semantic_content_roots(body_el: etree._Element) -> list:
+    """The page's OWN declared content containers -- `<main>`, `[role=main]`, a lone `<article>`
+    -- wherever they sit in the tree, best first. The RESCUE candidates for `structure_hash`,
+    used only when the ordinary descent finds no structure at all.
+
+    Why it can't be found by descending: lxml/libxml2 is not an HTML5 parser, so it does not
+    apply the auto-close rules for `<li>`/`<p>`/etc. A theme that ships unclosed `<li>`s in a
+    mega-menu (very common) leaves that element open, and everything after it -- `<main>`,
+    `<footer>`, the whole page -- gets nested INSIDE `<header>`, even though the source closes
+    `</header>` first. `<header>` is skipped as chrome, so the body has no structural children,
+    the skeleton is empty, and EVERY page of the site fingerprints as "" -> no template clusters
+    -> the report reads "Not analyzed" despite a complete crawl (Sarah, sais.org: 525 pages, 0
+    templates). A document-wide search for the semantic root steps over the mis-nesting.
+
+    Deliberately NOT a fallback to "descend including chrome": on such a document that lands in
+    the nav's `<ul>`, which is identical on every page -- one 525-page "template" and a confident
+    under-quote. No fingerprint is better than a false merge; a real content root is better than
+    both.
+
+    A LIST, not a single pick, because the best-looking candidate can be structurally empty: an
+    SPA hydration placeholder (`<main id="root"></main>`) next to the real `<article>`, or a
+    `<main>` holding nothing but inline spans. Picking one and giving up when its skeleton came
+    out empty reproduced the very "" this function exists to prevent (review), so the caller
+    walks the candidates and takes the first that actually fingerprints.
+
+    Order is `<main>` -> `[role=main]` -> lone `<article>`, each tier in DOCUMENT order (so a
+    nested pair yields the outer one first) and the whole list capped at `_MAX_ROOT_CANDIDATES`.
+    Document order, not subtree size: size ranking cost a full walk per candidate (see the cap's
+    note) AND made the choice content-length dependent, so one template split in two and two
+    merged as page length crossed a chrome `<main>` (review). Several `<article>`s contribute
+    NOTHING -- that is a listing OF articles, not an article page -- counted AFTER chrome
+    exclusion, so a footer related-post widget can't suppress a real article page's rescue."""
+    seen: set = set()
+    candidates: list = []
+
+    def _add(els) -> None:
+        for el in els:
+            if len(candidates) >= _MAX_ROOT_CANDIDATES:
+                return  # bounded: stop consuming the generator, never materialize the rest
+            if (isinstance(el.tag, str) and id(el) not in seen
+                    and not _under_excluded_chrome(el, body_el)):
+                seen.add(id(el))
+                candidates.append(el)
+
+    _add(body_el.iter("main"))
+    _add(el for el in body_el.iter()
+         if isinstance(el.tag, str) and (el.get("role") or "").strip().lower() == "main")
+    # The lone-article tier is a COUNT rule, so it needs the real total (bounded by the cap+1 --
+    # enough to tell "exactly one" from "more than one" without walking a 10k-item listing).
+    articles = list(islice(
+        (el for el in body_el.iter("article")
+         if isinstance(el.tag, str) and not _under_excluded_chrome(el, body_el)), 2))
+    if len(articles) == 1:
+        _add(articles)
+    return candidates
+
+
 def _skeleton(el: etree._Element, depth: int) -> str:
     """A depth-limited, content-free string of ``el``'s structural children (chrome + inline
     excluded). Consecutive identical child tokens (tag + their own subtree) collapse to one, so
@@ -336,11 +425,26 @@ def structure_hash(body_el: etree._Element) -> str:
 
     Coarse EXACT-hash, first pass (best-guess per issue #36): it errs toward over-splitting
     (an extra structural block -> its own cluster), the safe direction, and is tuned against
-    real crawls. Empty when the content root has no structural children (asset/empty page)."""
+    real crawls. Empty when the content root has no structural children (asset/empty page).
+
+    When the ordinary descent finds NO structure, retry from the page's declared semantic roots
+    (`_semantic_content_roots`) before giving up: on a site whose unclosed-tag markup makes the
+    non-HTML5 parser bury the whole page inside `<header>`, the descent lands on a chrome-only
+    body and every page would otherwise fingerprint as "". Candidates are tried IN ORDER until
+    one yields a real skeleton -- the biggest is not always the structural one (an empty SPA
+    placeholder `<main>` beside the real `<article>`). Ordering matters -- the descent stays
+    primary, so pages that fingerprint today keep the SAME hash and their clustering is
+    untouched; the semantic roots only rescue pages that produce nothing at all."""
     if body_el is None:
         return ""
     root = _content_root(body_el)
     skeleton = _skeleton(root, 1)
+    if not skeleton:
+        for rescue in _semantic_content_roots(body_el):
+            skeleton = _skeleton(rescue, 1)
+            if skeleton:
+                root = rescue
+                break
     if not skeleton:
         return ""  # no structural content -- no fingerprint (excluded from clustering)
     root_tag = root.tag.lower() if isinstance(root.tag, str) else "x"
