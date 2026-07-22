@@ -70,6 +70,10 @@ class ProgressWriter:
             if responses == 0:
                 blocked = self.stats.get_value("ssrf_guard/blocked", 0)
                 exceptions = self.stats.get_value("downloader/exception_count", 0)
+                # Order matters: the SSRF guard drops a host via IgnoreRequest, which Scrapy
+                # ALSO counts in downloader/exception_count -- so an all-SSRF-blocked crawl
+                # has exceptions>0 too. Checking blocked>0 first keeps it `ssrf_blocked`
+                # (the specific cause) rather than the generic `unreachable`.
                 if blocked > 0:
                     # Every candidate host resolved to a blocked/reserved range and was
                     # dropped by the SSRF guard.
