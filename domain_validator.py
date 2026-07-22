@@ -48,7 +48,18 @@ _BLOCKED_NETWORKS = [
 
 
 class DomainValidationError(Exception):
-    """Raised when domain validation fails."""
+    """Raised when domain validation fails.
+
+    Carries a stable ``code`` (issue #48) alongside the human message so a consumer
+    (yoko-corpus) switches on it instead of substring-matching the prose. Surfaced in the
+    ``POST /crawl`` rejection body as ``{"detail": <message>, "code": <code>}``. Codes:
+    ``unresolvable`` (no DNS answer / timeout), ``private_address`` (resolves only to a
+    blocked/reserved range), ``is_ip`` (a bare IP was supplied), ``bad_format`` (empty /
+    too long / fails the hostname regex)."""
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def validate_domain_format(domain: str) -> str:
@@ -74,22 +85,24 @@ def validate_domain_format(domain: str) -> str:
     domain = domain.split(":")[0]
 
     if not domain:
-        raise DomainValidationError("Domain is required")
+        raise DomainValidationError("Domain is required", code="bad_format")
 
     if len(domain) > _MAX_DOMAIN_LENGTH:
         raise DomainValidationError(
-            f"Domain exceeds {_MAX_DOMAIN_LENGTH} character limit"
+            f"Domain exceeds {_MAX_DOMAIN_LENGTH} character limit", code="bad_format"
         )
 
     # Reject raw IP addresses.
     try:
         ipaddress.ip_address(domain)
-        raise DomainValidationError("IP addresses are not allowed, use a domain name")
+        raise DomainValidationError(
+            "IP addresses are not allowed, use a domain name", code="is_ip"
+        )
     except ValueError:
         pass  # Not an IP, which is what we want.
 
     if not _DOMAIN_RE.match(domain):
-        raise DomainValidationError(f"Invalid domain format: {domain}")
+        raise DomainValidationError(f"Invalid domain format: {domain}", code="bad_format")
 
     return domain
 
@@ -132,23 +145,23 @@ async def check_dns_resolution(domain: str) -> None:
         )
     except asyncio.TimeoutError:
         raise DomainValidationError(
-            f"DNS resolution timed out for {domain}"
+            f"DNS resolution timed out for {domain}", code="unresolvable"
         )
     except socket.gaierror:
         raise DomainValidationError(
-            f"Domain does not resolve: {domain}"
+            f"Domain does not resolve: {domain}", code="unresolvable"
         )
 
     if not results:
         raise DomainValidationError(
-            f"Domain does not resolve: {domain}"
+            f"Domain does not resolve: {domain}", code="unresolvable"
         )
 
     for family, _, _, _, sockaddr in results:
         ip = ipaddress.ip_address(sockaddr[0])
         if _is_blocked(ip):
             raise DomainValidationError(
-                "Domain resolves to a private or reserved address"
+                "Domain resolves to a private or reserved address", code="private_address"
             )
 
 
@@ -195,10 +208,10 @@ def check_resolution_sync(domain: str) -> None:
     """
     ips = _resolve_ips(domain)
     if not ips:
-        raise DomainValidationError(f"Domain does not resolve: {domain}")
+        raise DomainValidationError(f"Domain does not resolve: {domain}", code="unresolvable")
     if any(_is_blocked(ip) for ip in ips):
         raise DomainValidationError(
-            "Domain resolves to a private or reserved address"
+            "Domain resolves to a private or reserved address", code="private_address"
         )
 
 

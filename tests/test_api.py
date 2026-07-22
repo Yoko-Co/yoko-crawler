@@ -83,6 +83,28 @@ class TestStartCrawl:
         )
         assert response.status_code == 422
 
+    async def test_invalid_domain_rejection_carries_code(self, client, auth_headers):
+        # The rejection body carries a structured `code` (issue #48) the corpus switches on,
+        # while `detail` stays a human string. A bad format -> code "bad_format".
+        response = await client.post(
+            "/crawl",
+            json={"domain": "not a domain!"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+        body = response.json()
+        assert body["code"] == "bad_format"
+        assert isinstance(body["detail"], str) and "Invalid domain" in body["detail"]
+
+    async def test_ip_rejection_carries_is_ip_code(self, client, auth_headers):
+        response = await client.post(
+            "/crawl",
+            json={"domain": "192.168.1.1"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422
+        assert response.json()["code"] == "is_ip"
+
     async def test_start_crawl_success(self, client, auth_headers):
         mock_process = AsyncMock()
         mock_process.returncode = None

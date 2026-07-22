@@ -133,6 +133,46 @@ class TestValidateDomainFormat:
             validate_domain_format("localhost")
 
 
+class TestValidationErrorCodes:
+    """Each DomainValidationError carries a stable `code` (issue #48) the corpus switches
+    on instead of substring-matching the message."""
+
+    def test_empty_is_bad_format(self):
+        with pytest.raises(DomainValidationError) as exc:
+            validate_domain_format("")
+        assert exc.value.code == "bad_format"
+
+    def test_too_long_is_bad_format(self):
+        with pytest.raises(DomainValidationError) as exc:
+            validate_domain_format("a" * 250 + ".com")
+        assert exc.value.code == "bad_format"
+
+    def test_ip_is_is_ip(self):
+        with pytest.raises(DomainValidationError) as exc:
+            validate_domain_format("192.168.1.1")
+        assert exc.value.code == "is_ip"
+
+    def test_invalid_format_is_bad_format(self):
+        with pytest.raises(DomainValidationError) as exc:
+            validate_domain_format("not a domain!")
+        assert exc.value.code == "bad_format"
+
+    def test_unresolvable_sync_is_unresolvable(self, monkeypatch):
+        monkeypatch.setattr("domain_validator.socket.getaddrinfo", _getaddrinfo_failing)
+        with pytest.raises(DomainValidationError) as exc:
+            check_resolution_sync("nope.test")
+        assert exc.value.code == "unresolvable"
+
+    def test_private_address_sync_is_private_address(self, monkeypatch):
+        monkeypatch.setattr(
+            "domain_validator.socket.getaddrinfo",
+            _getaddrinfo_returning("169.254.169.254"),
+        )
+        with pytest.raises(DomainValidationError) as exc:
+            check_resolution_sync("metadata.test")
+        assert exc.value.code == "private_address"
+
+
 class TestIsBlocked:
     def test_private_ipv4(self):
         assert _is_blocked(ipaddress.ip_address("10.0.0.1"))
