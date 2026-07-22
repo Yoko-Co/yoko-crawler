@@ -6,8 +6,10 @@ both refused (see `scripts/headless_probe.py`). The same crawl from a normal
 residential/office connection sails through.
 
 So the stopgap is: **crawl on your Mac, hand the result to the corpus on the droplet.**
-This runbook is the whole flow, end to end. The durable fix is a trusted-IP proxy so the
-droplet can do this itself; until that lands, this is the path.
+This runbook is the whole flow, end to end. The durable fix is a self-hosted trusted-IP
+proxy so the droplet can do this itself —
+[issue #22](https://github.com/Yoko-Co/yoko-crawler/issues/22) — and until that lands, this
+is the path.
 
 Roughly 20–40 minutes of wall clock for a few-hundred-page site, nearly all of it the
 polite crawl in step 2.
@@ -29,7 +31,10 @@ this project's libraries, so projects don't fight over package versions. `. .ven
 just edits your `PATH` so a plain `python` means *this* copy. You only create it once; you
 re-activate it in each new terminal.
 
-You'll also need SSH access to the Discovery droplet as `root`.
+You'll also need SSH access as `root` to the **Discovery droplet** — the host serving
+`discovery.yokoco.dev`. This runbook writes it as `<discovery-droplet>`; the actual address
+isn't stored in this repo, so get it from whoever administers the droplet if you don't
+already have it in your SSH config.
 
 ## Step 1 — Turn OFF your VPN
 
@@ -44,14 +49,19 @@ plain residential/office connection gets past these WAFs.
 ./scripts/local_scrape.sh nativeamericanagriculturefund.org
 ```
 
-Use the **apex** domain (`urac.org`, not `www.urac.org`) so it matches how Discovery
-normalizes domains — otherwise the report lands under a second, separate domain entry.
+**Use the apex domain — `urac.org`, never `www.urac.org`.** This one is worth being careful
+about, because nothing warns you. The corpus ingest validates the domain with
+`validate_domain_format`, which **keeps** a `www.` prefix, while the Discovery BFF looks
+sites up through `normalize_domain`, which **strips** it. Ingest `www.ndba.com` and you
+create a site row that Discovery can never resolve: the ingest reports success, the analysis
+runs, and the report 404s. (The corpus does have a `canonical_domain` helper that strips
+`www.`, but it's used for job dedup — not on this manual CLI path.)
 
 The script wraps `run_spider.py` with the settings this job needs: `--impersonate chrome`
 (browser TLS fingerprint), `--profile presale` (serial, ≥3s between requests), and
-`--emit-content` (the page text the corpus analysis needs). It writes
-`<domain>.ndjson` in the repo root and a live progress file at
-`/tmp/<domain>-local-scrape-status.json`.
+`--emit-content` (the page text the corpus analysis needs). It writes `<domain>.ndjson`
+**into whatever directory you run it from** — the output path is relative, not pinned to the
+repo root — plus a live progress file at `/tmp/<domain>-local-scrape-status.json`.
 
 Pass a second argument to override the profile (`./scripts/local_scrape.sh example.org standard`),
 but presale is the right default for a prospect's site we don't control.
@@ -78,13 +88,15 @@ SSH in as `root`, then become the `yoko` service user:
 
 ```bash
 ssh root@<discovery-droplet>
+cd /opt/yoko-corpus/app       # before the su, so the shell starts in a readable cwd
 su -s /bin/bash yoko          # no password; root can become any user
 whoami                        # -> yoko
 ```
 
 `-s /bin/bash` is needed because `yoko` is a system account created with
 `--shell /usr/sbin/nologin`; a plain `su yoko` would exit immediately. Its prompt won't
-show a username, so confirm with `whoami`.
+show a username, so confirm with `whoami`. (`cd` first because `su` from a directory `yoko`
+can't read prints a harmless but alarming `getcwd: cannot access parent directories`.)
 
 Then load the environment and run the two commands:
 
@@ -99,6 +111,18 @@ cd /opt/yoko-corpus/app
 /opt/yoko-corpus/venv/bin/python -m cli.main analyze nativeamericanagriculturefund.org
 
 exit                          # back to root
+```
+
+**Running this non-interactively** (from a script, or an agent driving the droplet over
+`ssh`): the bare `su -s /bin/bash yoko` above spawns an interactive shell and will *hang*
+waiting on stdin rather than fail. Use the `-c` form instead, which is the same sequence as
+a single command:
+
+```bash
+ssh root@<discovery-droplet> "cd /opt/yoko-corpus/app && su -s /bin/bash yoko -c '
+  set -a; . /opt/yoko-corpus/yoko-corpus.env; set +a
+  /opt/yoko-corpus/venv/bin/python -m cli.main ingest <domain> /tmp/<domain>.ndjson --profile presale &&
+  /opt/yoko-corpus/venv/bin/python -m cli.main analyze <domain>'"
 ```
 
 Four things that each break the run if skipped:
@@ -123,11 +147,19 @@ Pass the **same** `--profile` you crawled with, so the stored crawl records how 
 ## Step 5 — Verify
 
 Open Discovery and reload the domain's report. A fresh readable crawl supersedes the old
-bot-blocked one — the corpus treats a crawl as blocked by its forbidden-response ratio, so
-a crawl that actually read the site isn't flagged.
+bot-blocked one: the corpus only calls a crawl `wholesale_blocked` when **≥90% of fetched
+pages returned 4xx/5xx** (`_WHOLESALE_BLOCKED_FRACTION` in `analysis/summary.py`), so a crawl
+that actually read the site isn't flagged.
 
-From the CLI, `python -m cli.main report <domain>` prints the stored summary for the crawl
-you just analyzed.
+From the CLI, the stored summary for the crawl you just analyzed:
+
+```bash
+/opt/yoko-corpus/venv/bin/python -m cli.main report <domain>
+```
+
+**Don't re-submit the domain in the Discovery UI afterwards.** That queues a fresh worker
+crawl from the droplet's IP — the one that gets blocked — which will analyze over the
+blocked result and put you back where you started.
 
 ---
 
@@ -137,10 +169,11 @@ you just analyzed.
 |---|---|
 | Crawl returns a few rows, mostly 403 | You're on a VPN, or the site needs more than TLS impersonation. Turn the VPN off and re-run. If it still fails, the site may need a browser-solved `cf_clearance` cookie — see the Cloudflare section of the [README](../README.md), and note that cookie is bound to the solving IP. |
 | `Permission denied` reading the `/tmp` file as `yoko` | `scp` landed it `600`. As root: `chmod 644 /tmp/<domain>.ndjson`. |
-| Ingest "succeeds" but Discovery shows nothing | You didn't source the env file — look for a stray `yoko_corpus.db` in whatever directory you ran from, delete it, and re-run properly. |
+| Ingest "succeeds" but Discovery shows nothing | Either you didn't source the env file (look for a stray `yoko_corpus.db` in the directory you ran from, delete it, re-run), or you ingested a `www.` domain — see step 2. |
+| `This exact NDJSON was already ingested for <domain> as crawl N` (exit 4) | Not a failure. The corpus SHA-dedupes ingests, so this means the first one landed. Skip to `analyze`. Only `failed` crawls are re-ingestable. |
 | `ModuleNotFoundError: No module named 'cli'` | You're not in `/opt/yoko-corpus/app`. |
 | Services won't restart after an ingest | Root-owned WAL files. `chown yoko:yoko /opt/yoko-corpus/data/*`. |
-| A domain won't re-crawl (job wedged) | Separate issue, covered under "Troubleshooting: a domain won't re-crawl" in `yoko-corpus/deploy/README.md`. |
+| A domain won't re-crawl (job wedged) | Only affects the *Discovery UI* path, not this CLI flow — `ingest`/`analyze` never create a job row. Covered under "Troubleshooting: a domain won't re-crawl" in the [yoko-corpus deploy README](https://github.com/Yoko-Co/yoko-corpus/blob/main/deploy/README.md). |
 
 ## Housekeeping
 

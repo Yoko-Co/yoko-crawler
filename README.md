@@ -166,7 +166,11 @@ Some sites block the deployed crawler's **datacenter IP** regardless — imperso
 real headless browser are both refused, while the same crawl from a residential connection
 works. For those, run the crawl on your own machine with `scripts/local_scrape.sh` and hand
 the NDJSON to the corpus: see the
-**[local-scrape runbook](docs/local-scrape-runbook.md)** for the full flow.
+**[local-scrape runbook](docs/local-scrape-runbook.md)** for the full flow. The durable fix
+— a self-hosted trusted-IP proxy so the droplet can crawl these itself — is
+[issue #22](https://github.com/Yoko-Co/yoko-crawler/issues/22).
+
+### Sample row
 
 ```json
 {"url": "https://example.com/about", "status": 200, "last_modified": "", "redirected_to": "", "referrer": "https://example.com/", "content_hash": "9f86d0…", "main_content_extracted": true, "word_count": 412, "link_count": 18, "internal_link_count": 15, "external_link_count": 3, "pdf_link_count": 2, "asset_link_count": 2, "anchor_link_count": 0, "image_count": 4, "table_count": 0, "form_count": 1, "iframe_count": 1, "heading_count": 6, "embed_count_nonbenign": 0, "component_count": 2, "iframe_hosts": ["www.youtube.com"], "canonical": "https://example.com/about"}

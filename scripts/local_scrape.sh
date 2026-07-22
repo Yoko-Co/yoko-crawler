@@ -6,8 +6,8 @@
 # datacenter IP no matter what -- a real headless browser is blocked too (see
 # scripts/headless_probe.py). But the crawler's browser impersonation works fine from a
 # normal residential/office IP. So the short-term fix is to run the crawl on your Mac (your
-# IP) and hand the result to the corpus. The durable, team-usable fix is a trusted-IP proxy
-# (tracked in a GitHub issue) -- this is the stopgap for a prospect you need NOW.
+# IP) and hand the result to the corpus. The durable, team-usable fix is a self-hosted
+# trusted-IP proxy (issue #22) -- this is the stopgap for a prospect you need NOW.
 #
 # One-time setup on your Mac (in this yoko-crawler directory):
 #     python3 -m venv .venv && . .venv/bin/activate
@@ -65,9 +65,8 @@ echo "    cd /opt/yoko-corpus/app"
 echo "    /opt/yoko-corpus/venv/bin/python -m cli.main ingest ${DOMAIN} /tmp/${OUT} --profile ${PROFILE}"
 echo "    /opt/yoko-corpus/venv/bin/python -m cli.main analyze ${DOMAIN}"
 echo
-echo "(Run as yoko, not root -- root-owned SQLite WAL files break the API/worker. Sourcing"
-echo " the env file is required: without it the ingest writes to a stray empty DB.)"
-echo "Full runbook: docs/local-scrape-runbook.md"
+echo "Run as yoko (not root) and source the env file -- skipping either fails SILENTLY."
+echo "Why, plus troubleshooting and the non-interactive form: docs/local-scrape-runbook.md"
 echo
 echo "Open Discovery -> the ${DOMAIN} report will show the real crawl (it supersedes the"
 echo "old bot-blocked one, since a readable crawl isn't treated as 'blocked')."
