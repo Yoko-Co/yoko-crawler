@@ -31,6 +31,15 @@ The enrichment field names have a single source of truth: `ENRICHMENT_FIELD_NAME
   ingest`/`analyze`, verification — is in `docs/local-scrape-runbook.md`. This is the stopgap
   until a trusted-IP proxy lets the droplet do it directly.
 
+## Documented learnings
+
+`docs/solutions/` — solutions to past problems (bugs, conventions, architecture
+patterns), organized by category with YAML frontmatter (`module`, `tags`,
+`problem_type`). Relevant when implementing or debugging in a documented area.
+
+`CONCEPTS.md` — shared domain vocabulary (entities, named processes, status concepts).
+Relevant when orienting to the codebase or discussing domain concepts.
+
 ## Deployment
 
 The service runs the same Python code in either environment:
