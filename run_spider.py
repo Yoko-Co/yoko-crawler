@@ -9,6 +9,7 @@ Accepts --domain, --output, --status-file as command-line arguments.
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -62,6 +63,49 @@ def _write_failed_status(status_file, error):
         pass
 
 
+def reset_incompatible_jobdir(jobdir, *, disk_queue: str) -> bool:
+    """Discard a JOBDIR whose on-disk frontier was written by a DIFFERENT queue format
+    (issue #52). Returns True if it was reset.
+
+    Switching to breadth-first swapped `SCHEDULER_DISK_QUEUE` from Scrapy's default
+    `PickleLifoDiskQueue` to `PickleFifoDiskQueue`. queuelib's two implementations write
+    incompatible layouts, so resuming a pre-upgrade JOBDIR dies in `Scheduler.open()` with
+    `NotADirectoryError` -- and every paused multi-session crawl in flight at rollout is
+    exactly that case. `job_manager` only wipes a JOBDIR that closed with no reason; this
+    one closes as `shutdown`, so the JOBDIR is KEPT and every later session repeats the
+    crash forever. Left alone it permanently bricks the domain.
+
+    Where the formats differ is one level DOWN, which is the trap here: `Scheduler._dqdir`
+    mkdirs `requests.queue/` under BOTH formats, so testing that path says nothing. It is
+    each per-priority SLOT inside it that differs -- a FILE under Lifo, a DIRECTORY under
+    Fifo (verified against the installed queuelib; crossing them raises NotADirectoryError
+    one way and IsADirectoryError the other, so a ROLLBACK is equally fatal).
+
+    Comparing the slots against the format we are about to use makes this symmetric: it
+    self-heals a rollback as well as a roll-forward. Cost is one restart from the seed per
+    in-flight domain, once, with a clear log line.
+    """
+    queue_dir = os.path.join(str(jobdir), "requests.queue")
+    if not os.path.isdir(queue_dir):
+        return False  # no persisted frontier yet -- nothing to be incompatible with
+    # `active.json` is Scheduler bookkeeping, not a queue slot.
+    slots = [os.path.join(queue_dir, e) for e in os.listdir(queue_dir) if e != "active.json"]
+    if not slots:
+        return False
+    expects_directory_slots = "Fifo" in disk_queue
+    if all(os.path.isdir(s) == expects_directory_slots for s in slots):
+        return False  # on-disk format already matches what we are about to use
+    print(
+        f"JOBDIR {jobdir} holds a frontier written by the other scheduler queue format, "
+        "which cannot be resumed with the current one; discarding it and starting this "
+        "domain from the seed. Expected once per in-flight domain when the queue format "
+        "changes (issue #52).",
+        file=sys.stderr,
+    )
+    shutil.rmtree(jobdir, ignore_errors=True)
+    return True
+
+
 def build_settings(args):
     """Assemble the Scrapy settings dict for a crawl (pure, so it's testable)."""
     feed_fields = list(BASE_FEED_FIELDS)
@@ -91,6 +135,29 @@ def build_settings(args):
         # jar on the start request and CookiesMiddleware re-attaches to every followed
         # request to the same domain.
         "COOKIES_ENABLED": True,
+        # Breadth-first ordering (issue #52). Scrapy defaults to a LIFO queue -- depth-first
+        # -- with no depth limit, which makes an infinitely-branching subtree a TRAPDOOR
+        # rather than a tax: the crawler descends into it and never returns, because every
+        # page in it pushes more of it onto the stack. On naeyc.org the crawl fetched 430 real
+        # pages, hit a faceted-search subtree at row 430, and fetched ZERO real pages
+        # afterwards -- the remaining 1,491 requests all went to filter permutations.
+        #
+        # Under BFO a trap costs a slice of the crawl proportional to its branching and can
+        # never monopolize it, because shallow real pages are always served first. This is the
+        # GENERAL protection: #49's facet guard closes one trapdoor, but a path-based trap
+        # (a calendar walking /events/2027/03/ -> /04/ -> forever) is invisible to any
+        # query-param heuristic.
+        #
+        # The DISK queue only applies when JOBDIR is set (Scheduler.open: `self.dqs = self._dq()
+        # if self.dqdir else None`), which job_manager does for resumable crawls. A
+        # non-resumable crawl keeps its whole frontier in the memory queue -- and a BFO frontier
+        # is wider than a LIFO one -- so MEMUSAGE_LIMIT_MB below is what bounds it there.
+        "DEPTH_PRIORITY": 1,
+        "SCHEDULER_MEMORY_QUEUE": "scrapy.squeues.FifoMemoryQueue",
+        "SCHEDULER_DISK_QUEUE": "scrapy.squeues.PickleFifoDiskQueue",
+        # A session cap, NOT a crawl budget: on either close reason the corpus starts another
+        # resumable session against the same JOBDIR (yoko-corpus services/crawl.py), so a site
+        # bigger than one session still crawls to completion.
         "CLOSESPIDER_TIMEOUT": 7200,
         "CLOSESPIDER_ITEMCOUNT": 50000,
         "AUTOTHROTTLE_ENABLED": True,
@@ -119,6 +186,7 @@ def build_settings(args):
     # on a re-launch with the same dir, resumes -- skipping already-seen URLs and
     # continuing the pending frontier -- instead of re-crawling from the seed (Phase C).
     if getattr(args, "jobdir", None):
+        reset_incompatible_jobdir(args.jobdir, disk_queue=settings["SCHEDULER_DISK_QUEUE"])
         settings["JOBDIR"] = args.jobdir
 
     if args.impersonate == "off":

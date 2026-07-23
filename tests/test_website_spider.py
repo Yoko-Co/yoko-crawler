@@ -969,3 +969,284 @@ class TestFacetScheduling:
     def test_bad_max_facet_depth_falls_back_to_default(self):
         s = self._spider(max_facet_depth="nonsense")
         assert s.max_facet_depth == WebsiteSpider.MAX_FACET_DEPTH
+
+
+class TestResumableDedupState:
+    """issue #52: dedup state must survive between resumable crawler sessions.
+
+    These tests drive a REAL `scrapy.crawler.Crawler` in the same order production does --
+    `_create_spider()` then `_apply_settings()` -- because that ordering is the whole
+    difficulty. An earlier cut of this feature bound the state from a `spider_opened`
+    handler; since the spider (and its handler) are created BEFORE extensions load,
+    SpiderState's own handler registered second and ran second, so the bind saw no `state`
+    and silently did nothing. Every hand-rolled unit test still passed. Only a test that
+    exercises the real wiring catches that, so these do.
+    """
+
+    @staticmethod
+    def _install_reactor():
+        """Crawler._apply_settings() requires an installed reactor."""
+        from scrapy.utils.reactor import install_reactor
+        try:
+            install_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
+        except Exception:
+            pass  # already installed by an earlier test in this process
+
+    def _session(self, jobdir, urls=()):
+        """Run one crawler session against `jobdir`, in the real Crawler.crawl() order."""
+        from scrapy.crawler import Crawler
+        from scrapy import signals
+        self._install_reactor()
+        crawler = Crawler(WebsiteSpider, settings={"JOBDIR": jobdir, "LOG_ENABLED": False})
+        spider = crawler._create_spider(domain="example.com")
+        crawler.spider = spider
+        crawler._apply_settings()
+        crawler.signals.send_catch_log(signals.spider_opened, spider=spider)
+        fetched = sum(1 for u in urls if list(spider._schedule(u)))
+        crawler.signals.send_catch_log(signals.spider_closed, spider=spider, reason="finished")
+        return spider, fetched
+
+    def test_state_is_bound_through_real_scrapy_wiring(self, tmp_path):
+        """The regression guard: `seen` must BE the object inside `spider.state`, after a
+        real Crawler set things up. If this is a copy (or state is empty) nothing persists."""
+        spider, _ = self._session(str(tmp_path), ["https://example.com/a"])
+        assert spider.seen is spider.state["seen"]
+        assert spider.emitted is spider.state["emitted"]
+        assert spider.first_referrer is spider.state["first_referrer"]
+
+    def test_state_is_written_to_jobdir(self, tmp_path):
+        self._session(str(tmp_path), ["https://example.com/a"])
+        assert (tmp_path / "spider.state").exists()
+
+    def test_resumed_session_does_not_refetch(self, tmp_path):
+        urls = [f"https://example.com/p{i}" for i in range(5)]
+        _, first = self._session(str(tmp_path), urls)
+        assert first == 5
+        spider, second = self._session(str(tmp_path), urls)
+        assert second == 0, "a resumed session must not re-fetch earlier sessions' pages"
+        assert len(spider.seen) == 5, "dedup state should have been carried over"
+
+    def test_resumed_session_still_crawls_new_pages(self, tmp_path):
+        """Resume must not freeze the crawl -- newly discovered URLs still schedule."""
+        self._session(str(tmp_path), ["https://example.com/old"])
+        _, fetched = self._session(str(tmp_path), ["https://example.com/new"])
+        assert fetched == 1
+
+    def test_without_jobdir_behaviour_is_unchanged(self):
+        """No JOBDIR -> SpiderState does not attach -> the plain in-memory sets, as before."""
+        from scrapy.crawler import Crawler
+        from scrapy import signals
+        self._install_reactor()
+        crawler = Crawler(WebsiteSpider, settings={"LOG_ENABLED": False})
+        spider = crawler._create_spider(domain="example.com")
+        crawler.spider = spider
+        crawler._apply_settings()
+        crawler.signals.send_catch_log(signals.spider_opened, spider=spider)
+        urls = [f"https://example.com/p{i}" for i in range(5)]
+        assert sum(1 for u in urls if list(spider._schedule(u))) == 5
+
+    def test_corrupt_state_is_discarded_not_fatal(self):
+        """A hand-edited or version-skewed JOBDIR must not crash a multi-hour crawl."""
+        import types
+        spider = WebsiteSpider(domain="example.com")
+        spider.crawler = types.SimpleNamespace(stats=_FakeStats())
+        spider.state = {"seen": ["not", "a", "set"], "emitted": None, "first_referrer": 7}
+        spider._bind_dedup_state()
+        assert isinstance(spider.seen, set) and not spider.seen
+        assert isinstance(spider.emitted, set)
+        assert isinstance(spider.first_referrer, dict)
+        assert list(spider._schedule("https://example.com/a"))  # still crawls
+
+    def test_bind_is_idempotent(self):
+        """First-use binding runs on every _schedule call; it must not reset state."""
+        import types
+        spider = WebsiteSpider(domain="example.com")
+        spider.crawler = types.SimpleNamespace(stats=_FakeStats())
+        spider.state = {}
+        list(spider._schedule("https://example.com/a"))
+        list(spider._schedule("https://example.com/b"))
+        assert len(spider.seen) == 2 and spider.seen is spider.state["seen"]
+
+
+class TestBreadthFirstOrdering:
+    """issue #52: Scrapy defaults to a LIFO queue (depth-first) with no depth limit, which
+    turns an infinitely-branching subtree into a trapdoor -- on naeyc.org the crawl fetched
+    zero real pages after entering a faceted-search subtree at row 430."""
+
+    def _settings(self, **over):
+        import argparse, run_spider
+        args = argparse.Namespace(output="o.jsonl", format="jsonlines", emit_content=False,
+                                  user_agent=None, delay=1.0, profile="presale",
+                                  status_file="s.json", impersonate="off", jobdir=None,
+                                  cookies=None)
+        for k, v in over.items():
+            setattr(args, k, v)
+        return run_spider.build_settings(args)
+
+    def test_scheduler_is_breadth_first(self):
+        s = self._settings()
+        assert s["DEPTH_PRIORITY"] == 1
+        assert s["SCHEDULER_MEMORY_QUEUE"].endswith("FifoMemoryQueue")
+        assert s["SCHEDULER_DISK_QUEUE"].endswith("PickleFifoDiskQueue")
+
+    def test_breadth_first_applies_to_every_profile(self):
+        """A trap is not a politeness question -- BFO must hold for standard crawls too."""
+        s = self._settings(profile="standard")
+        assert s["DEPTH_PRIORITY"] == 1
+        assert s["SCHEDULER_MEMORY_QUEUE"].endswith("FifoMemoryQueue")
+
+
+class TestSeedRequests:
+    """issue #52 review: the crawl's seeds must actually be seeded.
+
+    Scrapy 2.13 replaced `start_requests()` with `async def start()`, and 2.17 removed the
+    base method and every call site. `requirements.txt` had an unbounded `scrapy>=2.11`, so
+    an ordinary upgrade silently made our `start_requests` dead code -- the default
+    `Spider.start()` seeded start_urls with no cookies and no robots.txt. Nothing failed.
+    Two production paths were dead: cf_clearance cookie injection and sitemap discovery."""
+
+    def _seeds(self, **kw):
+        import asyncio
+        from scrapy.utils.reactor import install_reactor
+        try:
+            install_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
+        except Exception:
+            pass
+        from scrapy.crawler import Crawler
+        crawler = Crawler(WebsiteSpider, settings={"LOG_ENABLED": False})
+        spider = crawler._create_spider(domain="example.com", **kw)
+        crawler.spider = spider
+        crawler._apply_settings()
+
+        async def collect():
+            return [r async for r in spider.start()]
+        return asyncio.new_event_loop().run_until_complete(collect())
+
+    def test_start_seeds_the_homepage(self):
+        assert "https://example.com/" in [r.url for r in self._seeds()]
+
+    def test_start_seeds_robots_txt(self):
+        """robots.txt is how sitemaps are discovered -- without it the crawler is
+        link-following only and never sees sitemap-only or orphaned pages."""
+        assert "https://example.com/robots.txt" in [r.url for r in self._seeds()]
+
+    def test_injected_cookies_reach_the_seed_requests(self):
+        """The bot-block retry path: a browser-solved cf_clearance must ride the seeds so
+        CookiesMiddleware re-attaches it to every followed request."""
+        seeds = self._seeds(cookies="cf_clearance=SECRET; __cf_bm=OTHER")
+        assert seeds, "no seed requests generated"
+        for r in seeds:
+            assert r.cookies.get("cf_clearance") == "SECRET", f"{r.url} lost the cookie"
+
+    def test_start_and_start_requests_agree(self):
+        """Both entry points must produce the same seeds, so a Scrapy version change can
+        never silently alter what gets crawled."""
+        import asyncio
+        from scrapy.utils.reactor import install_reactor
+        try:
+            install_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
+        except Exception:
+            pass
+        from scrapy.crawler import Crawler
+        crawler = Crawler(WebsiteSpider, settings={"LOG_ENABLED": False})
+        spider = crawler._create_spider(domain="example.com")
+        crawler.spider = spider
+        crawler._apply_settings()
+
+        async def collect():
+            return [r.url async for r in spider.start()]
+        via_start = asyncio.new_event_loop().run_until_complete(collect())
+        via_legacy = [r.url for r in spider.start_requests()]
+        assert via_start == via_legacy
+
+
+class TestJobdirFormatMigration:
+    """issue #52 review: breadth-first swapped SCHEDULER_DISK_QUEUE from Scrapy's default
+    PickleLifoDiskQueue to PickleFifoDiskQueue, whose on-disk layouts are incompatible.
+    Every paused resumable crawl in flight at rollout would die in Scheduler.open(), and
+    because that session closes as `shutdown` job_manager KEEPS the jobdir -- so the crash
+    repeats forever and the domain is permanently bricked.
+
+    The subtlety these tests pin: `Scheduler._dqdir` mkdirs `requests.queue/` under BOTH
+    formats, so checking that path detects nothing. It is each per-priority SLOT inside it
+    that differs -- a FILE under Lifo, a DIRECTORY under Fifo. An earlier cut of the guard
+    tested the wrong level and never fired.
+    """
+
+    FIFO = "scrapy.squeues.PickleFifoDiskQueue"
+    LIFO = "scrapy.squeues.PickleLifoDiskQueue"
+
+    def _jobdir(self, tmp_path, slot_is_dir):
+        qdir = tmp_path / "requests.queue"
+        qdir.mkdir()
+        (qdir / "active.json").write_text("[]")          # Scheduler bookkeeping
+        if slot_is_dir:
+            (qdir / "0").mkdir()
+            (qdir / "0" / "q00000").write_bytes(b"chunk")  # Fifo layout
+        else:
+            (qdir / "0").write_bytes(b"lifo single file")  # Lifo layout
+        (tmp_path / "spider.state").write_bytes(b"state")
+        return str(tmp_path)
+
+    def test_old_lifo_jobdir_is_reset(self, tmp_path):
+        from run_spider import reset_incompatible_jobdir
+        jobdir = self._jobdir(tmp_path, slot_is_dir=False)
+        assert reset_incompatible_jobdir(jobdir, disk_queue=self.FIFO) is True
+        assert not tmp_path.exists()
+
+    def test_matching_fifo_jobdir_is_kept(self, tmp_path):
+        """Must NOT wipe every session -- that would restart every long crawl forever."""
+        from run_spider import reset_incompatible_jobdir
+        jobdir = self._jobdir(tmp_path, slot_is_dir=True)
+        assert reset_incompatible_jobdir(jobdir, disk_queue=self.FIFO) is False
+        assert (tmp_path / "spider.state").exists()
+
+    def test_rollback_is_also_self_healing(self, tmp_path):
+        """Reverting to the Lifo queue must reset a Fifo-format JOBDIR too -- crossing the
+        formats raises IsADirectoryError in that direction, equally fatal."""
+        from run_spider import reset_incompatible_jobdir
+        jobdir = self._jobdir(tmp_path, slot_is_dir=True)
+        assert reset_incompatible_jobdir(jobdir, disk_queue=self.LIFO) is True
+
+    def test_requests_queue_dir_alone_is_not_the_discriminator(self, tmp_path):
+        """Pins the bug an earlier cut had: `requests.queue` is a DIRECTORY under both
+        formats, so a guard keyed on it never fires."""
+        import os
+        lifo = self._jobdir(tmp_path / "a", slot_is_dir=False) if False else None
+        for slot_is_dir in (True, False):
+            d = tmp_path / f"jd{int(slot_is_dir)}"
+            d.mkdir()
+            self._jobdir(d, slot_is_dir=slot_is_dir)
+            assert os.path.isdir(os.path.join(str(d), "requests.queue"))
+
+    def test_empty_or_missing_jobdir_is_untouched(self, tmp_path):
+        from run_spider import reset_incompatible_jobdir
+        assert reset_incompatible_jobdir(str(tmp_path / "nope"), disk_queue=self.FIFO) is False
+        (tmp_path / "requests.queue").mkdir()
+        assert reset_incompatible_jobdir(str(tmp_path), disk_queue=self.FIFO) is False
+
+    def test_real_queuelib_slot_formats_are_incompatible(self, tmp_path):
+        """Pins the premise against the installed queuelib, in BOTH directions."""
+        import pytest
+        from queuelib import FifoDiskQueue, LifoDiskQueue
+        lifo_slot = str(tmp_path / "lifo")
+        q = LifoDiskQueue(lifo_slot); q.push(b"x"); q.close()
+        with pytest.raises(NotADirectoryError):
+            FifoDiskQueue(lifo_slot)
+        fifo_slot = str(tmp_path / "fifo")
+        q = FifoDiskQueue(fifo_slot); q.push(b"x"); q.close()
+        with pytest.raises(IsADirectoryError):
+            LifoDiskQueue(fifo_slot)
+
+    def test_build_settings_resets_before_handing_jobdir_to_scrapy(self, tmp_path):
+        """The migration must run on the real code path, with the configured queue class."""
+        import argparse
+        from run_spider import build_settings
+        jobdir = self._jobdir(tmp_path, slot_is_dir=False)
+        args = argparse.Namespace(output="o.jsonl", format="jsonlines", emit_content=False,
+                                  user_agent=None, delay=1.0, profile="presale",
+                                  status_file="s.json", impersonate="off",
+                                  jobdir=jobdir, cookies=None)
+        settings = build_settings(args)
+        assert settings["JOBDIR"] == jobdir
+        assert not (tmp_path / "requests.queue").exists()

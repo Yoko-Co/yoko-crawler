@@ -6,12 +6,15 @@ The FastAPI parent process reads this file to serve GET /crawl/{id}.
 """
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
 
 from scrapy import signals
 from twisted.internet.task import LoopingCall
+
+logger = logging.getLogger(__name__)
 
 
 class ProgressWriter:
@@ -95,6 +98,24 @@ class ProgressWriter:
                 # empty finish (e.g. everything robots-disallowed). Left "completed" as
                 # before -- not a new failure mode, so behavior is unchanged.
 
+        # Seeding tripwire (issue #52). Our own seeding method counts every seed it emits,
+        # so a crawl that fetched pages while reporting ZERO seeds was seeded by something
+        # else -- in practice a framework rename orphaning the method, exactly what
+        # silently disabled robots.txt/sitemap discovery for months. Log it loudly: this
+        # class of failure produces a plausible-looking crawl (pages ARE fetched, just
+        # fewer), so nothing else would ever surface it. Deliberately NOT failed -- a
+        # link-followed crawl is degraded, not worthless, and failing it would lose real
+        # pages over a defect the operator can fix and re-run.
+        if self.stats.get_value("seeding/seeds_emitted", 0) == 0 and \
+                self.stats.get_value("response_received_count", 0) > 0:
+            logger.error(
+                "SEEDING DID NOT RUN: the crawl fetched pages but emitted no seeds of its "
+                "own, so robots.txt and sitemap discovery were skipped and this crawl is "
+                "link-following only. Almost certainly the Scrapy seeding entry point was "
+                "renamed and WebsiteSpider.start() is no longer being called -- check the "
+                "installed Scrapy against the pin in requirements.txt."
+            )
+
         self._write_status(
             status, error=error, final=True, close_reason=reason, failure_reason=failure_reason
         )
@@ -114,6 +135,18 @@ class ProgressWriter:
             # Structured failure token (issue #44): None unless the crawl failed with a
             # classified cause (unreachable / ssrf_blocked / crawl_error).
             "failure_reason": failure_reason,
+            # Seeding observability (issue #52). `seeds_emitted` is the tripwire for a whole
+            # bug CLASS: a framework rename made the spider's seeding method unreachable and
+            # Scrapy's default seeded instead, so robots.txt/sitemap discovery silently
+            # stopped -- for months, with no exception, no failing test and no log line.
+            # A crawl seeded by anything other than our own method reports 0 here.
+            # `robots_fetched` separates "the site lists no sitemap" (robots fetched,
+            # sitemaps 0) from "we never asked" (robots 0).
+            "seeding": {
+                "seeds_emitted": self.stats.get_value("seeding/seeds_emitted", 0),
+                "robots_fetched": self.stats.get_value("seeding/robots_fetched", 0),
+                "sitemaps_fetched": self.stats.get_value("seeding/sitemaps_fetched", 0),
+            },
         }
         if final:
             data["finished_at"] = datetime.now(timezone.utc).isoformat()

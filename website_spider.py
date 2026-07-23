@@ -176,9 +176,13 @@ class WebsiteSpider(scrapy.Spider):
           - include_subdomains=1  Treat any subdomain of the base domain as internal.
         """
         super().__init__(*args, **kwargs)
+        # Dedup state. Rebound on first use into `self.state` so it survives between
+        # resumable sessions (issue #52; see `_bind_dedup_state`) -- these plain values are
+        # what a crawl with no JOBDIR uses, and the fallback if the extension never fires.
         self.seen = set()              # scheduled (normalized in schedule-mode)
         self.emitted = set()           # already written (normalized in emit-mode)
         self.first_referrer = {}       # schedule-norm URL -> emit-norm first referrer
+        self._state_bound = False      # guards the one-time bind
 
         # Faceted-search depth cap (issue #49). Non-numeric/negative input falls back to
         # the class default rather than failing the crawl or disabling the cap.
@@ -239,6 +243,73 @@ class WebsiteSpider(scrapy.Spider):
                 base -= self.PAGINATION_PARAMS
             self.exclude_params_schedule = base
             self.exclude_params_emit = base
+
+    def _bind_dedup_state(self):
+        """Move the dedup structures INTO `self.state` so they persist across resumable
+        sessions (issue #52). Called on FIRST USE, not from a signal -- see the ordering
+        note below, which is load-bearing.
+
+        `yoko-corpus` drives one logical crawl as N crawler sessions against a shared
+        per-domain JOBDIR. JOBDIR persists Scrapy's frontier and dupefilter, but NOT spider
+        attributes -- so `self.seen` came back empty each session and every link found on a
+        resumed page was re-scheduled, re-fetching pages earlier sessions had already done.
+        Scrapy's dupefilter could not compensate because `_schedule` emits every request with
+        `dont_filter=True` (deliberately: this spider does its own normalization-aware dedup,
+        which is stricter than a URL fingerprint). Ingest is idempotent so the DATA stayed
+        correct, which is why it went unnoticed -- but the crawl budget was spent re-fetching,
+        and the waste compounds with size: a 30k-page site is ~13 polite sessions.
+
+        Scrapy's `SpiderState` extension (default-enabled, `EXTENSIONS_BASE` priority 0)
+        pickles `self.state` into JOBDIR on close and restores it on open. Binding our
+        attributes to the SAME objects held in `self.state` means every mutation is captured
+        with no explicit save step.
+
+        ORDERING: this must NOT run from a `spider_opened` handler. `Crawler.crawl()` does
+        `_create_spider()` (where a `from_crawler` hook would register ours) and only THEN
+        `_apply_settings()` (which loads extensions, registering SpiderState's own
+        `spider_opened` handler). Handlers fire in registration order, so ours would run
+        first, find no `state` attribute at all, and silently no-op -- reintroducing the very
+        bug this fixes while every test still passed. By the time a URL is scheduled the
+        engine is running and `self.state` is populated, so first-use binding is
+        ordering-independent. With no JOBDIR, `self.state` is a plain dict that starts empty
+        each run -- identical behaviour to before.
+        """
+        if self._state_bound:
+            return
+        self._state_bound = True
+        state = getattr(self, "state", None)
+        if state is None:
+            # No JOBDIR (SpiderState raises NotConfigured) -> plain in-memory values, as
+            # before. But `state` is ALSO missing when SpiderState's pickle.load() raised
+            # on a truncated file: it logs and swallows, then at close reopens the file
+            # 'wb' and asserts, leaving a 0-byte file that raises EOFError on every later
+            # session -- one bad write bricks the domain's resume permanently. Seeding an
+            # empty dict here means the next close writes a VALID state file, so a corrupt
+            # JOBDIR self-heals at the cost of one re-crawl instead of never recovering.
+            settings = getattr(self, "settings", None)  # absent on a bare spider (tests)
+            if settings is not None and settings.get("JOBDIR"):
+                self.logger.warning(
+                    "JOBDIR is set but no spider state was restored (absent or unreadable); "
+                    "starting with empty dedup state and rewriting it at close."
+                )
+                self.state = state = {}
+            else:
+                return
+        # Tolerate a corrupt/foreign persisted shape (a hand-edited or version-skewed
+        # JOBDIR): a wrong type is discarded rather than crashing a multi-hour crawl.
+        restored_seen = state.get("seen")
+        restored_emitted = state.get("emitted")
+        restored_refs = state.get("first_referrer")
+        state["seen"] = self.seen = restored_seen if isinstance(restored_seen, set) else self.seen
+        state["emitted"] = self.emitted = (
+            restored_emitted if isinstance(restored_emitted, set) else self.emitted)
+        state["first_referrer"] = self.first_referrer = (
+            restored_refs if isinstance(restored_refs, dict) else self.first_referrer)
+        if self.seen:
+            self.logger.info(
+                "Resumed dedup state: %d scheduled, %d emitted URLs carried over",
+                len(self.seen), len(self.emitted),
+            )
 
     @staticmethod
     def _parse_cookie_string(raw) -> dict:
@@ -384,23 +455,69 @@ class WebsiteSpider(scrapy.Spider):
 
     # ---------- Entry points ----------
 
-    def start_requests(self):
+    def _stat(self, name, count=1):
+        """Bump a crawl stat, tolerating a spider built without a crawler (unit tests)."""
+        crawler = getattr(self, "crawler", None)
+        stats = getattr(crawler, "stats", None) if crawler else None
+        if stats is not None:
+            stats.inc_value(name, count)
+
+    def _seed_requests(self):
+        """The crawl's seed requests: the start URL(s) plus robots.txt (which fans out to
+        the sitemaps). Shared by `start` and `start_requests` so the two entry points can
+        never drift.
+
+        Every seed is counted (`seeding/seeds_emitted`) so a crawl can PROVE this ran.
+        That is the tripwire for the bug class that killed it once already: Scrapy renamed
+        the seeding entry point, our method became unreachable, and nothing failed -- no
+        exception, no test, no log line. A crawl seeded by Scrapy's default instead of this
+        method reports 0 here, which `stats_extension` turns into a loud error."""
         # Seed the cookie jar with any injected cookies (e.g. a browser-solved
         # cf_clearance): setting them on the seed requests lets Scrapy's CookiesMiddleware
         # re-attach them to every followed request to the same domain automatically.
         cookies = self.injected_cookies or None
         for url in self.start_urls:
+            self._stat("seeding/seeds_emitted")
             yield scrapy.Request(url, callback=self.parse, cookies=cookies)
+        self._stat("seeding/seeds_emitted")
         yield scrapy.Request(
             urljoin(self.start_urls[0], "/robots.txt"),
             callback=self.parse_robots,
             cookies=cookies,
         )
 
+    async def start(self):
+        """Seed the crawl (Scrapy >= 2.13's entry point).
+
+        REQUIRED, not optional (issue #52 review). Scrapy 2.13 replaced `start_requests()`
+        with `async def start()`, and 2.17 removed the base `Spider.start_requests` and every
+        call site -- so on the installed Scrapy our `start_requests` below was DEAD CODE and
+        the default `Spider.start()` (start_urls only, no cookies, no robots.txt) was seeding
+        instead. Verified by instrumenting a real Crawler: `start_requests()` never ran, the
+        seed carried `cookies={}`, and no crawl in the archive ever fetched robots.txt.
+
+        Two silent regressions came from that, both pre-dating this branch: injected
+        cf_clearance cookies were never attached, so the entire bot-block retry path (the
+        SPA's "Retry with a browser cookie") did nothing; and robots.txt -> sitemap discovery
+        never ran, so the crawler was link-following only and never saw sitemap-only or
+        orphaned pages. `requirements.txt` pinned `scrapy>=2.11` with no upper bound, so an
+        ordinary dependency upgrade broke both without a single test failing.
+        """
+        for request in self._seed_requests():
+            yield request
+
+    def start_requests(self):
+        """Seed the crawl on Scrapy < 2.13, where `start()` does not exist. Kept so the
+        pinned range stays crawlable from either entry point; `start` is what runs today."""
+        return self._seed_requests()
+
     # ---------- Robots & sitemaps ----------
 
     def parse_robots(self, response):
-        # Record robots fetch
+        # Record robots fetch. Counted so a crawl can show sitemap discovery actually
+        # happened -- a site with no robots.txt still 404s here, so a ZERO means the seed
+        # never went out, not that the site lacks one.
+        self._stat("seeding/robots_fetched")
         yield from self._emit_row(response)
 
         # One-hop redirect follow -- only on-domain (issue corpus#71). robots.txt should redirect
@@ -422,7 +539,9 @@ class WebsiteSpider(scrapy.Spider):
                     yield scrapy.Request(sm_url, callback=self.parse_sitemap, dont_filter=True)
 
     def parse_sitemap(self, response):
-        # Record sitemap fetch
+        # Record sitemap fetch. `sitemaps_fetched` vs `seeding/robots_fetched` distinguishes
+        # "we asked for robots.txt and the site listed no sitemap" from "we never asked".
+        self._stat("seeding/sitemaps_fetched")
         yield from self._emit_row(response)
 
         # One-hop redirect follow -- only on-domain (issue corpus#71): an off-domain sitemap redirect
@@ -632,6 +751,7 @@ class WebsiteSpider(scrapy.Spider):
         plus the additive content/structural enrichment fields.
         Emission uses emit-mode normalization (pagination stripped when reach_pagination=1).
         """
+        self._bind_dedup_state()  # first-use restore from JOBDIR (issue #52)
         current_emit = self.normalize_url(response.url, exclude_params=self.exclude_params_emit)
         if current_emit in self.emitted:
             return
@@ -685,6 +805,7 @@ class WebsiteSpider(scrapy.Spider):
         Normalize with schedule-mode (pagination retained when reach_pagination=1),
         de-dup, and enqueue the next request. Record the first referrer seen.
         """
+        self._bind_dedup_state()  # first-use restore from JOBDIR (issue #52)
         if not self.is_internal(url):
             return
         normalized = self.normalize_url(url, exclude_params=self.exclude_params_schedule)
