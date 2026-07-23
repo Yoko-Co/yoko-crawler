@@ -238,6 +238,7 @@ The bundled spider (`website_spider.py`) does comprehensive URL discovery:
 - Skips non-navigational hrefs (`mailto:`/`tel:`/`javascript:`/`data:`…) — including malformed ones like `mail to:` that would otherwise be resolved into a crawlable path (issue #11)
 - Issues HEAD requests for non-HTML assets (PDFs, images, etc.)
 - Normalizes URLs and strips non-content query params — tracking (UTM, session IDs, etc.) and on-site search/comment params (`?s=`, `replytocom`) — so query-only variants of the same page are deduped and not re-crawled (issue #8)
+- Contains **faceted search** (issue #49) — a multi-select filter UI fans out combinatorially, since every filter *subset* is a URL and every *ordering* of a subset is another URL. Two guards: indexed facet params (`f[0]`, `tid[2]`) are deduped **order-insensitively**, so the many orderings of one selection are fetched once; and selections deeper than `max_facet_depth` (default 2) are skipped as duplicate views of a result set. Only facet-*shaped* params are affected — an identity param (`?id=5`, `?product=hat`) never trips either guard, so a query-param product catalog still crawls in full. On naeyc.org this cut 1,921 requests to 435, of which the runaway search page dropped from 1,491 to 5
 - Respects autothrottle for polite crawling
 - Captures per-page main-content text, structural counts, a change-detection content hash, and surprise-embed signals (see [Output format](#output-format))
 

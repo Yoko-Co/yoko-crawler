@@ -813,3 +813,159 @@ class TestInfraRedirectsStayOnDomain:
         followed = _requests(subs.parse_sitemap(
             _redirect_response("https://example.com/sitemap.xml", target)))
         assert [r.url for r in followed] == [target]
+
+
+class TestFacetFamily:
+    """Facet-param shape detection (issue #49) -- the gate that decides which URLs the
+    depth cap and order-insensitive dedup are allowed to touch."""
+
+    @pytest.mark.parametrize("key,expected", [
+        ("f[0]", "f[]"),
+        ("f[12]", "f[]"),
+        ("tid[2]", "tid[]"),
+        ("field_topics[1]", "field_topics[]"),
+        ("fq", "fq"),
+        ("FACET", "facet"),
+        ("filters", "filters"),
+    ])
+    def test_facet_shapes_recognized(self, spider, key, expected):
+        assert spider.facet_family(key) == expected
+
+    @pytest.mark.parametrize("key", [
+        "id", "product", "sku", "page_id", "q", "color", "lang",
+        "f",            # bare `f` is not a known facet name -- too generic to assume
+        "f[]",          # no index -> no slot to reorder
+        "f[a]",         # non-numeric index is a keyed map, not a slot
+        "prefix[0]suffix",  # bracket not at the end
+    ])
+    def test_identity_params_are_not_facets(self, spider, key):
+        """An identity param must never be treated as a facet, or two genuinely
+        different product pages could collapse onto one key."""
+        assert spider.facet_family(key) is None
+
+
+class TestFacetDepth:
+    def test_no_query_is_zero(self, spider):
+        assert spider.facet_depth("https://example.com/search") == 0
+
+    def test_identity_params_count_zero(self, spider):
+        """?id=5&color=red is a product page, not a filter stack -- never capped."""
+        assert spider.facet_depth("https://example.com/p?id=5&color=red") == 0
+
+    def test_counts_only_facet_params(self, spider):
+        url = "https://example.com/s?q=hats&f[0]=a&f[1]=b"
+        assert spider.facet_depth(url) == 2
+
+    def test_real_naeyc_url(self, spider):
+        url = ("https://www.naeyc.org/search/equity%20and%20diversity"
+               "?f%5B0%5D=field_topics%3A187&f%5B1%5D=field_topics%3A185"
+               "&f%5B2%5D=field_topics%3A79")
+        assert spider.facet_depth(url) == 3
+
+
+class TestFacetDedupKey:
+    """The order-insensitive scheduling identity. `canonicalize_url` sorts by param NAME,
+    so f[0]/f[1] permutations slip past it -- this is what collapses them."""
+
+    def test_permutations_collapse(self, spider):
+        a = spider.facet_dedup_key("https://example.com/s?f[0]=a&f[1]=b&f[2]=c")
+        b = spider.facet_dedup_key("https://example.com/s?f[0]=c&f[1]=a&f[2]=b")
+        c = spider.facet_dedup_key("https://example.com/s?f[0]=b&f[1]=c&f[2]=a")
+        assert a == b == c
+
+    def test_different_selections_stay_distinct(self, spider):
+        """Reordering collapses; changing WHICH filters are on must not."""
+        a = spider.facet_dedup_key("https://example.com/s?f[0]=a&f[1]=b")
+        b = spider.facet_dedup_key("https://example.com/s?f[0]=a&f[1]=z")
+        assert a != b
+
+    def test_subset_is_distinct_from_superset(self, spider):
+        a = spider.facet_dedup_key("https://example.com/s?f[0]=a")
+        b = spider.facet_dedup_key("https://example.com/s?f[0]=a&f[1]=b")
+        assert a != b
+
+    def test_separate_families_do_not_merge(self, spider):
+        """f[0]=a&g[0]=b must not read the same as f[0]=b&g[0]=a."""
+        a = spider.facet_dedup_key("https://example.com/s?f[0]=a&g[0]=b")
+        b = spider.facet_dedup_key("https://example.com/s?f[0]=b&g[0]=a")
+        assert a != b
+
+    def test_non_facet_url_returned_unchanged(self, spider):
+        """No facet params -> byte-identical passthrough, so ordinary pages keep their
+        exact identity and nothing downstream shifts."""
+        url = "https://example.com/p?id=5&color=red"
+        assert spider.facet_dedup_key(url) == url
+
+    def test_identity_params_never_collapse(self, spider):
+        a = spider.facet_dedup_key("https://example.com/p?id=5")
+        b = spider.facet_dedup_key("https://example.com/p?id=6")
+        assert a != b
+
+    def test_path_is_preserved(self, spider):
+        """Two different search terms are two different pages."""
+        a = spider.facet_dedup_key("https://example.com/search/hats?f[0]=a")
+        b = spider.facet_dedup_key("https://example.com/search/caps?f[0]=a")
+        assert a != b
+
+    def test_non_facet_params_survive_alongside_facets(self, spider):
+        """The search TERM (?q=) must survive the rewrite -- dropping it would merge
+        every search on the site into one page."""
+        key = spider.facet_dedup_key("https://example.com/s?q=hats&f[0]=a")
+        assert "q=hats" in key
+
+
+class TestFacetScheduling:
+    """_schedule's two new gates, end to end."""
+
+    def _spider(self, **kw):
+        import types
+        s = WebsiteSpider(domain="example.com", **kw)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_deep_facet_url_is_skipped(self):
+        s = self._spider()
+        reqs = list(s._schedule("https://example.com/s?f[0]=a&f[1]=b&f[2]=c"))
+        assert reqs == []
+        assert s.crawler.stats.values.get("facet_urls_skipped") == 1
+
+    def test_shallow_facet_url_is_scheduled(self):
+        s = self._spider()
+        reqs = list(s._schedule("https://example.com/s?f[0]=a&f[1]=b"))
+        assert len(reqs) == 1
+
+    def test_capped_url_is_not_marked_seen(self):
+        """A URL dropped by the cap must not poison `seen` -- raising the cap on a later
+        run (or a shallower sibling) must still be crawlable."""
+        s = self._spider()
+        list(s._schedule("https://example.com/s?f[0]=a&f[1]=b&f[2]=c"))
+        assert s.seen == set()
+
+    def test_permutation_is_not_refetched(self):
+        s = self._spider()
+        first = list(s._schedule("https://example.com/s?f[0]=a&f[1]=b"))
+        second = list(s._schedule("https://example.com/s?f[0]=b&f[1]=a"))
+        assert len(first) == 1
+        assert second == [], "a reordering of the same selection must not be refetched"
+
+    def test_scheduled_url_is_real_not_the_dedup_key(self):
+        """We must request the URL as the site emitted it. The dedup key reorders facet
+        slots into a canonical form the site may not serve."""
+        s = self._spider()
+        req = list(s._schedule("https://example.com/s?f[1]=b&f[0]=a"))[0]
+        assert "f%5B1%5D=b" in req.url or "f[1]=b" in req.url
+
+    def test_identity_params_unaffected_by_cap(self):
+        """The user-facing risk: a product catalog using query params must crawl fully."""
+        s = self._spider()
+        for i in range(5):
+            reqs = list(s._schedule(f"https://example.com/p?id={i}&color=red&size=l&fit=slim"))
+            assert len(reqs) == 1, "identity params must never trip the facet cap"
+
+    def test_max_facet_depth_override(self):
+        s = self._spider(max_facet_depth=4)
+        assert len(list(s._schedule("https://example.com/s?f[0]=a&f[1]=b&f[2]=c"))) == 1
+
+    def test_bad_max_facet_depth_falls_back_to_default(self):
+        s = self._spider(max_facet_depth="nonsense")
+        assert s.max_facet_depth == WebsiteSpider.MAX_FACET_DEPTH
