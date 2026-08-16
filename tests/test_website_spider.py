@@ -1318,10 +1318,70 @@ class TestPaginationFollowing:
             exclude_params=sp.exclude_params_emit,
         ) == "https://example.com/blog"
 
+    def test_offset_start_p_are_followed_like_page(self):
+        # page is the heavily-exercised case; the other sequence params must behave the same
+        # (kept in schedule, revealing new items) so the fix isn't page-only.
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        for param in ("offset=20", "start=40", "p=123"):
+            url = f"https://example.com/blog?{param}"
+            assert self._scheduled_urls(sp, url) == [url], param
+
+    def test_pager_links_are_followed_end_to_end(self):
+        # The real issue-#58 scenario, driven through parse(): a listing page's Drupal pager
+        # <a href="?page=N"> links are extracted AND scheduled (page retained), a normal post
+        # link is followed, and a ?sort/?order reordering never produces a sort= request.
+        import types
+        from scrapy.http import Request
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        sp.crawler = types.SimpleNamespace(stats=_FakeStats())
+        body = (
+            b"<html><body>"
+            b"<a href='/resources/blog?page=1'>2</a>"
+            b"<a href='/resources/blog?page=2'>3</a>"
+            b"<a href='/resources/blog?sort=title&order=desc'>Sort by title</a>"
+            b"<a href='/resources/blog/a-real-post'>A real post</a>"
+            b"</body></html>"
+        )
+        resp = _html_response(body=body, url="https://example.com/resources/blog")
+        scheduled = [o.url for o in sp.parse(resp) if isinstance(o, Request)]
+        assert "https://example.com/resources/blog?page=1" in scheduled
+        assert "https://example.com/resources/blog?page=2" in scheduled
+        assert "https://example.com/resources/blog/a-real-post" in scheduled
+        # No reordering is ever fetched as a distinct URL (it collapses to the base listing).
+        assert not any("sort=" in u or "order=" in u or "dir=" in u for u in scheduled)
+
     def test_sequence_and_reorder_partition_covers_pagination_params(self):
         # Guard the split: every historical pagination param is classified as exactly one of
         # sequence (followed) or reorder (stripped), and the two are disjoint.
         assert WebsiteSpider.SEQUENCE_PARAMS.isdisjoint(WebsiteSpider.REORDER_PARAMS)
         assert WebsiteSpider.SEQUENCE_PARAMS | WebsiteSpider.REORDER_PARAMS == WebsiteSpider.PAGINATION_PARAMS
-        # Reorder params must stay in UNWANTED so they are stripped in every mode.
+        # BOTH classes must live in UNWANTED so the default (no reach/keep) mode strips them;
+        # the modes then selectively re-admit only SEQUENCE. A sequence param that fell out of
+        # UNWANTED would be kept even in default mode (silent behavior drift).
         assert WebsiteSpider.REORDER_PARAMS <= WebsiteSpider.UNWANTED_PARAMS
+        assert WebsiteSpider.SEQUENCE_PARAMS <= WebsiteSpider.UNWANTED_PARAMS
+
+
+class TestKeepPaginationMode:
+    """keep_pagination=1 records paginated pages as distinct (schedule == emit). This PR
+    changed that branch to subtract SEQUENCE_PARAMS (was PAGINATION_PARAMS), so reorderings
+    are now stripped here too -- pin both halves (issue #58)."""
+
+    def test_keep_pagination_records_page_param_in_both_modes(self):
+        sp = WebsiteSpider(domain="example.com", keep_pagination=1)
+        # In this mode schedule and emit share one exclude set, so a ?page=N page is both
+        # visited AND recorded with the page intact (treated as a unique page).
+        assert sp.exclude_params_schedule == sp.exclude_params_emit
+        for mode in (sp.exclude_params_schedule, sp.exclude_params_emit):
+            assert sp.normalize_url(
+                "https://example.com/blog?page=2", exclude_params=mode
+            ) == "https://example.com/blog?page=2"
+
+    def test_keep_pagination_still_strips_reorderings(self):
+        # Reorderings are views regardless of mode: keep_pagination keeps the sequence params
+        # but must NOT resurrect sort/order/dir (the behavior this PR changed).
+        sp = WebsiteSpider(domain="example.com", keep_pagination=1)
+        assert sp.normalize_url(
+            "https://example.com/blog?sort=title&order=desc&dir=asc",
+            exclude_params=sp.exclude_params_emit,
+        ) == "https://example.com/blog"

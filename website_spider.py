@@ -147,6 +147,9 @@ class WebsiteSpider(scrapy.Spider):
     #     EVERY mode -- they live only in UNWANTED_PARAMS below, never in the keep-set.
     SEQUENCE_PARAMS = {"page", "p", "offset", "start"}
     REORDER_PARAMS = {"sort", "order", "dir"}
+    # The historical union. No production code reads it anymore (the exclude-set
+    # construction subtracts SEQUENCE_PARAMS directly); kept as the back-compat name and
+    # for the partition-invariant guard test, so a future reader knows it isn't dead.
     PAGINATION_PARAMS = SEQUENCE_PARAMS | REORDER_PARAMS
 
     # Faceted search (issue #49). A multi-select facet UI emits one query param per

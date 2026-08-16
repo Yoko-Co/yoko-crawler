@@ -233,7 +233,7 @@ The bundled spider (`website_spider.py`) does comprehensive URL discovery:
 
 - Seeds from robots.txt sitemaps, then follows all internal links
 - Records HTTP status, redirect targets, and referrers
-- Handles pagination archives (issue #58) — **true pagination** (`?page=N`, `?offset=`, `?start=`) is followed as a discovery path so every listing page's items are found, but the pagination URLs themselves are normalized away on emit (not recorded as separate pages). **Reorderings** (`?sort=`, `?order=`, `?dir=`) are treated as views of the *same* items and always stripped, so a listing is never chased through its sort permutations (`page × sort × order`)
+- Handles **pagination archives** (issue #58) — true pagination (`?page=N`, `?offset=`, `?start=`) is followed as a discovery path so every listing page's items are found, but the pagination URLs themselves are normalized away on emit (not recorded as separate pages). **Reorderings** (`?sort=`, `?order=`, `?dir=`) are treated as views of the *same* items and always stripped, so a listing is never chased through its sort permutations (`page × sort × order`)
 - Skips login/auth URLs (wp-login, OAuth, SSO, SAML, etc.)
 - Skips non-navigational hrefs (`mailto:`/`tel:`/`javascript:`/`data:`…) — including malformed ones like `mail to:` that would otherwise be resolved into a crawlable path (issue #11)
 - Issues HEAD requests for non-HTML assets (PDFs, images, etc.)
