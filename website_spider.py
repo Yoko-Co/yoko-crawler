@@ -136,8 +136,21 @@ class WebsiteSpider(scrapy.Spider):
         "page", "p", "offset", "start", "sort", "order", "dir",
     }
 
-    # Separable so we can treat pagination differently for scheduling vs emitting
-    PAGINATION_PARAMS = {"page", "p", "offset", "start", "sort", "order", "dir"}
+    # Separable so we can treat pagination differently for scheduling vs emitting.
+    # Two distinct classes hide inside "pagination", and only ONE reveals new content:
+    #   - SEQUENCE_PARAMS advance through a listing (`?page=2`, `?offset=20`) -- each value
+    #     surfaces a DIFFERENT set of items, so following them is a real discovery path
+    #     (issue #58: naeyc's 19-page Drupal blog had ~2/3 of its posts behind `?page=`).
+    #   - REORDER_PARAMS only re-sort the SAME items (`?sort=title&order=desc`); every value
+    #     is a view of one result set. Following them multiplies a listing by every sort
+    #     permutation (page x sort x order) for zero new content, so they stay stripped in
+    #     EVERY mode -- they live only in UNWANTED_PARAMS below, never in the keep-set.
+    SEQUENCE_PARAMS = {"page", "p", "offset", "start"}
+    REORDER_PARAMS = {"sort", "order", "dir"}
+    # The historical union. No production code reads it anymore (the exclude-set
+    # construction subtracts SEQUENCE_PARAMS directly); kept as the back-compat name and
+    # for the partition-invariant guard test, so a future reader knows it isn't dead.
+    PAGINATION_PARAMS = SEQUENCE_PARAMS | REORDER_PARAMS
 
     # Faceted search (issue #49). A multi-select facet UI emits one query param per
     # selected filter, which fans out combinatorially: every SUBSET is a URL, and every
@@ -231,16 +244,19 @@ class WebsiteSpider(scrapy.Spider):
         # third-party integration, so script_signals skips it (issue #28).
         self.self_hosts = frozenset(self.allowed_domains)
 
-        # Build exclude sets for scheduling vs emitting
+        # Build exclude sets for scheduling vs emitting. Only SEQUENCE_PARAMS are ever
+        # kept -- REORDER_PARAMS (sort/order/dir) stay in UNWANTED_PARAMS in every mode, so
+        # a listing is never chased through its sort permutations (issue #58).
         if self.reach_pagination:
-            # Visit distinct pagination pages, but normalize them away when emitting
-            self.exclude_params_schedule = set(self.UNWANTED_PARAMS) - self.PAGINATION_PARAMS
+            # Visit distinct pagination pages (?page=N reveals new items), but normalize
+            # them away when emitting so the stored URL is the canonical listing, not ?page=2.
+            self.exclude_params_schedule = set(self.UNWANTED_PARAMS) - self.SEQUENCE_PARAMS
             self.exclude_params_emit = set(self.UNWANTED_PARAMS)
         else:
             # Original behavior (optionally keep/drop pagination everywhere)
             base = set(self.UNWANTED_PARAMS)
             if keep_pagination:
-                base -= self.PAGINATION_PARAMS
+                base -= self.SEQUENCE_PARAMS
             self.exclude_params_schedule = base
             self.exclude_params_emit = base
 
