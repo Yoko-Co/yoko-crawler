@@ -1250,3 +1250,78 @@ class TestJobdirFormatMigration:
         settings = build_settings(args)
         assert settings["JOBDIR"] == jobdir
         assert not (tmp_path / "requests.queue").exists()
+
+
+class TestPaginationFollowing:
+    """Follow real pagination (?page=N) as a discovery path, but never chase reorderings
+    (?sort/order/dir) or record the pagination URLs themselves (issue #58)."""
+
+    @staticmethod
+    def _scheduled_urls(spider, url, **kw):
+        import scrapy
+        return [r.url for r in spider._schedule(url, **kw) if isinstance(r, scrapy.Request)]
+
+    def test_reach_pagination_follows_page_param(self):
+        # The production path runs with reach_pagination=1; a ?page=N link must be enqueued
+        # with the page param intact so the Nth listing page is actually fetched.
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        urls = self._scheduled_urls(
+            sp, "https://example.com/resources/blog?page=2",
+            referrer_emit="https://example.com/resources/blog",
+        )
+        assert urls == ["https://example.com/resources/blog?page=2"]
+
+    def test_reach_pagination_visits_each_page_as_a_distinct_target(self):
+        # page=1 and page=2 are DIFFERENT sets of items -> two distinct scheduled requests;
+        # re-scheduling the same page is deduped to nothing.
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        first = self._scheduled_urls(sp, "https://example.com/blog?page=1")
+        second = self._scheduled_urls(sp, "https://example.com/blog?page=2")
+        again = self._scheduled_urls(sp, "https://example.com/blog?page=2")
+        assert first == ["https://example.com/blog?page=1"]
+        assert second == ["https://example.com/blog?page=2"]
+        assert again == []  # already seen
+
+    def test_default_mode_does_not_follow_pagination(self):
+        # Without reach_pagination the page param is stripped, so ?page=2 collapses onto the
+        # base listing (the original, conservative behavior).
+        sp = WebsiteSpider(domain="example.com")
+        urls = self._scheduled_urls(sp, "https://example.com/blog?page=2")
+        assert urls == ["https://example.com/blog"]
+
+    def test_reorder_params_are_never_followed(self):
+        # sort/order/dir only re-sort the SAME items. Even with reach_pagination on they are
+        # stripped in schedule-mode, so a sort variant collapses onto the base listing
+        # (the fix for the page x sort x order permutation explosion, issue #58).
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        assert sp.normalize_url(
+            "https://example.com/blog?sort=title&order=desc&dir=asc",
+            exclude_params=sp.exclude_params_schedule,
+        ) == "https://example.com/blog"
+
+    def test_page_kept_but_sort_dropped_when_combined(self):
+        # A ?page=3&sort=title link keeps the sequence param (real next page) and drops the
+        # reordering param, so pagination is followed without fanning out per sort order.
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        assert sp.normalize_url(
+            "https://example.com/blog?page=3&sort=title",
+            exclude_params=sp.exclude_params_schedule,
+        ) == "https://example.com/blog?page=3"
+
+    def test_pagination_stripped_on_emit(self):
+        # The pagination URLs are a discovery path, not content: the emitted/stored row for
+        # a ?page=N page normalizes to the canonical listing, so ?page= never appears as a
+        # distinct recorded page.
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        assert sp.normalize_url(
+            "https://example.com/blog?page=2",
+            exclude_params=sp.exclude_params_emit,
+        ) == "https://example.com/blog"
+
+    def test_sequence_and_reorder_partition_covers_pagination_params(self):
+        # Guard the split: every historical pagination param is classified as exactly one of
+        # sequence (followed) or reorder (stripped), and the two are disjoint.
+        assert WebsiteSpider.SEQUENCE_PARAMS.isdisjoint(WebsiteSpider.REORDER_PARAMS)
+        assert WebsiteSpider.SEQUENCE_PARAMS | WebsiteSpider.REORDER_PARAMS == WebsiteSpider.PAGINATION_PARAMS
+        # Reorder params must stay in UNWANTED so they are stripped in every mode.
+        assert WebsiteSpider.REORDER_PARAMS <= WebsiteSpider.UNWANTED_PARAMS
