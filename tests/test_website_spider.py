@@ -1299,6 +1299,20 @@ class TestPaginationFollowing:
             exclude_params=sp.exclude_params_schedule,
         ) == "https://example.com/blog"
 
+    def test_drupal_views_exposed_sort_params_are_stripped(self):
+        # Real-site (naeyc.org) reordering: Drupal Views exposes sort as ?sort_by=&sort_order=,
+        # not the short generic names. These must strip in every mode too, or a sorted listing
+        # leaks as a duplicate page (issue #58, found in the live crawl).
+        sp = WebsiteSpider(domain="example.com", reach_pagination=1)
+        url = "https://example.com/resources/pubs/books/all?sort_by=field_publication_date&sort_order=DESC"
+        assert sp.normalize_url(url, exclude_params=sp.exclude_params_schedule) == "https://example.com/resources/pubs/books/all"
+        assert sp.normalize_url(url, exclude_params=sp.exclude_params_emit) == "https://example.com/resources/pubs/books/all"
+        # A page param alongside an exposed sort still keeps the page, drops the sort.
+        assert sp.normalize_url(
+            "https://example.com/list?page=2&sort_by=title&sort_bef_combine=asc",
+            exclude_params=sp.exclude_params_schedule,
+        ) == "https://example.com/list?page=2"
+
     def test_page_kept_but_sort_dropped_when_combined(self):
         # A ?page=3&sort=title link keeps the sequence param (real next page) and drops the
         # reordering param, so pagination is followed without fanning out per sort order.
