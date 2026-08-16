@@ -132,8 +132,11 @@ class WebsiteSpider(scrapy.Spider):
         # comment-reply/moderation links. Search-results variants are not content pages, so
         # collapsing any ?s= value onto the base URL is correct.
         "s", "search", "replytocom", "unapproved", "moderation-hash",
-        # Pagination/sorting (toggleable)
-        "page", "p", "offset", "start", "sort", "order", "dir",
+        # Pagination/sorting (toggleable). The sort family includes Drupal Views' exposed-sort
+        # param names (`sort_by`/`sort_order`, and Better Exposed Filters' `sort_bef_combine`),
+        # not just the short generic ones -- naeyc.org sorts listings with `?sort_by=...&sort_order=DESC`.
+        "page", "p", "offset", "start",
+        "sort", "order", "dir", "sort_by", "sort_order", "sort_bef_combine",
     }
 
     # Separable so we can treat pagination differently for scheduling vs emitting.
@@ -141,12 +144,13 @@ class WebsiteSpider(scrapy.Spider):
     #   - SEQUENCE_PARAMS advance through a listing (`?page=2`, `?offset=20`) -- each value
     #     surfaces a DIFFERENT set of items, so following them is a real discovery path
     #     (issue #58: naeyc's 19-page Drupal blog had ~2/3 of its posts behind `?page=`).
-    #   - REORDER_PARAMS only re-sort the SAME items (`?sort=title&order=desc`); every value
-    #     is a view of one result set. Following them multiplies a listing by every sort
-    #     permutation (page x sort x order) for zero new content, so they stay stripped in
-    #     EVERY mode -- they live only in UNWANTED_PARAMS below, never in the keep-set.
+    #   - REORDER_PARAMS only re-sort the SAME items (`?sort=title&order=desc`, or Drupal
+    #     Views' `?sort_by=field_date&sort_order=DESC`); every value is a view of one result
+    #     set. Following them multiplies a listing by every sort permutation (page x sort x
+    #     order) for zero new content, so they stay stripped in EVERY mode -- they live only
+    #     in UNWANTED_PARAMS below, never in the keep-set.
     SEQUENCE_PARAMS = {"page", "p", "offset", "start"}
-    REORDER_PARAMS = {"sort", "order", "dir"}
+    REORDER_PARAMS = {"sort", "order", "dir", "sort_by", "sort_order", "sort_bef_combine"}
     # The historical union. No production code reads it anymore (the exclude-set
     # construction subtracts SEQUENCE_PARAMS directly); kept as the back-compat name and
     # for the partition-invariant guard test, so a future reader knows it isn't dead.
