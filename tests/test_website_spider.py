@@ -354,8 +354,9 @@ class TestSchemaSync:
     """Guards against drift between the field-list sources of truth."""
 
     def test_base_feed_fields_match_source(self):
+        # skip_reason (issue #43) sits between the originals and the enrichment columns.
         assert run_spider.BASE_FEED_FIELDS == (
-            run_spider.ORIGINAL_FEED_FIELDS + list(ENRICHMENT_FIELD_NAMES)
+            run_spider.ORIGINAL_FEED_FIELDS + ["skip_reason"] + list(ENRICHMENT_FIELD_NAMES)
         )
 
     def test_empty_enrichment_keys_match_source(self):
@@ -1180,6 +1181,48 @@ class TestRobotsCrawlDelay:
         s._apply_crawl_delay(1.0)  # site asks for less than we already pace
         assert slot.delay == 3.0  # unchanged
         assert s.crawler.stats.values.get("robots_crawl_delay_applied") is None
+
+
+class TestSkippedAuthUrls:
+    """issue #43: a deliberately-skipped auth/login-gated URL emits a `skip_reason` record
+    so the corpus can surface it as coverage, without ever counting as a crawled page."""
+
+    def _spider(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_login_url_emits_skip_row(self):
+        s = self._spider()
+        out = list(s._schedule("https://example.com/account/login",
+                               referrer_emit="https://example.com/"))
+        assert not any(isinstance(o, Request) for o in out)  # not fetched
+        rows = [o for o in out if isinstance(o, dict)]
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["skip_reason"] == "login_gated"
+        assert r["status"] == 0
+        assert r["url"].endswith("/account/login")
+        assert r["referrer"] == "https://example.com/"
+        assert s.crawler.stats.values.get("login_urls_skipped") == 1
+
+    def test_non_login_url_has_no_skip_row(self):
+        s = self._spider()
+        out = list(s._schedule("https://example.com/about"))
+        assert any(isinstance(o, Request) for o in out)
+        assert not any(isinstance(o, dict) and o.get("skip_reason") for o in out)
+
+    def test_skip_row_emitted_once_per_url(self):
+        s = self._spider()
+        first = list(s._schedule("https://example.com/login"))
+        second = list(s._schedule("https://example.com/login"))
+        assert len([o for o in first if isinstance(o, dict)]) == 1
+        assert second == []  # seen -> no duplicate skip row
+
+    def test_fetched_page_row_carries_empty_skip_reason(self):
+        spider = WebsiteSpider(domain="example.com")
+        row = _emit_one(spider, _html_response())
+        assert row["skip_reason"] == ""
 
 
 class TestResumableDedupState:

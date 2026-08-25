@@ -35,7 +35,9 @@ DEFAULT_USER_AGENT = FAMILY_USER_AGENTS["chrome"]
 # source of truth (ENRICHMENT_FIELD_NAMES). content_text is appended only when
 # --emit-content is set.
 ORIGINAL_FEED_FIELDS = ["url", "status", "last_modified", "redirected_to", "referrer"]
-BASE_FEED_FIELDS = ORIGINAL_FEED_FIELDS + list(ENRICHMENT_FIELD_NAMES)
+# `skip_reason` (issue #43): empty on a fetched page, set on a deliberately-skipped URL
+# (auth/login-gated) so the corpus can route it to excluded_urls, never page_versions.
+BASE_FEED_FIELDS = ORIGINAL_FEED_FIELDS + ["skip_reason"] + list(ENRICHMENT_FIELD_NAMES)
 
 # Bound the download itself so a hostile multi-hundred-MB response can't blow the
 # memory cap before our per-body guard runs. Well above any real HTML page.
