@@ -167,7 +167,7 @@ blocked result and put you back where you started.
 
 | Symptom | Cause / fix |
 |---|---|
-| Crawl returns a few rows, mostly 403 | You're on a VPN, or the site needs more than TLS impersonation. Turn the VPN off and re-run. If it still fails, the site may need a browser-solved `cf_clearance` cookie — see the Cloudflare section of the [README](../README.md), and note that cookie is bound to the solving IP. |
+| Crawl returns a few rows, mostly 403 | You're on a VPN/datacenter IP, or the site's Cloudflare is blocking this IP outright (the block is IP-reputation driven, not the TLS fingerprint). Turn the VPN off and re-run from a residential connection — that is the reliable fix. Check the crawl status file's `blocking` section: a high `waf_challenge_count` confirms it's a Cloudflare wall, not genuine 404/gone content. |
 | `Permission denied` reading the `/tmp` file as `yoko` | `scp` landed it `600`. As root: `chmod 644 /tmp/<domain>.ndjson`. |
 | Ingest "succeeds" but Discovery shows nothing | Either you didn't source the env file (look for a stray `yoko_corpus.db` in the directory you ran from, delete it, re-run), or you ingested a `www.` domain — see step 2. |
 | `This exact NDJSON was already ingested for <domain> as crawl N` (exit 4) | Not a failure. The corpus SHA-dedupes ingests, so this means the first one landed. Skip to `analyze`. Only `failed` crawls are re-ingestable. |

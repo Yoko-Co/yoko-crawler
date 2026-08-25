@@ -37,7 +37,7 @@ def test_jobdir_setting_enables_scrapy_resume():
 
 
 def test_cookie_jar_enabled():
-    # Injected cookies (cf_clearance reuse) rely on the jar to propagate to followed links.
+    # The jar lets the SITE's own session/affinity cookies persist across the crawl.
     s = build_settings(make_args())
     assert s["COOKIES_ENABLED"] is True
 

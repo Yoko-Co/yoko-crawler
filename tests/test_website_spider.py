@@ -852,46 +852,6 @@ class TestObeyLinkDirectives:
         assert spider.crawler.stats.values.get("infra_urls_skipped") == 1
 
 
-# ---------- injected cookies (cf_clearance reuse) ----------
-
-class TestInjectedCookies:
-    def test_parse_cookie_string(self):
-        spider = WebsiteSpider(domain="example.com")
-        assert spider._parse_cookie_string("cf_clearance=abc123; __cf_bm=xy=z") == {
-            "cf_clearance": "abc123",
-            "__cf_bm": "xy=z",  # value keeps everything after the FIRST '='
-        }
-
-    def test_parse_cookie_string_tolerates_junk(self):
-        spider = WebsiteSpider(domain="example.com")
-        assert spider._parse_cookie_string("  ; =novalue; a=1 ;; b= ") == {"a": "1", "b": ""}
-        assert spider._parse_cookie_string(None) == {}
-        assert spider._parse_cookie_string("") == {}
-
-    def test_parse_cookie_string_strips_control_chars(self):
-        # A CRLF in a value must not survive into the cookie dict (no header injection).
-        spider = WebsiteSpider(domain="example.com")
-        parsed = spider._parse_cookie_string("cf_clearance=a\r\nEvil: 1\x00; b=2")
-        assert parsed == {"cf_clearance": "aEvil: 1", "b": "2"}
-        assert all("\r" not in v and "\n" not in v and "\x00" not in v for v in parsed.values())
-
-    def test_no_cookies_by_default(self):
-        spider = WebsiteSpider(domain="example.com")
-        assert spider.injected_cookies == {}
-        # start_requests carries no cookies (None) when none were injected.
-        reqs = list(spider.start_requests())
-        assert all(not r.cookies for r in reqs)
-
-    def test_injected_cookies_seed_the_start_requests(self):
-        spider = WebsiteSpider(domain="example.com", cookies="cf_clearance=tok; a=1")
-        assert spider.injected_cookies == {"cf_clearance": "tok", "a": "1"}
-        reqs = list(spider.start_requests())
-        # Both seeds (homepage + robots.txt) carry the cookies so the jar propagates them.
-        assert len(reqs) == 2
-        for r in reqs:
-            assert r.cookies == {"cf_clearance": "tok", "a": "1"}
-
-
 from scrapy.http import TextResponse  # noqa: E402
 
 
@@ -1233,8 +1193,7 @@ class TestBreadthFirstOrdering:
         import argparse, run_spider
         args = argparse.Namespace(output="o.jsonl", format="jsonlines", emit_content=False,
                                   user_agent=None, delay=1.0, profile="presale",
-                                  status_file="s.json", impersonate="off", jobdir=None,
-                                  cookies=None)
+                                  status_file="s.json", impersonate="off", jobdir=None)
         for k, v in over.items():
             setattr(args, k, v)
         return run_spider.build_settings(args)
@@ -1258,8 +1217,8 @@ class TestSeedRequests:
     Scrapy 2.13 replaced `start_requests()` with `async def start()`, and 2.17 removed the
     base method and every call site. `requirements.txt` had an unbounded `scrapy>=2.11`, so
     an ordinary upgrade silently made our `start_requests` dead code -- the default
-    `Spider.start()` seeded start_urls with no cookies and no robots.txt. Nothing failed.
-    Two production paths were dead: cf_clearance cookie injection and sitemap discovery."""
+    `Spider.start()` seeded start_urls with no robots.txt. Nothing failed. The dead path was
+    sitemap discovery: without robots.txt the crawler was link-following only."""
 
     def _seeds(self, **kw):
         import asyncio
@@ -1286,13 +1245,12 @@ class TestSeedRequests:
         link-following only and never sees sitemap-only or orphaned pages."""
         assert "https://example.com/robots.txt" in [r.url for r in self._seeds()]
 
-    def test_injected_cookies_reach_the_seed_requests(self):
-        """The bot-block retry path: a browser-solved cf_clearance must ride the seeds so
-        CookiesMiddleware re-attaches it to every followed request."""
-        seeds = self._seeds(cookies="cf_clearance=SECRET; __cf_bm=OTHER")
+    def test_seeds_carry_no_cookies(self):
+        """Cookie injection was removed: seeds must not carry any request cookies (the site's
+        own Set-Cookie still populates the jar during the crawl via COOKIES_ENABLED)."""
+        seeds = self._seeds()
         assert seeds, "no seed requests generated"
-        for r in seeds:
-            assert r.cookies.get("cf_clearance") == "SECRET", f"{r.url} lost the cookie"
+        assert all(not r.cookies for r in seeds)
 
     def test_start_and_start_requests_agree(self):
         """Both entry points must produce the same seeds, so a Scrapy version change can
@@ -1402,7 +1360,7 @@ class TestJobdirFormatMigration:
         args = argparse.Namespace(output="o.jsonl", format="jsonlines", emit_content=False,
                                   user_agent=None, delay=1.0, profile="presale",
                                   status_file="s.json", impersonate="off",
-                                  jobdir=jobdir, cookies=None)
+                                  jobdir=jobdir)
         settings = build_settings(args)
         assert settings["JOBDIR"] == jobdir
         assert not (tmp_path / "requests.queue").exists()

@@ -28,8 +28,8 @@ tags:
 
 ## Context
 
-`WebsiteSpider.start_requests()` seeded every crawl: the start URL, `/robots.txt`
-(which fans out to XML sitemap discovery), and any injected `cf_clearance` cookie.
+`WebsiteSpider.start_requests()` seeded every crawl: the start URL and `/robots.txt`
+(which fans out to XML sitemap discovery).
 
 Scrapy 2.13 replaced `start_requests()` with `async def start()`. By 2.16 the base
 method and **every call site** were gone — only two references survive in the whole

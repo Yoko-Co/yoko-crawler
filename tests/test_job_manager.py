@@ -197,25 +197,19 @@ class TestJobManager:
         args = mock_exec.call_args.args
         assert args[args.index("--impersonate") + 1] == "off"
 
-    async def test_cookie_passed_via_env_not_argv(self):
-        # The cookie is a secret -> passed via the YOKO_CRAWL_COOKIES env var (same-uid
-        # readable), never argv (world-readable via the process table). UA rides on argv.
+    async def test_user_agent_passed_on_argv(self):
+        # UA override (not a secret) rides on argv.
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process()
         with patch(
             "job_manager.asyncio.create_subprocess_exec", return_value=proc
         ) as mock_exec:
-            job = await jm.start_job(
-                "example.com", cookies="cf_clearance=tok", user_agent="Mozilla/5.0 X"
-            )
-        assert job.cookies == "cf_clearance=tok" and job.user_agent == "Mozilla/5.0 X"
+            job = await jm.start_job("example.com", user_agent="Mozilla/5.0 X")
+        assert job.user_agent == "Mozilla/5.0 X"
         args = mock_exec.call_args.args
-        assert "--cookies" not in args  # NOT on argv
-        assert "cf_clearance=tok" not in args
-        assert mock_exec.call_args.kwargs["env"]["YOKO_CRAWL_COOKIES"] == "cf_clearance=tok"
         assert args[args.index("--user-agent") + 1] == "Mozilla/5.0 X"
 
-    async def test_no_env_override_when_no_cookie(self):
+    async def test_no_user_agent_flag_by_default(self):
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process()
         with patch(
@@ -224,8 +218,8 @@ class TestJobManager:
             await jm.start_job("example.com")
         args = mock_exec.call_args.args
         assert "--cookies" not in args and "--user-agent" not in args
-        # env=None means inherit the parent environment (no injected cookie).
-        assert mock_exec.call_args.kwargs["env"] is None
+        # No custom env is passed: the subprocess inherits the parent environment.
+        assert "env" not in mock_exec.call_args.kwargs
 
     async def test_profile_and_emit_content_passed_to_subprocess(self):
         jm = JobManager(max_concurrent=3)

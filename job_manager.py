@@ -76,9 +76,7 @@ class Job:
     # Resumable crawl (Phase C): when true the spider runs with a persistent
     # per-domain JOBDIR, so a crawl that pauses (session cap) resumes on the next run.
     resumable: bool = False
-    # Injected cookies (raw Cookie-header string, e.g. a browser-solved cf_clearance) and a
-    # User-Agent override sent with every request -- reuse a solved Cloudflare challenge.
-    cookies: str | None = None
+    # User-Agent override sent with every request (e.g. a specific browser build).
     user_agent: str | None = None
     started_at: float = field(default_factory=time.time)
     status: str = "queued"  # queued, running, completed, failed
@@ -179,7 +177,6 @@ class JobManager:
         emit_content: bool = False,
         resumable: bool = False,
         reset: bool = False,
-        cookies: str | None = None,
         user_agent: str | None = None,
     ) -> Job:
         """
@@ -197,9 +194,7 @@ class JobManager:
         that pauses at the session cap RESUMES on the next run instead of re-fetching
         from the seed (Phase C). ``reset`` discards any existing JOBDIR first, forcing
         a fresh scan (e.g. a "request fresh crawl" that must re-detect changes).
-        ``cookies`` (raw Cookie-header string) seeds the cookie jar on every request --
-        reuse a browser-solved Cloudflare ``cf_clearance`` -- and ``user_agent`` overrides
-        the UA to match the one that solved the challenge (cf_clearance is UA-bound).
+        ``user_agent`` overrides the User-Agent sent on every request.
         """
         if profile not in VALID_PROFILES:
             raise ValueError(f"invalid profile: {profile!r}")
@@ -234,7 +229,6 @@ class JobManager:
                 profile=profile,
                 emit_content=emit_content,
                 resumable=resumable,
-                cookies=cookies,
                 user_agent=user_agent,
             )
             self._jobs[job_id] = job
@@ -309,20 +303,12 @@ class JobManager:
         if job.user_agent:
             cmd += ["--user-agent", job.user_agent]
 
-        # The cookie IS a secret (a browser-solved cf_clearance), so pass it via an env var
-        # -- readable only by the same uid -- rather than argv, which is world-readable via
-        # the process table (`ps`, /proc/<pid>/cmdline) for the crawl's whole lifetime.
-        env = None
-        if job.cookies:
-            env = {**os.environ, "YOKO_CRAWL_COOKIES": job.cookies}
-
         try:
             job.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=log_fh,
                 cwd=str(Path(__file__).parent),
-                env=env,
             )
         except Exception:
             log_fh.close()
