@@ -193,8 +193,12 @@ def build_settings(args):
         return settings
 
     # Browser TLS-fingerprint impersonation (curl_cffi via scrapy-impersonate).
-    # Defeats Cloudflare Bot Management and similar WAFs that fingerprint the
-    # TLS ClientHello (JA3/JA4) and 403 standard Scrapy regardless of headers.
+    # Presents a current browser's TLS ClientHello (JA3/JA4) plus a matching UA, because
+    # many CDNs 403 the default Scrapy/curl fingerprint OUTRIGHT -- regardless of intent or
+    # headers -- and would refuse even content the origin serves to every visitor. This is a
+    # compatibility measure, not a way to override a site's stated "no": we obey robots
+    # directives, rel=nofollow, and <meta name=robots>, and we do NOT try to punch through an
+    # active Cloudflare challenge (see RETRY_HTTP_CODES below).
     # Fail fast with a clear message if the optional dependency is missing.
     try:
         import scrapy_impersonate  # noqa: F401
@@ -221,14 +225,15 @@ def build_settings(args):
                 "https": "scrapy_impersonate.ImpersonateDownloadHandler",
             },
             "IMPERSONATE_TARGET": args.impersonate,
-            # Cloudflare still issues occasional bot challenges (403) under
-            # concurrency even with a good fingerprint. Retrying lets the
-            # __cf_bm cookie set on the challenge carry into the retry, which
-            # then passes. Genuinely-restricted pages just exhaust retries.
-            "RETRY_HTTP_CODES": [500, 502, 503, 504, 522, 524, 408, 429, 403],
-            # Cap retries at 1: enough to recover a transient challenge via the
-            # __cf_bm cookie, without tripling outbound load on a site that 403s
-            # broadly (each retry re-hits the same WAF).
+            # 403 is deliberately NOT retried. A Cloudflare 403 is a challenge/block, and
+            # in practice punching through it never worked (the block is driven by IP
+            # reputation, not the fingerprint) -- retrying just re-hit the WAF and doubled
+            # outbound load on an already-blocked site. Recording the 403 once, immediately,
+            # is both the honest signal and what feeds the crawl's block-legibility counts
+            # (waf_challenge_count). Transient server/network codes are still retried once.
+            "RETRY_HTTP_CODES": [500, 502, 503, 504, 522, 524, 408, 429],
+            # Cap retries at 1: enough to recover a genuinely transient blip without
+            # tripling outbound load on a site that errors broadly.
             "RETRY_TIMES": 1,
         }
     )

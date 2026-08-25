@@ -56,7 +56,12 @@ def test_ssrf_guard_survives_impersonation():
     assert "ssrf_guard.SsrfGuardMiddleware" in mw
     assert "tls_impersonate.ImpersonateMiddleware" in mw
     assert s["RETRY_TIMES"] == 1
-    assert 403 in s["RETRY_HTTP_CODES"]
+    # 403 is deliberately NOT retried: a Cloudflare 403 is a challenge/block that punching
+    # through never actually cleared (IP-reputation driven), so retrying only re-hit the WAF.
+    # Recording it once feeds the block-legibility counts instead. Transient codes still retry.
+    assert 403 not in s["RETRY_HTTP_CODES"]
+    assert 429 in s["RETRY_HTTP_CODES"]
+    assert 503 in s["RETRY_HTTP_CODES"]
     assert s["IMPERSONATE_TARGET"] == "chrome"
     # Middleware supplies a per-request UA matching the fingerprint.
     assert s["USER_AGENT"] is None
