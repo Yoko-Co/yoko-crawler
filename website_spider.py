@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import scrapy
+from protego import Protego
 from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse, urljoin
 from w3lib.url import canonicalize_url
 from scrapy.http import TextResponse
@@ -85,6 +87,16 @@ class WebsiteSpider(scrapy.Spider):
         "logout", "signout", "sign-out", "sign_out",
         "auth", "oauth", "oauth2", "sso", "cas", "saml", "adfs",
     }
+
+    # The robots.txt user-agent group we obey. We present a browser fingerprint, not a named
+    # bot, so we fall under the catch-all `*` group -- and a site that names us explicitly
+    # (`User-agent: yoko-crawler`) is honored too, since protego picks the best-matching group
+    # and this token matches nothing else, falling back to `*`.
+    ROBOTS_USER_AGENT = "yoko-crawler"
+    # Cap on an honored robots.txt Crawl-delay (seconds). We never crawl faster than a site
+    # asks, but a pathological delay (e.g. 3600s) would blow the crawl budget, so we honor up
+    # to this and log the clamp. Env-tunable; the site's own smaller delay is honored in full.
+    DEFAULT_MAX_ROBOTS_CRAWL_DELAY = 10.0
 
     # CMS/CDN infrastructure endpoints (machine-only, never site content, no redirect
     # value). `cdn-cgi` is Cloudflare-reserved: nothing under it is the origin's content
@@ -234,6 +246,18 @@ class WebsiteSpider(scrapy.Spider):
         # The site's own hosts -- a same-site <script src> is the site's own code, not a
         # third-party integration, so script_signals skips it (issue #28).
         self.self_hosts = frozenset(self.allowed_domains)
+
+        # robots.txt obedience (issues #57/#59): a Protego matcher parsed from the site's
+        # robots.txt when the seed fetch returns it. None until then (and for a site with
+        # no robots.txt) -> allow-all, unchanged behavior. Disallow rules gate scheduling;
+        # a Crawl-delay paces the host (see parse_robots / _apply_crawl_delay).
+        self._robots = None
+        try:
+            self.max_robots_crawl_delay = float(
+                os.environ.get("YOKO_CRAWL_MAX_ROBOTS_DELAY", self.DEFAULT_MAX_ROBOTS_CRAWL_DELAY)
+            )
+        except (TypeError, ValueError):
+            self.max_robots_crawl_delay = self.DEFAULT_MAX_ROBOTS_CRAWL_DELAY
 
         # Build exclude sets for scheduling vs emitting. Only SEQUENCE_PARAMS are ever
         # kept -- REORDER_PARAMS (sort/order/dir) stay in UNWANTED_PARAMS in every mode, so
@@ -442,6 +466,66 @@ class WebsiteSpider(scrapy.Spider):
         segments = path.split("/")
         return any(seg in self.INFRA_PATH_SEGMENTS for seg in segments)
 
+    def is_robots_disallowed(self, url: str) -> bool:
+        """True when the site's robots.txt Disallows this URL for our user-agent group
+        (issues #57/#59). False when robots.txt hasn't been parsed yet, the site has none,
+        or the match errors -- allow-all, so this only ever ADDS a skip, never a false one."""
+        if self._robots is None:
+            return False
+        try:
+            return not self._robots.can_fetch(url, self.ROBOTS_USER_AGENT)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _honored_crawl_delay(requested: float, configured: float, cap: float) -> tuple[float, bool]:
+        """The per-request interval to honor for a robots.txt Crawl-delay, and whether it was
+        clamped. `max(configured, min(requested, cap))`: never faster than the site asks, never
+        below our own floor, never above the cap (which bounds a pathological delay vs the crawl
+        budget). Returns (honored_delay, was_clamped)."""
+        honored = max(configured, min(requested, cap))
+        return honored, requested > cap
+
+    def _apply_crawl_delay(self, requested: float) -> None:
+        """Honor a robots.txt Crawl-delay (issue #57): pace this host at the honored interval.
+        AutoThrottle floors its adaptive delay at its own `mindelay` (= DOWNLOAD_DELAY), so we
+        RAISE that floor to the honored value -- otherwise AutoThrottle would lower the pace
+        back below what the site asked. We also bump the live download slot(s) so it takes
+        effect on the very next request, not only after the next adjustment. All best-effort:
+        a Scrapy-internals shape change must never break the crawl. Note: a large honored delay
+        means a fixed-budget crawl finalizes partial (honestly labelled) rather than complete."""
+        crawler = getattr(self, "crawler", None)
+        if crawler is None:
+            return
+        configured = crawler.settings.getfloat("DOWNLOAD_DELAY")
+        honored, clamped = self._honored_crawl_delay(
+            requested, configured, self.max_robots_crawl_delay
+        )
+        if honored <= configured:
+            return  # the site asks for <= our own floor -> nothing to slow down
+        # Raise AutoThrottle's floor so its adaptive lowering can't undo the crawl-delay.
+        # AutoThrottle is the extension carrying a `mindelay` (its adaptive floor); duck-type
+        # on it rather than importing the class, so the hook is trivially testable.
+        try:
+            for ext in crawler.extensions.middlewares:
+                if hasattr(ext, "mindelay"):
+                    ext.mindelay = max(float(getattr(ext, "mindelay", 0.0) or 0.0), honored)
+        except Exception:
+            self.logger.debug("could not raise AutoThrottle floor", exc_info=True)
+        # Apply immediately to the live slot(s) (single-host crawl -> one slot).
+        try:
+            for slot in crawler.engine.downloader.slots.values():
+                slot.delay = max(slot.delay, honored)
+        except Exception:
+            self.logger.debug("could not bump download slot delay", exc_info=True)
+        self._stat("robots_crawl_delay_applied")
+        self.logger.info(
+            "Honoring robots.txt Crawl-delay for %s: pacing at %.1fs/request "
+            "(site asked %.1fs%s)",
+            self.base_domain, honored, requested,
+            f"; clamped to the {self.max_robots_crawl_delay:.0f}s cap" if clamped else "",
+        )
+
     # ---------- Entry points ----------
 
     def _stat(self, name, count=1):
@@ -512,6 +596,18 @@ class WebsiteSpider(scrapy.Spider):
                 if self.is_internal(tgt):
                     yield scrapy.Request(tgt, callback=self.parse_robots)
             return
+
+        # Parse robots.txt rules from the real body (issues #57/#59): Disallow gates scheduling
+        # (is_robots_disallowed) and a Crawl-delay paces the host. Best-effort -- a malformed or
+        # non-text robots.txt leaves rules unset (allow-all), never breaking the crawl.
+        if response.status == 200 and isinstance(response, TextResponse):
+            try:
+                self._robots = Protego.parse(response.text)
+                delay = self._robots.crawl_delay(self.ROBOTS_USER_AGENT)
+                if delay:
+                    self._apply_crawl_delay(float(delay))
+            except Exception:
+                self.logger.debug("robots.txt parse failed for %s", response.url, exc_info=True)
 
         # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
         for line in response.text.splitlines():
@@ -883,6 +979,16 @@ class WebsiteSpider(scrapy.Spider):
             return
         seen_key = self.facet_dedup_key(normalized)
         if seen_key in self.seen:
+            return
+
+        # robots.txt Disallow (issues #57/#59): the site asked crawlers not to fetch this
+        # path. Obey it -- this is what keeps us out of `Disallow: /search/` facet traps
+        # (naeyc: 693 permutations, 38% of the crawl) and, more broadly, off anything the
+        # site marks off-limits. No-op until robots.txt is parsed / for a site without one.
+        if self.is_robots_disallowed(normalized):
+            self.seen.add(seen_key)
+            self.crawler.stats.inc_value("robots_disallowed_skipped")
+            self.logger.debug("Skipping robots-disallowed URL: %s", normalized)
             return
 
         if self.is_login_url(normalized):

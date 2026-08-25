@@ -1087,6 +1087,101 @@ class TestFacetScheduling:
         assert s.max_facet_depth == WebsiteSpider.MAX_FACET_DEPTH
 
 
+class TestRobotsDisallow:
+    """robots.txt Disallow obedience (issues #57/#59): once robots.txt is parsed, its
+    Disallow rules gate scheduling; a site with none is allow-all (behavior unchanged)."""
+
+    def _spider(self, robots_body=None):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        if robots_body is not None:
+            from protego import Protego
+            s._robots = Protego.parse(robots_body)
+        return s
+
+    def test_is_robots_disallowed_matches_and_allows(self):
+        s = self._spider("User-agent: *\nDisallow: /search/\nAllow: /search/help\n")
+        assert s.is_robots_disallowed("https://example.com/search/?f[0]=a")
+        assert not s.is_robots_disallowed("https://example.com/about")
+        assert not s.is_robots_disallowed("https://example.com/search/help")  # Allow wins
+
+    def test_no_robots_is_allow_all(self):
+        s = self._spider()  # no robots.txt parsed
+        assert s._robots is None
+        assert not s.is_robots_disallowed("https://example.com/search/anything")
+
+    def test_named_yoko_group_is_honored(self):
+        s = self._spider("User-agent: yoko-crawler\nDisallow: /private/\n")
+        assert s.is_robots_disallowed("https://example.com/private/x")
+
+    def test_disallowed_url_not_scheduled(self):
+        s = self._spider("User-agent: *\nDisallow: /search/\n")
+        reqs = list(s._schedule("https://example.com/search/results"))
+        assert reqs == []
+        assert s.crawler.stats.values.get("robots_disallowed_skipped") == 1
+
+    def test_allowed_url_is_scheduled(self):
+        s = self._spider("User-agent: *\nDisallow: /search/\n")
+        reqs = list(s._schedule("https://example.com/about"))
+        assert len(reqs) == 1
+
+    def test_parse_robots_populates_rules(self):
+        s = self._spider()
+        body = b"User-agent: *\nDisallow: /search/\n"
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        list(s.parse_robots(resp))  # consume the generator
+        assert s._robots is not None
+        assert s.is_robots_disallowed("https://example.com/search/x")
+
+
+class TestRobotsCrawlDelay:
+    """robots.txt Crawl-delay honoring (issue #57): max(our floor, min(asked, cap))."""
+
+    def test_honored_crawl_delay_math(self):
+        assert WebsiteSpider._honored_crawl_delay(10.0, 1.0, 10.0) == (10.0, False)
+        assert WebsiteSpider._honored_crawl_delay(30.0, 1.0, 10.0) == (10.0, True)  # clamped
+        assert WebsiteSpider._honored_crawl_delay(0.5, 1.0, 10.0) == (1.0, False)  # below floor
+        assert WebsiteSpider._honored_crawl_delay(5.0, 1.0, 10.0) == (5.0, False)
+
+    def _crawler(self, download_delay, throttle=None, slot=None):
+        exts = types.SimpleNamespace(middlewares=[throttle] if throttle is not None else [])
+        downloader = types.SimpleNamespace(slots={"example.com": slot} if slot is not None else {})
+        return types.SimpleNamespace(
+            stats=_FakeStats(),
+            settings=types.SimpleNamespace(getfloat=lambda _k: download_delay),
+            extensions=exts,
+            engine=types.SimpleNamespace(downloader=downloader),
+        )
+
+    def test_apply_raises_slot_and_autothrottle_floor(self):
+        s = WebsiteSpider(domain="example.com")
+        throttle = types.SimpleNamespace(mindelay=1.0)  # duck-types as AutoThrottle
+        slot = types.SimpleNamespace(delay=1.0)
+        s.crawler = self._crawler(1.0, throttle=throttle, slot=slot)
+        s._apply_crawl_delay(10.0)
+        assert slot.delay == 10.0
+        assert throttle.mindelay == 10.0
+        assert s.crawler.stats.values.get("robots_crawl_delay_applied") == 1
+
+    def test_apply_clamps_to_cap(self):
+        s = WebsiteSpider(domain="example.com")
+        s.max_robots_crawl_delay = 10.0
+        slot = types.SimpleNamespace(delay=1.0)
+        s.crawler = self._crawler(1.0, slot=slot)
+        s._apply_crawl_delay(3600.0)  # pathological
+        assert slot.delay == 10.0  # clamped to the cap, not 3600
+
+    def test_apply_noop_when_asked_below_our_floor(self):
+        s = WebsiteSpider(domain="example.com")
+        slot = types.SimpleNamespace(delay=3.0)
+        s.crawler = self._crawler(3.0, slot=slot)  # our floor 3s
+        s._apply_crawl_delay(1.0)  # site asks for less than we already pace
+        assert slot.delay == 3.0  # unchanged
+        assert s.crawler.stats.values.get("robots_crawl_delay_applied") is None
+
+
 class TestResumableDedupState:
     """issue #52: dedup state must survive between resumable crawler sessions.
 
