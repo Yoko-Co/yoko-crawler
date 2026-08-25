@@ -47,6 +47,36 @@ def read_urls(path):
 # new domain in the list trips this once, then passes.
 BLOCK_STATUSES = frozenset({403, 429, 503})
 
+# Default pause before a block/exception retry. Applied to BOTH the block-status
+# and the raised-exception paths so a raised-then-retried request isn't fired
+# back-to-back with zero spacing.
+_RETRY_BACKOFF_SECONDS = 0.5
+# Cap an honored Retry-After so a hostile/misconfigured host can't stall the run.
+_MAX_RETRY_AFTER_SECONDS = 30
+
+
+def _retry_after(resp):
+    """Seconds to wait before retrying a blocked response: the server's
+    Retry-After when it's a plain integer (capped), else the default backoff.
+    HTTP-date Retry-After is not parsed — not worth it for a one-shot audit; the
+    default backoff covers the __cf_bm cookie-warm case."""
+    raw = resp.headers.get("Retry-After", "")
+    if raw.strip().isdigit():
+        return min(int(raw), _MAX_RETRY_AFTER_SECONDS)
+    return _RETRY_BACKOFF_SECONDS
+
+
+def _csv_safe(value):
+    """Neutralize spreadsheet formula injection. Excel/LibreOffice treat a cell
+    beginning with = + - @ (or a leading tab/CR) as a formula, so a probed host
+    can return a Location header like `=cmd|'/c calc'!A1` that executes when the
+    operator opens the report. Prefix any such cell with an apostrophe. Mirrors
+    the corpus/discovery CSV-export hardening."""
+    text = str(value)
+    if text[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
 
 def check(session, url, target, ua, method, timeout, retries):
     """Probe one URL without following redirects, retrying past CF blocks.
@@ -68,15 +98,19 @@ def check(session, url, target, ua, method, timeout, retries):
             )
         except Exception as exc:  # noqa: BLE001 - report any failure per-row
             last_exc = exc
+            if attempt < retries:
+                time.sleep(_RETRY_BACKOFF_SECONDS)
             continue
         # Retry block statuses now that the session may hold a fresh cookie.
         if resp.status_code in BLOCK_STATUSES and attempt < retries:
-            time.sleep(0.5)
+            time.sleep(_retry_after(resp))
             continue
         redirect_to = ""
         if 300 <= resp.status_code < 400:
             redirect_to = resp.headers.get("Location", "")
-        note = "cf-block" if resp.status_code in BLOCK_STATUSES else ""
+        # A trailing "?" — we can't prove the block is Cloudflare vs a genuine
+        # 403/503, only that it survived our retry.
+        note = "blocked?" if resp.status_code in BLOCK_STATUSES else ""
         return resp.status_code, redirect_to, note
 
     return "ERROR", "", f"{type(last_exc).__name__}: {last_exc}"
@@ -116,6 +150,8 @@ def main(argv=None):
         "cookie is set; raise for flaky hosts (default: 1)",
     )
     args = parser.parse_args(argv)
+    if args.retries < 0:
+        parser.error("--retries must be >= 0")
 
     target = CURRENT_TARGETS[args.impersonate]
     ua = user_agent_for(target)
@@ -139,7 +175,7 @@ def main(argv=None):
                 session, url, target, ua, args.method, args.timeout,
                 args.retries,
             )
-            writer.writerow([url, status, redirect_to, note])
+            writer.writerow([_csv_safe(url), status, _csv_safe(redirect_to), note])
             fh.flush()  # results survive a Ctrl-C mid-run
             print(
                 f"[{i}/{len(urls)}] {status:>6}  {url}"
