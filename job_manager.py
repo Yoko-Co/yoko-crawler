@@ -568,6 +568,16 @@ class JobManager:
             # failure_class, instead of scraping the humanized `error` prose. None
             # unless the crawl failed with a classified cause.
             "failure_reason": status_data.get("failure_reason"),
+            # Block/restriction observability (from the status file's `blocking` section):
+            # waf_challenge_count (Cloudflare wall) vs origin_forbidden_count (member-
+            # restricted 403s), plus a full HTTP status_counts histogram. Defaulted to a
+            # zeroed shape so a consumer always sees the same structure -- mid-crawl, or on
+            # an older status file written before this field existed.
+            "blocking": status_data.get("blocking") or {
+                "waf_challenge_count": 0,
+                "origin_forbidden_count": 0,
+                "status_counts": {},
+            },
             "started_at": (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(job.started_at))
             ),

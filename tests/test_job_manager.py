@@ -354,6 +354,47 @@ class TestJobManager:
         assert response["status"] == "failed"
         assert response["failure_reason"] == "unreachable"
 
+    async def test_get_status_response_propagates_blocking(self):
+        # The `blocking` counts written to status.json must reach GET /crawl/{id} so the
+        # corpus/frontend can surface the Cloudflare-challenge vs origin-403 split.
+        jm = JobManager()
+        proc = make_fake_process(returncode=0)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("example.com", resumable=True)
+        job.status_file.write_text(
+            json.dumps({
+                "status": "running",
+                "urls_crawled": 60,
+                "blocking": {
+                    "waf_challenge_count": 12,
+                    "origin_forbidden_count": 8,
+                    "status_counts": {"200": 40, "403": 20},
+                },
+            })
+        )
+        response = await jm.get_status_response(job)
+        assert response["blocking"]["waf_challenge_count"] == 12
+        assert response["blocking"]["origin_forbidden_count"] == 8
+        assert response["blocking"]["status_counts"] == {"200": 40, "403": 20}
+
+    async def test_get_status_response_blocking_defaults_when_absent(self):
+        # An older status file (or mid-crawl before any 403) has no `blocking` -> a zeroed
+        # shape, so a consumer always sees the same keys.
+        jm = JobManager()
+        job = Job(
+            job_id="abc123def4560000",
+            domain="example.com",
+            status="running",
+            started_at=time.time(),
+        )
+        jm._jobs[job.job_id] = job
+        response = await jm.get_status_response(job)
+        assert response["blocking"] == {
+            "waf_challenge_count": 0,
+            "origin_forbidden_count": 0,
+            "status_counts": {},
+        }
+
     def test_startup_sweep(self, tmp_path):
         """Startup sweep should delete old orphaned files."""
         # tmp_path is the same as the monkeypatched RESULTS_DIR from autouse fixture.
