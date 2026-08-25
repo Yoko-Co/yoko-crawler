@@ -18,6 +18,9 @@ class FakeStats:
     def get_value(self, key, default=0):
         return self._values.get(key, default)
 
+    def get_stats(self):
+        return self._values
+
 
 def _write_and_read(tmp_path, stats_values, reason):
     status_file = str(tmp_path / "status.json")
@@ -38,6 +41,39 @@ def test_all_403_completes_consumer_owns_policy(tmp_path):
     )
     assert data["status"] == "completed"
     assert data["error"] is None
+
+
+def test_blocking_counts_surfaced(tmp_path):
+    # Block/restriction observability: the status file exposes the challenge vs origin-403
+    # split and a full status histogram, so the corpus/frontend can read the mix. Observed
+    # counts, not a verdict -- the crawl still COMPLETES (policy stays with the consumer).
+    data = _write_and_read(
+        tmp_path,
+        {
+            "response_received_count": 60,
+            "downloader/response_status_count/200": 40,
+            "downloader/response_status_count/403": 20,
+            "waf_challenge_count": 12,
+            "origin_forbidden_count": 8,
+        },
+        reason="finished",
+    )
+    assert data["status"] == "completed"
+    blocking = data["blocking"]
+    assert blocking["waf_challenge_count"] == 12
+    assert blocking["origin_forbidden_count"] == 8
+    assert blocking["status_counts"] == {"200": 40, "403": 20}
+
+
+def test_blocking_counts_default_to_zero(tmp_path):
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 5, "downloader/response_status_count/200": 5},
+        reason="finished",
+    )
+    assert data["blocking"]["waf_challenge_count"] == 0
+    assert data["blocking"]["origin_forbidden_count"] == 0
+    assert data["blocking"]["status_counts"] == {"200": 5}
 
 
 def test_partial_403_completes(tmp_path):

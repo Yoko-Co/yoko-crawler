@@ -120,6 +120,17 @@ class ProgressWriter:
             status, error=error, final=True, close_reason=reason, failure_reason=failure_reason
         )
 
+    def _status_counts(self):
+        """HTTP status histogram ({"200": n, "403": n, ...}) from Scrapy's built-in
+        `downloader/response_status_count/<code>` stats, so the operator can see the response
+        mix (how many 403s, redirects, 404s) at a glance without re-deriving it."""
+        prefix = "downloader/response_status_count/"
+        counts = {}
+        for key, value in self.stats.get_stats().items():
+            if key.startswith(prefix):
+                counts[key[len(prefix):]] = value
+        return counts
+
     def _write_status(self, status, error=None, final=False, close_reason=None, failure_reason=None):
         data = {
             "status": status,
@@ -146,6 +157,22 @@ class ProgressWriter:
                 "seeds_emitted": self.stats.get_value("seeding/seeds_emitted", 0),
                 "robots_fetched": self.stats.get_value("seeding/robots_fetched", 0),
                 "sitemaps_fetched": self.stats.get_value("seeding/sitemaps_fetched", 0),
+            },
+            # Block/restriction observability. These are OBSERVED counts, NOT a verdict: on a
+            # Cloudflare-fronted site a single 403 can be both a bot challenge and a login page
+            # (INCOSE's /setdb-login/ returns `403 cf-mitigated: challenge` to a bot), and the
+            # crawler can't recover the origin's intent from one blocked fetch. So it surfaces
+            # the raw picture and leaves the blocked-crawl policy to the consumer (yoko-corpus
+            # already reads the forbidden ratio; the frontend can show it).
+            #   waf_challenge_count    -- responses Cloudflare ITSELF walled (cf-mitigated, or a
+            #                             CF fingerprint with no origin headers).
+            #   origin_forbidden_count -- 403s the ORIGIN generated (member-restricted content
+            #                             we DO want inventoried), kept out of the wall bucket.
+            #   status_counts          -- full HTTP status histogram, from Scrapy's own stats.
+            "blocking": {
+                "waf_challenge_count": self.stats.get_value("waf_challenge_count", 0),
+                "origin_forbidden_count": self.stats.get_value("origin_forbidden_count", 0),
+                "status_counts": self._status_counts(),
             },
         }
         if final:

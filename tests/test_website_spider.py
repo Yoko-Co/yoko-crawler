@@ -713,6 +713,80 @@ class TestWafChallenge:
         assert "ki-cf-botcl" not in normalized
 
 
+class TestOriginVsChallenge403:
+    """A 403 the ORIGIN generated (member-restricted content) must stay OUT of the bot-wall
+    bucket on Cloudflare-fronted sites, where every response also carries cf-ray/server.
+    cf-mitigated is the reliable challenge signal; an origin fingerprint marks restricted
+    content. (INCOSE's /setdb-login/ returns `403 cf-mitigated: challenge` to a bot.)"""
+
+    def _resp(self, headers, status=403, url="https://example.com/members/"):
+        h = {"Content-Type": "text/html; charset=utf-8"}
+        h.update(headers)
+        return HtmlResponse(url=url, body=b"<html><body>nope</body></html>",
+                            headers=h, request=Request(url), status=status)
+
+    def test_cf_mitigated_is_always_a_challenge(self):
+        spider = WebsiteSpider(domain="example.com")
+        r = self._resp({"cf-ray": "x-EWR", "Server": "cloudflare",
+                        "cf-mitigated": "challenge", "x-powered-by": "ASP.NET"})
+        # Even WITH an origin header, cf-mitigated wins -- CF explicitly walled it.
+        assert spider._is_waf_challenge(r) is True
+
+    def test_cf_fronted_origin_403_with_powered_by_is_not_a_challenge(self):
+        spider = WebsiteSpider(domain="example.com")
+        r = self._resp({"cf-ray": "x-EWR", "Server": "cloudflare", "x-powered-by": "ASP.NET"})
+        assert spider._is_waf_challenge(r) is False
+
+    def test_cf_fronted_origin_403_with_session_cookie_is_not_a_challenge(self):
+        spider = WebsiteSpider(domain="example.com")
+        r = self._resp({"cf-ray": "x-EWR", "Server": "cloudflare",
+                        "Set-Cookie": "ARRAffinity=abc123; Path=/; HttpOnly"})
+        assert spider._is_waf_challenge(r) is False
+
+    def test_cf_wall_403_without_origin_headers_is_a_challenge(self):
+        # A real CF wall carries no origin fingerprint -> still caught by the fallback.
+        spider = WebsiteSpider(domain="example.com")
+        r = self._resp({"cf-ray": "x-EWR", "Server": "cloudflare"})
+        assert spider._is_waf_challenge(r) is True
+
+    def test_cf_own_cookie_is_not_an_origin_fingerprint(self):
+        # __cf_bm is Cloudflare's own cookie -> not an origin signal, so this stays a wall.
+        spider = WebsiteSpider(domain="example.com")
+        r = self._resp({"cf-ray": "x-EWR", "Server": "cloudflare",
+                        "Set-Cookie": "__cf_bm=xyz; Path=/"})
+        assert spider._is_waf_challenge(r) is True
+
+    def test_has_origin_fingerprint_direct(self):
+        spider = WebsiteSpider(domain="example.com")
+        assert spider._has_origin_fingerprint(self._resp({"x-generator": "Drupal 10"}))
+        assert not spider._has_origin_fingerprint(
+            self._resp({"cf-ray": "x-EWR", "Server": "cloudflare"}))
+
+
+class TestForbiddenCounts:
+    """parse() records the challenge-vs-origin split as observable stats."""
+
+    def _counts(self, headers):
+        spider = WebsiteSpider(domain="example.com")
+        spider.crawler = types.SimpleNamespace(stats=_FakeStats())
+        h = {"Content-Type": "text/html"}
+        h.update(headers)
+        resp = HtmlResponse(url="https://example.com/x", body=b"<html></html>",
+                            headers=h, request=Request("https://example.com/x"), status=403)
+        list(spider.parse(resp))
+        return spider.crawler.stats.values
+
+    def test_challenge_403_counts_as_waf_not_origin(self):
+        vals = self._counts({"cf-ray": "x", "Server": "cloudflare", "cf-mitigated": "challenge"})
+        assert vals.get("waf_challenge_count") == 1
+        assert vals.get("origin_forbidden_count") is None
+
+    def test_origin_403_counts_as_forbidden_not_waf(self):
+        vals = self._counts({"cf-ray": "x", "Server": "cloudflare", "x-powered-by": "ASP.NET"})
+        assert vals.get("origin_forbidden_count") == 1
+        assert vals.get("waf_challenge_count") is None
+
+
 class TestObeyLinkDirectives:
     """The crawler follows only links the site permits: rel='nofollow'/'ugc'/'sponsored'
     anchors, pages marked <meta name='robots' content='nofollow'>, and Cloudflare's
