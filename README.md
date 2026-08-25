@@ -188,6 +188,36 @@ the NDJSON to the corpus: see the
 — a self-hosted trusted-IP proxy so the droplet can crawl these itself — is
 [issue #22](https://github.com/Yoko-Co/yoko-crawler/issues/22).
 
+### Bulk URL status checks (standalone)
+
+`check_urls.py` is a standalone helper (no Scrapy) for auditing a list of URLs —
+"do these 404 or redirect?" — through the same browser TLS fingerprint the crawler
+uses, so it gets past Cloudflare where `curl`/`requests` would `403`. Redirects are
+reported, not followed, so a `301`/`302` shows up with its `Location`:
+
+```bash
+python check_urls.py urls.txt -o report.csv        # one URL per line; blanks and # comments ignored
+python check_urls.py urls.txt --impersonate firefox --delay 0.5
+```
+
+Output is a CSV of `url, status, redirect_to, note` (flushed per row, so a
+Ctrl-C mid-run keeps what it has). It reuses `tls_impersonate.CURRENT_TARGETS` /
+`user_agent_for`, so a fingerprint bump there carries over automatically.
+
+Two things make the TLS fingerprint alone insufficient outside Scrapy, and the
+script handles both — replicate them in any standalone probe:
+
+- **Persistent session, not per-request.** Cloudflare `403`s the first
+  *cookie-less* request but sets a `__cf_bm` cookie on that same response; the
+  next request on a session that carries it passes. A fresh
+  `curl_cffi.requests.get()` per URL therefore `403`s *every* time — use one
+  `requests.Session()` across the whole list and **retry once** on `403`/`429`/`503`
+  so the cookie set by the blocked attempt carries into the retry. `__cf_bm` is
+  per-host, so each new domain trips one block, then clears.
+- **GET, not HEAD.** Cloudflare often `403`s a bare `HEAD`; the script defaults to
+  `GET` for this reason (`--method HEAD` is available for lighter checks on
+  permissive hosts).
+
 ### Sample row
 
 ```json
@@ -295,6 +325,7 @@ tls_impersonate.py   # Downloader middleware: browser TLS fingerprint (curl_cffi
 content_extractor.py # Main-content extraction, structural counts, embed signals, content hash
 embed_allowlist.py   # Configurable benign-embed allowlist (surprise-embed signal)
 website_spider.py    # The actual crawler
+check_urls.py        # Standalone bulk URL status->CSV checker (reuses the TLS fingerprint)
 Dockerfile           # python:3.13-slim-bookworm, non-root user
 docker-compose.yml   # Memory limits, healthcheck, security hardening
 nginx/               # Reverse proxy config (TLS, rate limiting)
