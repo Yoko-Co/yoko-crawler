@@ -135,6 +135,18 @@ class TestIsInfraUrl:
         assert spider.is_infra_url("https://example.com/WP-JSON/wp/v2/posts/1")
         assert spider.is_infra_url("https://example.com/XMLRPC.PHP")
 
+    def test_cdn_cgi_content(self, spider):
+        # Cloudflare AI Labyrinth crawler-trap pages live under /cdn-cgi/content.
+        assert spider.is_infra_url(
+            "https://example.com/cdn-cgi/content?id=IBljj_TV_pz3NpmQ5siu07t7"
+        )
+
+    def test_cdn_cgi_email_protection(self, spider):
+        assert spider.is_infra_url("https://example.com/cdn-cgi/l/email-protection")
+
+    def test_cdn_cgi_case_insensitive(self, spider):
+        assert spider.is_infra_url("https://example.com/CDN-CGI/content?id=x")
+
 
 class TestIsInfraUrlFalsePositives:
     """Ensure legitimate pages are not incorrectly flagged as infra URLs."""
@@ -158,6 +170,11 @@ class TestIsInfraUrlFalsePositives:
         assert not spider.is_infra_url("https://example.com/")
         assert not spider.is_infra_url("https://example.com/about")
         assert not spider.is_infra_url("https://example.com/blog/my-post")
+
+    def test_cdn_prefixed_path_not_filtered(self, spider):
+        # A real path that merely starts with "cdn" is not the reserved cdn-cgi segment.
+        assert not spider.is_infra_url("https://example.com/cdn-guide")
+        assert not spider.is_infra_url("https://example.com/blog/cdn-cgi-explained")
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +711,71 @@ class TestWafChallenge:
             "https://example.com/x?ki-cf-botcl=1", exclude_params=spider.exclude_params_emit
         )
         assert "ki-cf-botcl" not in normalized
+
+
+class TestObeyLinkDirectives:
+    """The crawler follows only links the site permits: rel='nofollow'/'ugc'/'sponsored'
+    anchors, pages marked <meta name='robots' content='nofollow'>, and Cloudflare's
+    reserved /cdn-cgi/ path are all left alone. This is what keeps us out of the AI
+    Labyrinth trap and, more broadly, off links the site asked bots not to follow."""
+
+    def _parse(self, body, url="https://example.com/"):
+        spider = WebsiteSpider(domain="example.com")
+        spider.crawler = types.SimpleNamespace(stats=_FakeStats())
+        out = list(spider.parse(_html_response(body=body, url=url)))
+        followed = [o.url for o in out if isinstance(o, Request)]
+        return spider, followed
+
+    def test_rel_nofollow_anchor_skipped(self):
+        body = (b"<html><body>"
+                b"<a href='/keep'>keep</a>"
+                b"<a href='/trap' rel='nofollow'>trap</a>"
+                b"</body></html>")
+        spider, followed = self._parse(body)
+        assert any(u.endswith("/keep") for u in followed)
+        assert not any(u.endswith("/trap") for u in followed)
+        assert spider.crawler.stats.values.get("nofollow_links_skipped") == 1
+
+    def test_nofollow_among_multiple_rel_tokens(self):
+        body = b"<html><body><a href='/x' rel='noopener nofollow'>x</a></body></html>"
+        _, followed = self._parse(body)
+        assert not any(u.endswith("/x") for u in followed)
+
+    def test_ugc_and_sponsored_also_skipped(self):
+        body = (b"<html><body>"
+                b"<a href='/u' rel='ugc'>u</a>"
+                b"<a href='/s' rel='sponsored'>s</a></body></html>")
+        _, followed = self._parse(body)
+        assert followed == []
+
+    def test_meta_robots_nofollow_skips_all_links(self):
+        body = (b"<html><head><meta name='robots' content='noindex, nofollow'></head>"
+                b"<body><a href='/a'>a</a><a href='/b'>b</a></body></html>")
+        spider, followed = self._parse(body)
+        assert followed == []
+        assert spider.crawler.stats.values.get("meta_nofollow_pages") == 1
+
+    def test_meta_robots_none_shorthand_skips_all_links(self):
+        body = (b"<html><head><meta name='ROBOTS' content='none'></head>"
+                b"<body><a href='/a'>a</a></body></html>")
+        _, followed = self._parse(body)
+        assert followed == []
+
+    def test_meta_robots_index_follow_permits_links(self):
+        body = (b"<html><head><meta name='robots' content='index, follow'></head>"
+                b"<body><a href='/a'>a</a></body></html>")
+        _, followed = self._parse(body)
+        assert any(u.endswith("/a") for u in followed)
+
+    def test_cdn_cgi_link_not_scheduled_end_to_end(self):
+        # A plain, followable link into /cdn-cgi/ is still dropped by _schedule's infra gate.
+        body = (b"<html><body>"
+                b"<a href='/cdn-cgi/content?id=abc'>trap</a>"
+                b"<a href='/real'>real</a></body></html>")
+        spider, followed = self._parse(body)
+        assert any(u.endswith("/real") for u in followed)
+        assert not any("/cdn-cgi/" in u for u in followed)
+        assert spider.crawler.stats.values.get("infra_urls_skipped") == 1
 
 
 # ---------- injected cookies (cf_clearance reuse) ----------

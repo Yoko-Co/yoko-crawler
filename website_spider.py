@@ -95,9 +95,14 @@ class WebsiteSpider(scrapy.Spider):
         "auth", "oauth", "oauth2", "sso", "cas", "saml", "adfs",
     }
 
-    # WordPress infrastructure endpoints (machine-only, no redirect value)
+    # CMS/CDN infrastructure endpoints (machine-only, never site content, no redirect
+    # value). `cdn-cgi` is Cloudflare-reserved: nothing under it is the origin's content
+    # -- it fronts AI Labyrinth crawler-trap pages (fake AI-written articles behind
+    # invisible nofollow links), email-obfuscation, image-resizing, and trace endpoints.
+    # Following the Labyrinth is what fingerprints a client as a bot, so we never enter it.
     INFRA_PATH_SEGMENTS = {
         "wp-json", "xmlrpc.php", "wp-cron.php", "trackback",
+        "cdn-cgi",
     }
 
     # Query parameters commonly used for tracking, sessions, or cache busting
@@ -468,7 +473,8 @@ class WebsiteSpider(scrapy.Spider):
         return any(seg in self.LOGIN_PATH_SEGMENTS for seg in segments)
 
     def is_infra_url(self, url: str) -> bool:
-        """Detect WordPress infrastructure endpoints (REST API, XML-RPC, cron, trackback)."""
+        """Detect CMS/CDN infrastructure endpoints (WP REST API, XML-RPC, cron, trackback,
+        and Cloudflare's reserved `/cdn-cgi/` path). Machine-only, never site content."""
         path = (urlparse(url).path or "").lower()
         segments = path.split("/")
         return any(seg in self.INFRA_PATH_SEGMENTS for seg in segments)
@@ -621,6 +627,15 @@ class WebsiteSpider(scrapy.Spider):
         if "html" not in ctype and "xml" not in ctype:
             return
 
+        # Page-level robots directive: <meta name="robots" content="...nofollow..."> (or the
+        # `none` shorthand) means the site asks crawlers not to follow this page's links.
+        # We obey it -- the row is still emitted (the page is real content), we just don't
+        # schedule what it links out to. This is a stated-intent signal, the same class as
+        # rel="nofollow" and robots.txt; honoring it keeps us out of link mazes by design.
+        if self._page_meta_nofollow(response):
+            self.crawler.stats.inc_value("meta_nofollow_pages")
+            return
+
         # Collect a richer set of link sources
         selectors = [
             "a[href]", "area[href]",
@@ -637,11 +652,38 @@ class WebsiteSpider(scrapy.Spider):
                 if href:
                     self.crawler.stats.inc_value("nonnav_hrefs_skipped")
                 continue
+            # rel="nofollow" on the link itself (also "ugc"/"sponsored", which carry the
+            # same do-not-follow intent). Cloudflare's AI Labyrinth links are injected as
+            # invisible nofollow anchors, so honoring this alone keeps us out of the trap --
+            # `cdn-cgi` filtering above is the belt to this page-level suspenders.
+            rel_tokens = (sel.attrib.get("rel") or "").lower().split()
+            if {"nofollow", "ugc", "sponsored"} & set(rel_tokens):
+                self.crawler.stats.inc_value("nofollow_links_skipped")
+                continue
             full_url = response.urljoin(href)
             if self.is_internal(full_url):
                 yield from self._schedule(full_url, referrer_emit=current_emit)
 
     # ---------- Helpers ----------
+
+    def _page_meta_nofollow(self, response) -> bool:
+        """True when the page carries a <meta name="robots" content="..."> directive asking
+        crawlers not to follow its links -- an explicit `nofollow`, or the `none` shorthand
+        (which means noindex,nofollow). Name and content are matched case-insensitively and
+        content is tokenized on commas/whitespace, so `content="NoIndex, NoFollow"` matches.
+        Best-effort: any parse error means "no directive", never a crash."""
+        try:
+            contents = response.xpath("//meta[@name and @content]/@content").getall()
+            names = response.xpath("//meta[@name and @content]/@name").getall()
+        except Exception:
+            return False
+        for name, content in zip(names, contents):
+            if name.strip().lower() != "robots":
+                continue
+            tokens = {t for t in re.split(r"[,\s]+", content.lower()) if t}
+            if "nofollow" in tokens or "none" in tokens:
+                return True
+        return False
 
     def _is_waf_challenge(self, response) -> bool:
         """True when a response is a Cloudflare/WAF bot-wall challenge or block page,
