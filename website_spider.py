@@ -956,9 +956,27 @@ class WebsiteSpider(scrapy.Spider):
             "last_modified": last_modified,
             "redirected_to": redirected_to,
             "referrer": referrer,
+            # Empty on a real (fetched) page; only a deliberately-skipped URL carries a
+            # reason (see _skip_row). Present on every row so the CSV/JSONL shape is stable.
+            "skip_reason": "",
         }
         row.update(self._enrichment(response))
         yield row
+
+    def _skip_row(self, url: str, reason: str, referrer_emit: str | None) -> dict:
+        """A feed row for a URL we deliberately did NOT fetch (issue #43): the URL, a zero
+        status (never fetched), the skip `reason`, and the referrer that linked to it. The
+        corpus routes any row with a non-empty `skip_reason` to its excluded_urls store, so
+        this surfaces as coverage ("auth-gated areas we didn't crawl") without ever being
+        counted, analyzed, or exported as a crawled page."""
+        return {
+            "url": url,
+            "status": 0,
+            "last_modified": "",
+            "redirected_to": "",
+            "referrer": referrer_emit or "",
+            "skip_reason": reason,
+        }
 
     def _schedule(self, url, *, referrer_emit: str | None = None):
         """
@@ -995,6 +1013,11 @@ class WebsiteSpider(scrapy.Spider):
             self.seen.add(seen_key)
             self.crawler.stats.inc_value("login_urls_skipped")
             self.logger.debug("Skipping login/auth URL: %s", normalized)
+            # Emit a skip record (issue #43): we deliberately don't fetch auth/login-gated
+            # URLs, but "we found a members-only area and didn't crawl it" is a real
+            # migration-scoping signal. The corpus routes rows with a `skip_reason` to its
+            # excluded_urls store (never page_versions), so this never counts as a page.
+            yield self._skip_row(normalized, "login_gated", referrer_emit)
             return
 
         if self.is_infra_url(normalized):
