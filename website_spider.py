@@ -26,15 +26,6 @@ from script_allowlist import load_benign_script_hosts
 # (the single source of truth for field names). content_text is handled
 # separately: present only when --emit-content is set.
 
-# Control characters an injected cookie value must never carry into an HTTP header
-# (CR/LF would enable header injection; NUL is invalid in a header).
-_CONTROL_CHARS = str.maketrans("", "", "\r\n\x00")
-
-
-def _strip_controls(value: str) -> str:
-    return value.translate(_CONTROL_CHARS)
-
-
 class WebsiteSpider(scrapy.Spider):
     """
     Internal crawler that:
@@ -219,15 +210,6 @@ class WebsiteSpider(scrapy.Spider):
         self.reach_pagination = str(kwargs.get("reach_pagination", "")).lower() in {"1", "true", "yes"}
         self.include_subdomains = str(kwargs.get("include_subdomains", "")).lower() in {"1", "true", "yes"}
 
-        # Injected cookies: reuse a browser-solved Cloudflare clearance cookie. A raw
-        # Cookie-header string ("cf_clearance=...; __cf_bm=...") is parsed to a dict and
-        # attached to the seed requests; Scrapy's cookie jar (COOKIES_ENABLED default True)
-        # then re-sends them on every followed request to the same domain, so a
-        # cf_clearance cookie carries through the whole crawl. Pair with a matching
-        # --user-agent -- cf_clearance is bound to the UA (and usually the IP) that solved
-        # the challenge, so a mismatched UA (or a different egress IP) is rejected.
-        self.injected_cookies = self._parse_cookie_string(kwargs.get("cookies"))
-
         # Content enrichment options.
         self.emit_content = str(kwargs.get("emit_content", "")).lower() in {"1", "true", "yes"}
         # Needed so iframe_hosts (a list) can be JSON-encoded for CSV output,
@@ -335,25 +317,6 @@ class WebsiteSpider(scrapy.Spider):
                 "Resumed dedup state: %d scheduled, %d emitted URLs carried over",
                 len(self.seen), len(self.emitted),
             )
-
-    @staticmethod
-    def _parse_cookie_string(raw) -> dict:
-        """Parse a raw Cookie-header string ("a=1; b=2") into a {name: value} dict.
-        Tolerant: splits pairs on ';' and each pair on the FIRST '=' (a cookie value can
-        itself contain '=', e.g. base64), trims whitespace, and skips empty/malformed
-        pairs. Control characters (CR/LF/NUL) are stripped from names and values so a
-        crafted value can't inject a header into the outgoing Cookie header (defense in
-        depth; the download handler also validates). Returns {} for None/empty input."""
-        cookies = {}
-        for part in str(raw or "").split(";"):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            name, value = part.split("=", 1)
-            name = _strip_controls(name).strip()
-            if name:
-                cookies[name] = _strip_controls(value).strip()
-        return cookies
 
     # ---------- URL helpers ----------
 
@@ -498,18 +461,13 @@ class WebsiteSpider(scrapy.Spider):
         the seeding entry point, our method became unreachable, and nothing failed -- no
         exception, no test, no log line. A crawl seeded by Scrapy's default instead of this
         method reports 0 here, which `stats_extension` turns into a loud error."""
-        # Seed the cookie jar with any injected cookies (e.g. a browser-solved
-        # cf_clearance): setting them on the seed requests lets Scrapy's CookiesMiddleware
-        # re-attach them to every followed request to the same domain automatically.
-        cookies = self.injected_cookies or None
         for url in self.start_urls:
             self._stat("seeding/seeds_emitted")
-            yield scrapy.Request(url, callback=self.parse, cookies=cookies)
+            yield scrapy.Request(url, callback=self.parse)
         self._stat("seeding/seeds_emitted")
         yield scrapy.Request(
             urljoin(self.start_urls[0], "/robots.txt"),
             callback=self.parse_robots,
-            cookies=cookies,
         )
 
     async def start(self):
@@ -518,16 +476,14 @@ class WebsiteSpider(scrapy.Spider):
         REQUIRED, not optional (issue #52 review). Scrapy 2.13 replaced `start_requests()`
         with `async def start()`, and 2.17 removed the base `Spider.start_requests` and every
         call site -- so on the installed Scrapy our `start_requests` below was DEAD CODE and
-        the default `Spider.start()` (start_urls only, no cookies, no robots.txt) was seeding
-        instead. Verified by instrumenting a real Crawler: `start_requests()` never ran, the
-        seed carried `cookies={}`, and no crawl in the archive ever fetched robots.txt.
+        the default `Spider.start()` (start_urls only, no robots.txt) was seeding instead.
+        Verified by instrumenting a real Crawler: `start_requests()` never ran and no crawl in
+        the archive ever fetched robots.txt.
 
-        Two silent regressions came from that, both pre-dating this branch: injected
-        cf_clearance cookies were never attached, so the entire bot-block retry path (the
-        SPA's "Retry with a browser cookie") did nothing; and robots.txt -> sitemap discovery
-        never ran, so the crawler was link-following only and never saw sitemap-only or
-        orphaned pages. `requirements.txt` pinned `scrapy>=2.11` with no upper bound, so an
-        ordinary dependency upgrade broke both without a single test failing.
+        The silent regression that caused: robots.txt -> sitemap discovery never ran, so the
+        crawler was link-following only and never saw sitemap-only or orphaned pages.
+        `requirements.txt` pinned `scrapy>=2.11` with no upper bound, so an ordinary dependency
+        upgrade broke it without a single test failing.
         """
         for request in self._seed_requests():
             yield request
