@@ -1289,6 +1289,28 @@ class TestStructureHash:
                           b"<section><table><tr><td>z</td></tr></table></section></main>")
         assert len({listing, article, landing}) == 3
 
+    def test_prose_variation_does_not_split_template(self):
+        # issue #35: a newsletter/article issue that adds a subheading or an extra paragraph is
+        # the SAME post type -- prose-block count/mix (p/hN/blockquote/pre/hr) must not split it.
+        # (Validated against openprimaries.org's Primary Buzz series: 7 -> 4 distinct hashes.)
+        plain = b"<main><article><h1>T</h1><p>a</p><p>b</p><p>c</p></article></main>"
+        richer = (b"<main><article><h1>T</h1><p>a</p><h2>sub</h2><p>b</p>"
+                  b"<blockquote>q</blockquote><p>c</p></article></main>")
+        assert self._h(plain) == self._h(richer)
+
+    def test_distinctive_block_still_splits_template(self):
+        # The safe direction: prose collapses, but a real structural difference (a table)
+        # still splits -- so we never MERGE genuinely distinct templates.
+        prose = b"<main><article><h1>T</h1><p>a</p><p>b</p></article></main>"
+        with_table = b"<main><article><h1>T</h1><p>a</p><table><tr><td>x</td></tr></table><p>b</p></article></main>"
+        assert self._h(prose) != self._h(with_table)
+
+    def test_list_layout_stays_distinct_from_prose(self):
+        # ul/ol are deliberately NOT prose: a bulleted-list layout is a real discriminator.
+        prose = b"<main><article><h1>T</h1><p>a</p><p>b</p></article></main>"
+        with_list = b"<main><article><h1>T</h1><p>a</p><ul><li>x</li><li>y</li></ul></article></main>"
+        assert self._h(prose) != self._h(with_list)
+
     def test_wrapper_chains_do_not_false_merge(self):
         # Regression: real themes/builders wrap content in div#page > div.site-inner >
         # div.builder > main. The fingerprint must skip chrome + unwrap to the content root,

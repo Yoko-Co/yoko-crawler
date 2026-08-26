@@ -254,6 +254,18 @@ def content_hash(normalized_text: str) -> str:
 
 # Coarse structural fingerprint (issue #36) -- clusters pages into distinct TEMPLATES.
 _SKELETON_MAX_DEPTH = 4
+# Prose block tags (issue #35): text blocks whose COUNT and MIX vary with the writing, not the
+# template -- a weekly newsletter where one issue adds a subheading or an extra paragraph is the
+# SAME post type, yet the old consecutive-run collapse split it (an `h2` between paragraphs
+# breaks the run). Each of these collapses to a single opaque `prose` token (its own subtree is
+# NOT recursed), so any run of mixed p/hN/blockquote/pre/hr fingerprints identically regardless
+# of how the author arranged it. DISTINCTIVE blocks (table, form, figure, ul/ol, section, aside,
+# div, iframe, img-wrappers) stay granular, so a table-vs-no-table or list-vs-prose difference
+# still splits -- the safe direction. `ul`/`ol` are deliberately excluded: a list layout is a
+# real template discriminator, not free-form prose.
+_PROSE_BLOCK_TAGS = frozenset({
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "hr",
+})
 # Inline / text-carrying tags dropped from the skeleton: they are content, not layout, so
 # keeping them would let content differences split pages of the same template.
 _SKELETON_SKIP_TAGS = frozenset({
@@ -398,16 +410,25 @@ def _semantic_content_roots(body_el: etree._Element) -> list:
 
 def _skeleton(el: etree._Element, depth: int) -> str:
     """A depth-limited, content-free string of ``el``'s structural children (chrome + inline
-    excluded). Consecutive identical child tokens (tag + their own subtree) collapse to one, so
-    a listing of 10 vs 12 identical items -- or a gallery with N images -- produces the SAME
-    skeleton. Text and attributes are dropped entirely."""
+    excluded). Two collapses keep content variation out of the fingerprint: (1) each prose
+    block (`_PROSE_BLOCK_TAGS`: p/hN/blockquote/pre/hr) becomes one opaque `prose` token, so an
+    extra paragraph or subheading can't split a template (issue #35); (2) consecutive identical
+    tokens fold to one, so a listing of 10 vs 12 identical cards -- or a gallery with N images --
+    produces the SAME skeleton. Text and attributes are dropped entirely."""
     if depth > _SKELETON_MAX_DEPTH:
         return ""
     parts: list[str] = []
     prev: str | None = None
     for child in _structural_children(el):
-        sub = _skeleton(child, depth + 1)
-        token = f"{child.tag.lower()}({sub})" if sub else child.tag.lower()
+        tag = child.tag.lower()
+        if tag in _PROSE_BLOCK_TAGS:
+            # A text block: collapse to one opaque `prose` token, ignoring its subtree, so an
+            # extra paragraph/subheading can't split a template (issue #35). Consecutive `prose`
+            # tokens then fold into one via the run collapse below.
+            token = "prose"
+        else:
+            sub = _skeleton(child, depth + 1)
+            token = f"{tag}({sub})" if sub else tag
         if token != prev:  # collapse consecutive identical runs (repeated cards / list items)
             parts.append(token)
             prev = token
@@ -417,8 +438,9 @@ def _skeleton(el: etree._Element, depth: int) -> str:
 def structure_hash(body_el: etree._Element) -> str:
     """A content-independent fingerprint of the page's coarse LAYOUT skeleton (issue #36):
     the block-level tag tree of the CONTENT ROOT (chrome and wrapper boilerplate skipped),
-    depth-limited, with consecutive identical sibling-runs collapsed and all text/attributes
-    dropped. Pass the full <body> -- it locates the content root itself, and unlike the
+    depth-limited, with prose blocks collapsed to one `prose` token (issue #35) and consecutive
+    identical sibling-runs collapsed, all text/attributes dropped. Pass the full <body> -- it
+    locates the content root itself, and unlike the
     trafilatura-located region the body is content-length-stable. Pages built from the same
     template hash identically regardless of their content or how many items they list -- so
     downstream can cluster pages into "N pages across ~M distinct templates".
