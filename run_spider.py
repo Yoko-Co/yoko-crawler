@@ -183,6 +183,14 @@ def build_settings(args):
         },
     }
 
+    # Forward-proxy egress (issue #22): route every request through --proxy by setting
+    # request.meta["proxy"], which both download handlers honor. Registered AFTER the SSRF
+    # guard (90) so the guard still resolves + vets the TARGET host first -- the proxy is
+    # transport only. Absent --proxy -> ProxyMiddleware NotConfigured, byte-identical crawl.
+    if args.proxy:
+        settings["YOKO_CRAWL_PROXY"] = args.proxy
+        settings["DOWNLOADER_MIDDLEWARES"]["proxy_middleware.ProxyMiddleware"] = 100
+
     # Resumable crawl: Scrapy persists the request frontier + dupefilter to JOBDIR and,
     # on a re-launch with the same dir, resumes -- skipping already-seen URLs and
     # continuing the pending frontier -- instead of re-crawling from the seed (Phase C).
@@ -285,6 +293,16 @@ def main():
             "Chrome UA for standard crawls. When --impersonate is set, leave this "
             "unset so the impersonated browser supplies a matching UA; pass it "
             "only to deliberately override that."
+        ),
+    )
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        help=(
+            "Route every request through this forward proxy (issue #22): an "
+            "http(s):// CONNECT proxy or a socks5:// proxy, optionally with "
+            "user:pass@ auth. The trusted residential-IP egress used only on a "
+            "bot-block retry. The SSRF guard still vets the target host."
         ),
     )
     parser.add_argument(

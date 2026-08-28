@@ -21,9 +21,25 @@ def make_args(**overrides):
         emit_content=False,
         profile="standard",
         jobdir=None,
+        proxy=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_proxy_registers_middleware_and_setting():
+    s = build_settings(make_args(proxy="http://user:pass@box:8080"))
+    assert s["YOKO_CRAWL_PROXY"] == "http://user:pass@box:8080"
+    mw = s["DOWNLOADER_MIDDLEWARES"]
+    assert mw["proxy_middleware.ProxyMiddleware"] == 100
+    # After the SSRF guard, so the target host is still vetted before the proxy hop.
+    assert mw["ssrf_guard.SsrfGuardMiddleware"] < mw["proxy_middleware.ProxyMiddleware"]
+
+
+def test_no_proxy_leaves_settings_clean():
+    s = build_settings(make_args())
+    assert "YOKO_CRAWL_PROXY" not in s
+    assert "proxy_middleware.ProxyMiddleware" not in s["DOWNLOADER_MIDDLEWARES"]
 
 
 def test_no_jobdir_setting_by_default():

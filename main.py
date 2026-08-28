@@ -158,14 +158,29 @@ class CrawlRequest(BaseModel):
     reset: bool = False
     # Override the User-Agent on every request (e.g. to match a specific browser build).
     user_agent: str | None = Field(default=None, max_length=512)
+    # Route every request through this forward proxy (issue #22): the trusted residential-IP
+    # egress the corpus passes ONLY on a bot-block retry, so an IP-blocked prospect leaves from
+    # an IP Yoko controls. Transport only -- the SSRF guard still resolves the TARGET host.
+    proxy: str | None = Field(default=None, max_length=2048)
 
-    @field_validator("user_agent")
+    @field_validator("user_agent", "proxy")
     @classmethod
     def _reject_control_chars(cls, v: str | None) -> str | None:
-        """A CR/LF/NUL in the UA could inject a header downstream (it feeds the User-Agent
-        header). Reject rather than silently mangle, so a caller sees the bad input."""
+        """A CR/LF/NUL could inject a header / mangle the proxy URL downstream. Reject rather
+        than silently mangle, so a caller sees the bad input."""
         if v is not None and any(c in v for c in "\r\n\x00"):
             raise ValueError("must not contain control characters (CR, LF, or NUL)")
+        return v
+
+    @field_validator("proxy")
+    @classmethod
+    def _proxy_scheme(cls, v: str | None) -> str | None:
+        """Only a real forward-proxy URL scheme -- http(s) CONNECT proxy or SOCKS -- so a
+        bad value can't be smuggled into curl's proxy option as something else."""
+        if v is not None and not v.startswith(
+            ("http://", "https://", "socks5://", "socks5h://", "socks4://", "socks4a://")
+        ):
+            raise ValueError("must be an http(s):// or socks5:///socks4:// proxy URL")
         return v
 
 
@@ -198,6 +213,7 @@ async def start_crawl(request: CrawlRequest):
             resumable=request.resumable,
             reset=request.reset,
             user_agent=request.user_agent,
+            proxy=request.proxy,
         )
     except ConcurrencyLimitError:
         raise HTTPException(

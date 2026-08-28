@@ -209,6 +209,27 @@ class TestJobManager:
         args = mock_exec.call_args.args
         assert args[args.index("--user-agent") + 1] == "Mozilla/5.0 X"
 
+    async def test_proxy_passed_on_argv(self):
+        # issue #22: a job's proxy is passed to the crawler subprocess as --proxy.
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job("example.com", proxy="http://user:pass@box:8080")
+        assert job.proxy == "http://user:pass@box:8080"
+        args = mock_exec.call_args.args
+        assert args[args.index("--proxy") + 1] == "http://user:pass@box:8080"
+
+    async def test_no_proxy_flag_by_default(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            await jm.start_job("example.com")
+        assert "--proxy" not in mock_exec.call_args.args
+
     async def test_no_user_agent_flag_by_default(self):
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process()
