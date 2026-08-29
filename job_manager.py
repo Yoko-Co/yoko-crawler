@@ -307,8 +307,12 @@ class JobManager:
         # UA override (not a secret) rides on argv; passed only when set.
         if job.user_agent:
             cmd += ["--user-agent", job.user_agent]
-        if job.proxy:
-            cmd += ["--proxy", job.proxy]
+
+        # The proxy URL can embed credentials (user:pass@), so it must NOT ride on argv --
+        # argv is world-readable via `ps` / /proc/<pid>/cmdline. Hand it to the child in the
+        # environment instead; run_spider reads YOKO_CRAWL_PROXY and validates + SSRF-vets it
+        # before use (issue #22). env=None inherits the parent environment unchanged.
+        proc_env = {**os.environ, "YOKO_CRAWL_PROXY": job.proxy} if job.proxy else None
 
         try:
             job.process = await asyncio.create_subprocess_exec(
@@ -316,6 +320,7 @@ class JobManager:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=log_fh,
                 cwd=str(Path(__file__).parent),
+                env=proc_env,
             )
         except Exception:
             log_fh.close()

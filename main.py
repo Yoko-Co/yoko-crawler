@@ -16,8 +16,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from urllib.parse import urlparse
+
 from auth import verify_api_key
-from domain_validator import DomainValidationError, validate_domain
+from domain_validator import (
+    DomainValidationError,
+    host_resolves_to_blocked,
+    validate_domain,
+)
 from job_manager import (
     ConcurrencyLimitError,
     DomainAlreadyCrawlingError,
@@ -200,6 +206,25 @@ async def start_crawl(request: CrawlRequest):
         # (consumers still read it); a JSONResponse keeps that shape (a dict HTTPException
         # detail would nest it under `detail`).
         return JSONResponse(status_code=422, content={"detail": str(e), "code": e.code})
+
+    # Vet the proxy host too (issue #22). The SSRF guard covers the crawl TARGET, but the proxy
+    # is a second outbound destination: without this, an authenticated caller could point `proxy`
+    # at an internal address (169.254.169.254, 10.x, ...) and make the crawler open connections
+    # into the private network. Reject up front with a clean 422 rather than spawning a job that
+    # then connects to an internal host. Resolution runs off the event loop; run_spider re-vets
+    # the same value at the subprocess boundary as defense-in-depth for non-API callers.
+    if request.proxy:
+        proxy_host = urlparse(request.proxy).hostname
+        if proxy_host and await asyncio.get_event_loop().run_in_executor(
+            None, host_resolves_to_blocked, proxy_host
+        ):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": f"proxy host {proxy_host} resolves to a private or reserved address",
+                    "code": "proxy_private_address",
+                },
+            )
 
     jm: JobManager = app.state.job_manager
 

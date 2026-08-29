@@ -347,7 +347,8 @@ class TestStartCrawl:
         assert response.status_code == 422
 
     async def test_start_crawl_forwards_proxy(self, client, auth_headers):
-        # issue #22: a proxy in the body rides to the subprocess as --proxy.
+        # issue #22: a proxy in the body reaches the subprocess in the environment
+        # (YOKO_CRAWL_PROXY), never on argv -- embedded creds must not leak via `ps`.
         mock_process = AsyncMock()
         mock_process.returncode = None
         mock_process.pid = 12345
@@ -369,8 +370,27 @@ class TestStartCrawl:
                 headers=auth_headers,
             )
         assert response.status_code == 202
-        args = mock_exec.call_args.args
-        assert args[args.index("--proxy") + 1] == "http://user:pass@box:8080"
+        assert "--proxy" not in mock_exec.call_args.args
+        assert mock_exec.call_args.kwargs["env"]["YOKO_CRAWL_PROXY"] == "http://user:pass@box:8080"
+
+    async def test_start_crawl_rejects_proxy_host_resolving_to_private_address(
+        self, client, auth_headers
+    ):
+        # issue #22: the SSRF guard vets the crawl TARGET; the proxy is a second outbound
+        # destination. A proxy host pointing at an internal address must 422 (proxy_private_address),
+        # not spawn a job that connects into the private network.
+        with patch("domain_validator.asyncio.get_running_loop") as mock_loop, \
+             patch("main.host_resolves_to_blocked", return_value=True):
+            mock_loop.return_value.getaddrinfo = AsyncMock(
+                return_value=[(2, 1, 6, "", ("93.184.216.34", 443))]
+            )
+            response = await client.post(
+                "/crawl",
+                json={"domain": "example.com", "proxy": "http://169.254.169.254:8080"},
+                headers=auth_headers,
+            )
+        assert response.status_code == 422
+        assert response.json().get("code") == "proxy_private_address"
 
     async def test_start_crawl_rejects_non_proxy_scheme(self, client, auth_headers):
         # A non-proxy scheme (e.g. file://) must 422, not reach the subprocess.
