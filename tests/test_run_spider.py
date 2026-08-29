@@ -4,6 +4,9 @@ import os
 import subprocess
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 
 from run_spider import build_settings
 
@@ -21,9 +24,54 @@ def make_args(**overrides):
         emit_content=False,
         profile="standard",
         jobdir=None,
+        proxy=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_proxy_registers_middleware_and_setting(monkeypatch):
+    monkeypatch.delenv("YOKO_CRAWL_PROXY", raising=False)
+    s = build_settings(make_args(proxy="http://user:pass@box:8080"))
+    assert s["YOKO_CRAWL_PROXY"] == "http://user:pass@box:8080"
+    mw = s["DOWNLOADER_MIDDLEWARES"]
+    assert mw["proxy_middleware.ProxyMiddleware"] == 100
+    # After the SSRF guard, so the target host is still vetted before the proxy hop.
+    assert mw["ssrf_guard.SsrfGuardMiddleware"] < mw["proxy_middleware.ProxyMiddleware"]
+
+
+def test_no_proxy_leaves_settings_clean(monkeypatch):
+    monkeypatch.delenv("YOKO_CRAWL_PROXY", raising=False)
+    s = build_settings(make_args())
+    assert "YOKO_CRAWL_PROXY" not in s
+    assert "proxy_middleware.ProxyMiddleware" not in s["DOWNLOADER_MIDDLEWARES"]
+
+
+def test_proxy_read_from_env_when_no_flag(monkeypatch):
+    # The job manager hands the proxy to the subprocess in YOKO_CRAWL_PROXY (off argv, so
+    # embedded creds don't leak via `ps`); build_settings must honor it with no --proxy flag.
+    monkeypatch.setenv("YOKO_CRAWL_PROXY", "http://user:pass@box:8080")
+    s = build_settings(make_args(proxy=None))
+    assert s["YOKO_CRAWL_PROXY"] == "http://user:pass@box:8080"
+    assert s["DOWNLOADER_MIDDLEWARES"]["proxy_middleware.ProxyMiddleware"] == 100
+
+
+def test_proxy_host_resolving_to_private_address_is_rejected(monkeypatch):
+    # Defense-in-depth for non-API callers: a proxy pointing at an internal host must abort the
+    # crawl here, not route egress through the private network. Fail closed (raise), never fall
+    # back to a direct fetch.
+    monkeypatch.delenv("YOKO_CRAWL_PROXY", raising=False)
+    with patch("run_spider.host_resolves_to_blocked", return_value=True):
+        with pytest.raises(ValueError, match="private/reserved"):
+            build_settings(make_args(proxy="http://169.254.169.254:8080"))
+
+
+def test_proxy_bad_scheme_rejected_at_subprocess_boundary(monkeypatch):
+    # The scheme allowlist is re-applied here, not only in the API model, so a scripted/direct
+    # invocation can't smuggle a non-proxy URL (file://, gopher://) into curl's proxy option.
+    monkeypatch.delenv("YOKO_CRAWL_PROXY", raising=False)
+    with pytest.raises(ValueError, match="scheme"):
+        build_settings(make_args(proxy="file:///etc/passwd"))
 
 
 def test_no_jobdir_setting_by_default():

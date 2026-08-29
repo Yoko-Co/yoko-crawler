@@ -209,6 +209,34 @@ class TestJobManager:
         args = mock_exec.call_args.args
         assert args[args.index("--user-agent") + 1] == "Mozilla/5.0 X"
 
+    async def test_proxy_passed_via_env_not_argv(self):
+        # issue #22: a proxy URL can carry credentials, so it is handed to the subprocess in
+        # the environment (YOKO_CRAWL_PROXY), NOT on argv where `ps` would expose it.
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            job = await jm.start_job("example.com", proxy="http://user:pass@box:8080")
+        assert job.proxy == "http://user:pass@box:8080"
+        # Never on argv (the whole point -- creds must not be world-readable via `ps`).
+        assert "--proxy" not in mock_exec.call_args.args
+        assert "http://user:pass@box:8080" not in mock_exec.call_args.args
+        # Delivered in the child's environment instead.
+        env = mock_exec.call_args.kwargs["env"]
+        assert env["YOKO_CRAWL_PROXY"] == "http://user:pass@box:8080"
+
+    async def test_no_proxy_flag_by_default(self):
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process()
+        with patch(
+            "job_manager.asyncio.create_subprocess_exec", return_value=proc
+        ) as mock_exec:
+            await jm.start_job("example.com")
+        assert "--proxy" not in mock_exec.call_args.args
+        # env=None -> the subprocess inherits the parent environment unchanged (no proxy).
+        assert mock_exec.call_args.kwargs.get("env") is None
+
     async def test_no_user_agent_flag_by_default(self):
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process()
@@ -218,8 +246,8 @@ class TestJobManager:
             await jm.start_job("example.com")
         args = mock_exec.call_args.args
         assert "--cookies" not in args and "--user-agent" not in args
-        # No custom env is passed: the subprocess inherits the parent environment.
-        assert "env" not in mock_exec.call_args.kwargs
+        # No proxy -> env=None, so the subprocess inherits the parent environment unchanged.
+        assert mock_exec.call_args.kwargs.get("env") is None
 
     async def test_profile_and_emit_content_passed_to_subprocess(self):
         jm = JobManager(max_concurrent=3)

@@ -15,10 +15,13 @@ import time
 
 from scrapy.crawler import CrawlerProcess
 
+from urllib.parse import urlparse
+
 from content_extractor import ENRICHMENT_FIELD_NAMES
 from domain_validator import (
     DomainValidationError,
     check_resolution_sync,
+    host_resolves_to_blocked,
     validate_domain_format,
 )
 from stats_extension import ProgressWriter
@@ -108,6 +111,30 @@ def reset_incompatible_jobdir(jobdir, *, disk_queue: str) -> bool:
     return True
 
 
+# Accepted forward-proxy URL schemes -- must match main.py's CrawlRequest validator so a value
+# that isn't a real proxy URL can't be smuggled into curl's proxy option as file://, gopher://, etc.
+_PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://", "socks4://", "socks4a://")
+
+
+def _validate_proxy(proxy: str) -> None:
+    """Re-validate the effective proxy at the crawl subprocess's OWN trust boundary -- the single
+    point both the API (via the YOKO_CRAWL_PROXY env var) and the CLI (--proxy) funnel through --
+    so the scheme allowlist and SSRF host check hold no matter who launched us (issue #22). The
+    API validates too, but this guarantees a direct/scripted invocation can't bypass it. Fail
+    closed: a requested-but-invalid proxy raises here, aborting the crawl, so we never silently
+    fall back to a direct (droplet-IP) fetch when a proxy was asked for."""
+    if any(c in proxy for c in "\r\n\x00"):
+        raise ValueError("proxy must not contain control characters (CR, LF, or NUL)")
+    if not proxy.startswith(_PROXY_SCHEMES):
+        raise ValueError(f"proxy scheme must be one of {_PROXY_SCHEMES}")
+    host = urlparse(proxy).hostname
+    if host and host_resolves_to_blocked(host):
+        raise ValueError(
+            f"proxy host {host!r} resolves to a private/reserved address -- refusing to route "
+            "egress through an internal host"
+        )
+
+
 def build_settings(args):
     """Assemble the Scrapy settings dict for a crawl (pure, so it's testable)."""
     feed_fields = list(BASE_FEED_FIELDS)
@@ -182,6 +209,20 @@ def build_settings(args):
             "ssrf_guard.SsrfGuardMiddleware": 90,
         },
     }
+
+    # Forward-proxy egress (issue #22): route every request through the proxy by setting
+    # request.meta["proxy"], which both download handlers honor. Registered AFTER the SSRF
+    # guard (90) so the guard still resolves + vets the TARGET host first -- the proxy is
+    # transport only. The value arrives either on --proxy (local/CLI) or, from the job manager,
+    # in the YOKO_CRAWL_PROXY env var (kept off argv so embedded creds aren't world-readable via
+    # `ps`). Validate + SSRF-vet it HERE, the one place both paths converge, before installing
+    # the middleware; a bad value raises so the subprocess exits rather than crawling direct.
+    # Absent a proxy -> ProxyMiddleware NotConfigured, byte-identical crawl.
+    proxy = getattr(args, "proxy", None) or os.environ.get("YOKO_CRAWL_PROXY")
+    if proxy:
+        _validate_proxy(proxy)
+        settings["YOKO_CRAWL_PROXY"] = proxy
+        settings["DOWNLOADER_MIDDLEWARES"]["proxy_middleware.ProxyMiddleware"] = 100
 
     # Resumable crawl: Scrapy persists the request frontier + dupefilter to JOBDIR and,
     # on a re-launch with the same dir, resumes -- skipping already-seen URLs and
@@ -285,6 +326,16 @@ def main():
             "Chrome UA for standard crawls. When --impersonate is set, leave this "
             "unset so the impersonated browser supplies a matching UA; pass it "
             "only to deliberately override that."
+        ),
+    )
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        help=(
+            "Route every request through this forward proxy (issue #22): an "
+            "http(s):// CONNECT proxy or a socks5:// proxy, optionally with "
+            "user:pass@ auth. The trusted residential-IP egress used only on a "
+            "bot-block retry. The SSRF guard still vets the target host."
         ),
     )
     parser.add_argument(

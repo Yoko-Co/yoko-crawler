@@ -79,6 +79,7 @@ Request body:
 | `profile` | enum | `standard` | `standard` or `presale`. `presale` is a politer bundle (serial, ≥3s delay) for prospect sites you don't control. Never relaxes SSRF/domain validation. |
 | `emit_content` | bool | `false` | When `true`, each HTML page's extracted main-content text is included in a `content_text` field. Off keeps output lean; the content hash and structural counts are emitted regardless. |
 | `user_agent` | string | — | Override the `User-Agent` on every request (≤512 chars). Survives `impersonate` (pass it only to deliberately override the impersonated browser's UA). |
+| `proxy` | string | — | Route every request through a forward proxy — an `http(s)://` CONNECT proxy or a `socks5://` proxy, optionally with `user:pass@` auth (≤2048 chars). The trusted residential-IP egress for IP-blocked sites (issue #22); the corpus passes it only on a bot-block retry. Transport only — the SSRF guard still resolves and vets the target host before the proxy hop, and the proxy host itself is rejected if it resolves to a private/reserved address. Delivered to the crawl subprocess in the environment, never on argv, so embedded credentials aren't exposed via `ps`. |
 
 Response `202`:
 

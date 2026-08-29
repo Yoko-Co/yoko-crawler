@@ -78,6 +78,8 @@ class Job:
     resumable: bool = False
     # User-Agent override sent with every request (e.g. a specific browser build).
     user_agent: str | None = None
+    # Forward-proxy URL for a bot-block retry (issue #22); None for a normal crawl.
+    proxy: str | None = None
     started_at: float = field(default_factory=time.time)
     status: str = "queued"  # queued, running, completed, failed
     error: str | None = None
@@ -178,6 +180,7 @@ class JobManager:
         resumable: bool = False,
         reset: bool = False,
         user_agent: str | None = None,
+        proxy: str | None = None,
     ) -> Job:
         """
         Start a new crawl job for the given domain.
@@ -194,7 +197,8 @@ class JobManager:
         that pauses at the session cap RESUMES on the next run instead of re-fetching
         from the seed (Phase C). ``reset`` discards any existing JOBDIR first, forcing
         a fresh scan (e.g. a "request fresh crawl" that must re-detect changes).
-        ``user_agent`` overrides the User-Agent sent on every request.
+        ``user_agent`` overrides the User-Agent sent on every request. ``proxy`` routes
+        every request through a forward proxy (the trusted-IP egress, issue #22).
         """
         if profile not in VALID_PROFILES:
             raise ValueError(f"invalid profile: {profile!r}")
@@ -230,6 +234,7 @@ class JobManager:
                 emit_content=emit_content,
                 resumable=resumable,
                 user_agent=user_agent,
+                proxy=proxy,
             )
             self._jobs[job_id] = job
 
@@ -303,12 +308,19 @@ class JobManager:
         if job.user_agent:
             cmd += ["--user-agent", job.user_agent]
 
+        # The proxy URL can embed credentials (user:pass@), so it must NOT ride on argv --
+        # argv is world-readable via `ps` / /proc/<pid>/cmdline. Hand it to the child in the
+        # environment instead; run_spider reads YOKO_CRAWL_PROXY and validates + SSRF-vets it
+        # before use (issue #22). env=None inherits the parent environment unchanged.
+        proc_env = {**os.environ, "YOKO_CRAWL_PROXY": job.proxy} if job.proxy else None
+
         try:
             job.process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=log_fh,
                 cwd=str(Path(__file__).parent),
+                env=proc_env,
             )
         except Exception:
             log_fh.close()

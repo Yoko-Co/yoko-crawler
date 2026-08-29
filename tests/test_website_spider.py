@@ -1331,7 +1331,7 @@ class TestBreadthFirstOrdering:
         import argparse, run_spider
         args = argparse.Namespace(output="o.jsonl", format="jsonlines", emit_content=False,
                                   user_agent=None, delay=1.0, profile="presale",
-                                  status_file="s.json", impersonate="off", jobdir=None)
+                                  status_file="s.json", impersonate="off", jobdir=None, proxy=None)
         for k, v in over.items():
             setattr(args, k, v)
         return run_spider.build_settings(args)
@@ -1498,7 +1498,7 @@ class TestJobdirFormatMigration:
         args = argparse.Namespace(output="o.jsonl", format="jsonlines", emit_content=False,
                                   user_agent=None, delay=1.0, profile="presale",
                                   status_file="s.json", impersonate="off",
-                                  jobdir=jobdir)
+                                  jobdir=jobdir, proxy=None)
         settings = build_settings(args)
         assert settings["JOBDIR"] == jobdir
         assert not (tmp_path / "requests.queue").exists()
