@@ -116,6 +116,24 @@ class ProgressWriter:
                 "installed Scrapy against the pin in requirements.txt."
             )
 
+        # Phase-two seeding tripwire (issue #76). Seeding is no longer one atomic event:
+        # the spider seeds robots.txt, and the START URLS are emitted from its callback once
+        # the Disallow rules are final. So "seeding ran" is no longer proved by a non-zero
+        # seeds_emitted -- phase one can succeed while phase two never happens (an unbounded
+        # robots.txt redirect chain, an exception in the callback, a request lost to a
+        # middleware that neither calls back nor errbacks). The signature is robots fetched,
+        # start URLs never emitted, and the crawl closing "completed" with a one-row
+        # inventory -- the most deceptive shape available, so it gets its own loud error.
+        if self.stats.get_value("seeding/seeds_emitted", 0) > 0 and \
+                self.stats.get_value("seeding/start_urls_emitted", 0) == 0:
+            logger.error(
+                "SEEDING STOPPED AFTER ROBOTS.TXT: the crawl fetched robots.txt but never "
+                "emitted its start URL, so it inventoried nothing. Any page count in this "
+                "crawl is robots.txt itself, NOT the site -- do not read it as an inventory. "
+                "Usually an unterminated robots.txt redirect chain or an error in "
+                "parse_robots; re-run and check the robots.txt of the target."
+            )
+
         self._write_status(
             status, error=error, final=True, close_reason=reason, failure_reason=failure_reason
         )
@@ -152,11 +170,21 @@ class ProgressWriter:
             # stopped -- for months, with no exception, no failing test and no log line.
             # A crawl seeded by anything other than our own method reports 0 here.
             # `robots_fetched` separates "the site lists no sitemap" (robots fetched,
-            # sitemaps 0) from "we never asked" (robots 0).
+            # sitemaps 0) from "we never asked" (robots 0) -- and since #76 a third case,
+            # "we asked and the transport failed", which `robots_failed` distinguishes.
             "seeding": {
                 "seeds_emitted": self.stats.get_value("seeding/seeds_emitted", 0),
                 "robots_fetched": self.stats.get_value("seeding/robots_fetched", 0),
                 "sitemaps_fetched": self.stats.get_value("seeding/sitemaps_fetched", 0),
+                # Seeding is two-phase since #76 (robots.txt, THEN the start URLs from its
+                # callback). A crawl with seeds_emitted > 0 but start_urls_emitted == 0
+                # fetched robots.txt and nothing else -- see the tripwire below.
+                "start_urls_emitted": self.stats.get_value("seeding/start_urls_emitted", 0),
+                # Non-zero means robots.txt could not be FETCHED (DNS/refused/timeout) and
+                # the crawl ran allow-all. Without this, `robots_fetched: 0` is ambiguous
+                # between "the seeder never ran" and "we asked and the network refused" --
+                # and the crawl's robots posture is unrecoverable after the fact.
+                "robots_failed": self.stats.get_value("seeding/robots_failed", 0),
             },
             # Block/restriction observability. These are OBSERVED counts, NOT a verdict: on a
             # Cloudflare-fronted site a single 403 can be both a bot challenge and a login page

@@ -261,7 +261,7 @@ When main-content extraction fails, `content_hash` is computed over the normaliz
 
 The bundled spider (`website_spider.py`) does comprehensive URL discovery:
 
-- Seeds from robots.txt sitemaps, then follows internal links — obeying robots.txt `Disallow`/`Crawl-delay`, `rel=nofollow`, and `<meta name=robots>` (issues #57/#59)
+- Fetches robots.txt first, seeds from it (start URL + any sitemaps), then follows internal links — obeying robots.txt `Disallow`/`Crawl-delay`, `rel=nofollow`, and `<meta name=robots>` (issues #57/#59)
 - Records HTTP status, redirect targets, and referrers
 - Handles **pagination archives** (issue #58) — true pagination (`?page=N`, `?offset=`, `?start=`) is followed as a discovery path so every listing page's items are found, but the pagination URLs themselves are normalized away on emit (not recorded as separate pages). **Reorderings** (`?sort=`/`?order=`/`?dir=`, and Drupal Views' `?sort_by=`/`?sort_order=`/`?sort_bef_combine=`) are treated as views of the *same* items and always stripped, so a listing is never chased through its sort permutations (`page × sort × order`)
 - Skips login/auth URLs (wp-login, OAuth, SSO, SAML, etc.)

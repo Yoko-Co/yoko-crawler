@@ -877,7 +877,11 @@ class TestInfraRedirectsStayOnDomain:
         resp = _redirect_response("https://example.com/robots.txt",
                                   "https://evil.cdn.net/robots.txt")
         reqs = _requests(spider.parse_robots(resp))
-        assert reqs == []
+        # The off-domain robots.txt is not fetched. The start URL IS emitted here (issue
+        # #76): this redirect ends the robots chain, and seeding now hangs off parse_robots,
+        # so returning nothing would leave the crawl with no pages at all.
+        assert [r.url for r in reqs] == ["https://example.com/"]
+        assert not any("evil.cdn.net" in r.url for r in reqs)
 
     def test_robots_redirect_on_domain_followed(self):
         spider = WebsiteSpider(domain="example.com")
@@ -895,7 +899,10 @@ class TestInfraRedirectsStayOnDomain:
                             headers={"Content-Type": "text/plain"},
                             request=Request("https://example.com/robots.txt"), status=200)
         urls = [r.url for r in _requests(spider.parse_robots(resp))]
-        assert urls == ["https://example.com/sitemap.xml"]
+        # On-domain sitemap only; the third-party one is never scheduled. The trailing entry
+        # is the start URL, now emitted from parse_robots (issue #76).
+        assert urls == ["https://example.com/sitemap.xml", "https://example.com/"]
+        assert not any("thirdparty" in u for u in urls)
 
     def test_sitemap_redirect_off_domain_not_followed(self):
         spider = WebsiteSpider(domain="example.com")
@@ -1375,8 +1382,19 @@ class TestSeedRequests:
             return [r async for r in spider.start()]
         return asyncio.new_event_loop().run_until_complete(collect())
 
-    def test_start_seeds_the_homepage(self):
-        assert "https://example.com/" in [r.url for r in self._seeds()]
+    def test_start_seeds_only_robots_txt(self):
+        """The start URL is NOT a seed any more (issue #76): it is emitted from
+        parse_robots, so the Disallow gate is always in its final state before any page URL
+        is scheduled. Seeding it here too is what let the first hop escape the gate."""
+        urls = [r.url for r in self._seeds()]
+        assert urls == ["https://example.com/robots.txt"], urls
+
+    def test_robots_seed_carries_an_errback(self):
+        """Without an errback a DNS/connection failure on robots.txt would never reach a
+        callback, the start URLs would never be emitted, and the crawl would fetch nothing
+        (issue #76). The errback is what keeps a network blip from zeroing a crawl."""
+        seeds = self._seeds()
+        assert all(r.errback is not None for r in seeds)
 
     def test_start_seeds_robots_txt(self):
         """robots.txt is how sitemaps are discovered -- without it the crawler is
@@ -1651,3 +1669,263 @@ class TestKeepPaginationMode:
             "https://example.com/blog?sort=title&order=desc&dir=asc",
             exclude_params=sp.exclude_params_emit,
         ) == "https://example.com/blog"
+
+
+class TestRobotsSeedRace:
+    """Issue #76: the Disallow gate is a no-op until robots.txt is parsed, so seeding the
+    start URL alongside robots.txt let the whole first hop escape it. robots.txt is now a
+    PREREQUISITE of seeding, which removes the race by construction.
+
+    Modelled on gastro.org, where the old ordering produced 57 pages (homepage + its 56
+    links) against a 2,347-URL sitemap and reported it as a complete crawl of a simple site.
+    """
+
+    GASTRO_ROBOTS = (
+        b"User-agent: *\nCrawl-delay: 15\nDisallow: /\nDisallow: /wp-admin/\n"
+        b"Allow: /wp-admin/admin-ajax.php\n\nUser-agent: Googlebot\nAllow: /\n"
+    )
+
+    def _spider(self, domain="gastro.org"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _resp(self, body=None, status=200, url="https://gastro.org/robots.txt", headers=None):
+        return TextResponse(
+            url=url, body=body if body is not None else self.GASTRO_ROBOTS,
+            headers=headers or {"Content-Type": "text/plain"},
+            request=Request(url), status=status,
+        )
+
+    def test_start_urls_are_gated_behind_robots(self):
+        """A blanket Disallow now yields a crawl with nothing scheduled past the start URL,
+        instead of the start URL plus an un-gated first hop."""
+        s = self._spider()
+        out = list(s.parse_robots(self._resp()))
+        # The start URL is emitted (the operator asked for it) ...
+        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+        # ... but every link discovered from it is now correctly refused.
+        assert list(s._schedule("https://gastro.org/news/a-post/")) == []
+        assert s.crawler.stats.values.get("robots_disallowed_skipped") == 1
+
+    def test_rules_are_live_before_any_page_is_scheduled(self):
+        """The ordering guarantee: by the time the start URL exists, _robots is populated."""
+        s = self._spider()
+        assert s._robots is None
+        list(s.parse_robots(self._resp()))
+        assert s._robots is not None
+        assert s.is_robots_disallowed("https://gastro.org/anything/")
+
+    def test_start_urls_emitted_exactly_once_across_a_redirect_chain(self):
+        """robots.txt redirecting re-enters parse_robots; the start URL must not double."""
+        s = self._spider()
+        hop = list(s.parse_robots(self._resp(
+            body=b"", status=301, headers={"Location": b"https://gastro.org/robots.txt?x=1"},
+        )))
+        assert [r.url for r in hop if isinstance(r, Request)] == ["https://gastro.org/robots.txt?x=1"]
+        final = list(s.parse_robots(self._resp(url="https://gastro.org/robots.txt?x=1")))
+        assert [r.url for r in final if isinstance(r, Request)] == ["https://gastro.org/"]
+        # A third landing (redirect loop) must not re-seed.
+        again = list(s.parse_robots(self._resp(url="https://gastro.org/robots.txt?x=1")))
+        assert [r.url for r in again if isinstance(r, Request)] == []
+
+    def test_offdomain_redirect_still_seeds(self):
+        """An off-domain robots.txt redirect ends the chain -- we must still crawl the site,
+        not return silently and fetch nothing."""
+        s = self._spider()
+        out = list(s.parse_robots(self._resp(
+            body=b"", status=301, headers={"Location": b"https://elsewhere.example/robots.txt"},
+        )))
+        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+
+    def test_redirect_without_location_still_seeds(self):
+        s = self._spider()
+        out = list(s.parse_robots(self._resp(body=b"", status=301)))
+        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+
+    def test_missing_robots_txt_seeds_allow_all(self):
+        """A 404 is the common case (no robots.txt at all): crawl normally."""
+        s = self._spider()
+        out = list(s.parse_robots(self._resp(body=b"<html>404</html>", status=404)))
+        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+        assert s._robots is None
+        assert not s.is_robots_disallowed("https://gastro.org/anything/")
+
+    def test_non_text_robots_body_still_seeds(self):
+        """A binary robots.txt has no `.text`; seeding must not die with sitemap parsing."""
+        from scrapy.http import Response
+        s = self._spider()
+        resp = Response(url="https://gastro.org/robots.txt", body=b"\x00\x01\x02",
+                        request=Request("https://gastro.org/robots.txt"), status=200)
+        out = list(s.parse_robots(resp))
+        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+
+    def test_transport_failure_seeds_allow_all(self):
+        """Issue #76's regression guard: a DNS/connection failure on robots.txt must not
+        produce a zero-page crawl."""
+        s = self._spider()
+        failure = types.SimpleNamespace(value=OSError("dns failure"))
+        out = list(s.robots_failed(failure))
+        assert [r.url for r in out] == ["https://gastro.org/"]
+        assert s.crawler.stats.values.get("seeding/robots_failed") == 1
+        assert not s.is_robots_disallowed("https://gastro.org/anything/")
+
+    def test_seeds_emitted_tripwire_still_counts_start_urls(self):
+        """`seeding/seeds_emitted` is the #52 tripwire -- it must still count the pages we
+        seed, not just the robots.txt request."""
+        s = self._spider()
+        list(s.parse_robots(self._resp(body=b"User-agent: *\nAllow: /\n")))
+        assert s.crawler.stats.values.get("seeding/seeds_emitted") == 1
+
+    def test_permissive_robots_is_unchanged(self):
+        """The common case must behave exactly as before: seed, then crawl freely."""
+        s = self._spider()
+        out = list(s.parse_robots(self._resp(
+            body=b"User-agent: *\nDisallow: /search/\nSitemap: https://gastro.org/sitemap.xml\n"
+        )))
+        urls = [r.url for r in out if isinstance(r, Request)]
+        assert "https://gastro.org/sitemap.xml" in urls
+        assert "https://gastro.org/" in urls
+        assert len(list(s._schedule("https://gastro.org/news/a-post/"))) == 1
+        assert list(s._schedule("https://gastro.org/search/x")) == []
+
+
+class TestRobotsSeedRaceHardening:
+    """Findings from the #76 code review: the paths that turn the fix itself into a
+    zero-page crawl. Each of these was reproducible on the first cut of the change."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _redirect(self, url, location, hops=None):
+        req = Request(url)
+        if hops is not None:
+            req.meta["robots_hops"] = hops
+        return TextResponse(
+            url=url, body=b"", status=301,
+            headers={"Location": location.encode()}, request=req,
+        )
+
+    def test_self_referential_redirect_loop_terminates_and_seeds(self):
+        """A robots.txt that 301s to ITSELF (the classic apex/www or http/https page-rule
+        bug). REDIRECT_ENABLED is False and the hop carries dont_filter, so nothing else
+        bounds this -- unbounded, it spins until CLOSESPIDER_TIMEOUT and emits one row while
+        reporting `completed`."""
+        s = self._spider()
+        url = "https://example.com/robots.txt"
+        hops, seeded = 0, []
+        resp = self._redirect(url, url)
+        for _ in range(20):
+            out = [r for r in s.parse_robots(resp) if isinstance(r, Request)]
+            if not out:
+                break
+            nxt = out[0]
+            if nxt.url != url:      # the start URL -> the chain resolved
+                seeded.append(nxt.url)
+                break
+            hops += 1
+            resp = self._redirect(url, url, hops=nxt.meta.get("robots_hops"))
+        assert hops <= WebsiteSpider.MAX_ROBOTS_REDIRECTS, f"unbounded after {hops} hops"
+        assert seeded == ["https://example.com/"], "loop terminated without seeding"
+
+    def test_ping_pong_redirect_terminates_and_seeds(self):
+        """A -> B -> A, the other shape of the same misconfiguration."""
+        s = self._spider()
+        a, b = "https://example.com/robots.txt", "https://www.example.com/robots.txt"
+        cur, nxt_url, seeded, hops = a, b, [], 0
+        meta_hops = None
+        for _ in range(20):
+            out = [r for r in s.parse_robots(self._redirect(cur, nxt_url, hops=meta_hops))
+                   if isinstance(r, Request)]
+            if not out:
+                break
+            r = out[0]
+            if not r.url.endswith("robots.txt"):
+                seeded.append(r.url)
+                break
+            hops += 1
+            meta_hops = r.meta.get("robots_hops")
+            cur, nxt_url = nxt_url, cur
+        assert hops <= WebsiteSpider.MAX_ROBOTS_REDIRECTS
+        assert seeded == ["https://example.com/"]
+
+    def test_malformed_sitemap_url_does_not_cost_the_seed(self):
+        """A fullwidth solidus in a `Sitemap:` line (a real CMS copy-paste artifact) makes
+        urlparse raise. Before the fix that exception escaped and skipped seeding, so the
+        crawl reported `completed` with one row."""
+        s = self._spider()
+        body = ("User-agent: *\nAllow: /\n"
+                "Sitemap: http://a／b.example.com/sitemap.xml\n").encode()
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert "https://example.com/" in urls
+        assert s._robots is not None, "the rules must still have been parsed"
+
+    def test_malformed_location_header_does_not_cost_the_seed(self):
+        s = self._spider()
+        resp = self._redirect("https://example.com/robots.txt", "http://[::1")
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert urls == ["https://example.com/"]
+
+    def test_start_url_carries_no_referrer(self):
+        """The site root has no referrer. Yielding it from a callback would otherwise let
+        RefererMiddleware stamp /robots.txt on it, and _emit_row's header fallback would
+        report the root as linked-from-robots.txt -- a value corpus persists and exports."""
+        s = self._spider()
+        body = b"User-agent: *\nAllow: /\n"
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        start = [r for r in s.parse_robots(resp)
+                 if isinstance(r, Request) and r.url == "https://example.com/"]
+        assert len(start) == 1
+        assert start[0].headers.get("Referer") is None
+
+    def test_robots_seed_and_start_url_carry_dont_filter(self):
+        """Load-bearing for a JOBDIR resume: the dupefilter persists across sessions, so
+        without dont_filter session 2 filters the robots seed, never runs parse_robots, and
+        therefore never emits the start URL -- a zero-page resume."""
+        s = self._spider()
+        seeds = list(s._seed_requests())
+        assert all(r.dont_filter for r in seeds)
+        body = b"User-agent: *\nAllow: /\n"
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        starts = [r for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert all(r.dont_filter for r in starts)
+
+    def test_robots_rules_survive_a_resumed_session(self):
+        """The gate must be CLOSED before the first restored frontier page is parsed on a
+        resume, or #76 survives on the multi-session path yoko-corpus actually uses."""
+        s1 = self._spider("gastro.org")
+        s1.state = {}
+        body = b"User-agent: *\nDisallow: /\n"
+        resp = TextResponse(url="https://gastro.org/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://gastro.org/robots.txt"), status=200)
+        list(s1.parse_robots(resp))
+        assert isinstance(s1.state.get("robots_body"), str)
+
+        # Session 2: same JOBDIR state, no robots.txt response yet.
+        s2 = self._spider("gastro.org")
+        s2.state = s1.state
+        assert s2._robots is None
+        assert list(s2._schedule("https://gastro.org/news/a-post/")) == []
+        assert s2._robots is not None, "rules must be restored on first schedule"
+        assert s2.crawler.stats.values.get("robots_disallowed_skipped") == 1
+
+    def test_no_jobdir_resume_is_unaffected(self):
+        """With no JOBDIR there is no state; persistence must be a silent no-op."""
+        s = self._spider()
+        body = b"User-agent: *\nDisallow: /private/\n"
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert urls == ["https://example.com/"]
+        assert s.is_robots_disallowed("https://example.com/private/x")

@@ -29,11 +29,13 @@ paused close and a finished close must be distinguished explicitly, never inferr
 the fact that the process exited.
 
 ### Seed
-The starting requests a Crawl is launched from — the site's entry URL plus the request
-for its robots file, which is what leads to any sitemaps. Everything else is reached by
-following links from a Seed. Because Seeds are supplied to the framework rather than
-called directly, their absence degrades a Crawl silently rather than failing it, so the
-count of Seeds actually emitted is treated as a health signal for the Crawl.
+The request a Crawl is launched from: the site's robots file. Seeding is **two-phase** —
+the robots file is fetched first, and the site's entry URL is emitted only once its rules
+are known, so nothing is ever scheduled before the Crawl knows what it is allowed to
+reach. Everything else is reached by following links from the entry URL, or from any
+sitemap the robots file lists. Because Seeds are supplied to the framework rather than
+called directly, their absence degrades a Crawl silently rather than failing it, so both
+phases are counted and a Crawl that completes the first without the second is flagged.
 
 ### Profile
 A named bundle of politeness settings applied to a Crawl — request spacing,
