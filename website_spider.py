@@ -555,6 +555,17 @@ class WebsiteSpider(scrapy.Spider):
         except Exception:
             self.logger.debug("could not bump download slot delay", exc_info=True)
         self._stat("robots_crawl_delay_applied")
+        # Record the actual seconds, not just that it happened (issue #74). "We paced this
+        # site at 10s/request because it asked for 15s" is the sentence an operator needs to
+        # read a partial crawl correctly; a bare counter can't say it. set_value, not inc:
+        # these are a measurement, and robots.txt is parsed once per session.
+        stats = getattr(getattr(self, "crawler", None), "stats", None)
+        if stats is not None:
+            try:
+                stats.set_value("robots_crawl_delay_honored", float(honored))
+                stats.set_value("robots_crawl_delay_requested", float(requested))
+            except Exception:
+                self.logger.debug("could not record crawl-delay values", exc_info=True)
         self.logger.info(
             "Honoring robots.txt Crawl-delay for %s: pacing at %.1fs/request "
             "(site asked %.1fs%s)",

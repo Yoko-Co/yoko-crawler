@@ -202,6 +202,35 @@ class ProgressWriter:
                 "origin_forbidden_count": self.stats.get_value("origin_forbidden_count", 0),
                 "status_counts": self._status_counts(),
             },
+            # Restriction observability (issue #74). The crawler deliberately does not fetch
+            # several classes of URL, and until now NONE of those counts left Scrapy's stats
+            # -- so a crawl the site itself had walled off was indistinguishable from a crawl
+            # of a small site. gastro.org made that concrete: `User-agent: * / Disallow: /`
+            # reduced a 2,347-URL site to a 1-page inventory that still reported "completed",
+            # and the report called it "a Simple site".
+            #
+            # Like `blocking`, these are OBSERVED counts, not a verdict -- the consumer
+            # decides what they mean. `robots_disallowed` is the load-bearing one: large
+            # relative to the pages actually crawled, the crawl is not an inventory.
+            "restrictions": {
+                "skipped": {
+                    "robots_disallowed": self.stats.get_value("robots_disallowed_skipped", 0),
+                    "login_gated": self.stats.get_value("login_urls_skipped", 0),
+                    "infra": self.stats.get_value("infra_urls_skipped", 0),
+                    "facet_capped": self.stats.get_value("facet_urls_skipped", 0),
+                    "nofollow_links": self.stats.get_value("nofollow_links_skipped", 0),
+                    "meta_nofollow_pages": self.stats.get_value("meta_nofollow_pages", 0),
+                },
+                # robots.txt Crawl-delay. `honored_seconds` is what we actually paced at;
+                # `requested_seconds` is what the site asked for. They differ when the ask
+                # exceeded YOKO_CRAWL_MAX_ROBOTS_DELAY and we clamped -- which is the case
+                # where a crawl finalizes partial and the operator needs to know why.
+                "crawl_delay": {
+                    "applied": self.stats.get_value("robots_crawl_delay_applied", 0),
+                    "honored_seconds": self.stats.get_value("robots_crawl_delay_honored", 0),
+                    "requested_seconds": self.stats.get_value("robots_crawl_delay_requested", 0),
+                },
+            },
         }
         if final:
             data["finished_at"] = datetime.now(timezone.utc).isoformat()
