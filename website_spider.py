@@ -252,6 +252,11 @@ class WebsiteSpider(scrapy.Spider):
         # no robots.txt) -> allow-all, unchanged behavior. Disallow rules gate scheduling;
         # a Crawl-delay paces the host (see parse_robots / _apply_crawl_delay).
         self._robots = None
+        # Start URLs are emitted from parse_robots / robots_failed, never from the seed
+        # itself (issue #76), so robots rules are always known before any page URL is
+        # scheduled. A robots.txt redirect chain re-enters parse_robots, so this guard
+        # keeps the start URLs emitted exactly once no matter how many times we land here.
+        self._start_urls_emitted = False
         try:
             self.max_robots_crawl_delay = float(
                 os.environ.get("YOKO_CRAWL_MAX_ROBOTS_DELAY", self.DEFAULT_MAX_ROBOTS_CRAWL_DELAY)
@@ -536,23 +541,61 @@ class WebsiteSpider(scrapy.Spider):
             stats.inc_value(name, count)
 
     def _seed_requests(self):
-        """The crawl's seed requests: the start URL(s) plus robots.txt (which fans out to
-        the sitemaps). Shared by `start` and `start_requests` so the two entry points can
-        never drift.
+        """The crawl's only seed: robots.txt. The start URL(s) are emitted from
+        `parse_robots` (or `robots_failed`), NOT from here.
+
+        Ordering is load-bearing (issue #76). The Disallow gate lives in `_schedule` and
+        is a no-op while `self._robots` is None, so any page scheduled before robots.txt
+        is parsed escapes it permanently -- nothing re-checks a queued request at download
+        time. Seeding the start URL alongside robots.txt made that a RACE: on gastro.org
+        (`User-agent: * / Disallow: /`) the homepage came back first, its 56 links were all
+        scheduled un-gated, and the crawl closed `finished` with 57 pages against a 2,347-URL
+        sitemap -- reported as a complete inventory of a "simple" site. Fetching robots.txt
+        as a prerequisite removes the race by construction rather than narrowing it.
 
         Every seed is counted (`seeding/seeds_emitted`) so a crawl can PROVE this ran.
         That is the tripwire for the bug class that killed it once already: Scrapy renamed
         the seeding entry point, our method became unreachable, and nothing failed -- no
         exception, no test, no log line. A crawl seeded by Scrapy's default instead of this
         method reports 0 here, which `stats_extension` turns into a loud error."""
-        for url in self.start_urls:
-            self._stat("seeding/seeds_emitted")
-            yield scrapy.Request(url, callback=self.parse)
         self._stat("seeding/seeds_emitted")
         yield scrapy.Request(
             urljoin(self.start_urls[0], "/robots.txt"),
             callback=self.parse_robots,
+            errback=self.robots_failed,
+            dont_filter=True,
         )
+
+    def _start_url_requests(self):
+        """Emit the start URL(s), exactly once per crawl. Called once robots.txt has
+        resolved -- parsed, missing (404), unreachable, or redirected somewhere we won't
+        follow -- so the Disallow gate is in its final state before any page is scheduled.
+
+        NOT routed through `_schedule`: a start URL is the operator's explicit instruction
+        and the crawl's only entry point. Dropping it would leave a crawl with nothing to
+        do and no row explaining why; a robots-disallowed start URL is reported honestly by
+        the crawl coming back empty (and, once #74 lands, by the skip counts)."""
+        if self._start_urls_emitted:
+            return
+        self._start_urls_emitted = True
+        for url in self.start_urls:
+            self._stat("seeding/seeds_emitted")
+            yield scrapy.Request(url, callback=self.parse, dont_filter=True)
+
+    def robots_failed(self, failure):
+        """robots.txt never arrived -- DNS failure, refused connection, timeout (issue #76).
+
+        Scrapy routes transport failures to an errback, not the callback, so without this
+        the start URLs would never be emitted and a momentary network fault would silently
+        produce a ZERO-page crawl. Allow-all is the same posture as a site with no
+        robots.txt: we could not read a "no", so we do not invent one."""
+        self._stat("seeding/robots_failed")
+        self.logger.warning(
+            "robots.txt could not be fetched (%s) -- proceeding allow-all, as for a site "
+            "with no robots.txt. Crawl-delay and Disallow rules are unknown for this crawl.",
+            failure.value if hasattr(failure, "value") else failure,
+        )
+        yield from self._start_url_requests()
 
     async def start(self):
         """Seed the crawl (Scrapy >= 2.13's entry point).
@@ -589,12 +632,22 @@ class WebsiteSpider(scrapy.Spider):
         # One-hop redirect follow -- only on-domain (issue corpus#71). robots.txt should redirect
         # within the site (http->https, apex->www); an off-domain hop is a handoff to another site,
         # not our robots, so don't fetch it as ours.
+        #
+        # Every exit from this branch must resolve seeding (issue #76): the followed hop
+        # re-enters parse_robots and seeds there, but a redirect with no Location, or one
+        # pointing off-domain, ends the robots chain here -- and if we returned without
+        # seeding, the crawl would fetch nothing at all.
         if response.status in self.REDIRECT_STATUSES:
             target = response.headers.get("Location")
             if target:
                 tgt = response.urljoin(target.decode("latin-1"))
                 if self.is_internal(tgt):
-                    yield scrapy.Request(tgt, callback=self.parse_robots)
+                    yield scrapy.Request(
+                        tgt, callback=self.parse_robots, errback=self.robots_failed,
+                        dont_filter=True,
+                    )
+                    return
+            yield from self._start_url_requests()
             return
 
         # Parse robots.txt rules from the real body (issues #57/#59): Disallow gates scheduling
@@ -610,11 +663,20 @@ class WebsiteSpider(scrapy.Spider):
                 self.logger.debug("robots.txt parse failed for %s", response.url, exc_info=True)
 
         # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
-        for line in response.text.splitlines():
-            if line.lower().startswith("sitemap:"):
-                sm_url = line.split(":", 1)[1].strip()
-                if sm_url and self.is_internal(sm_url):
-                    yield scrapy.Request(sm_url, callback=self.parse_sitemap, dont_filter=True)
+        # Guarded on TextResponse: a binary/non-text body has no `.text`, and since seeding
+        # now hangs off this callback (issue #76) an AttributeError here would take the whole
+        # crawl down, not just sitemap discovery.
+        if isinstance(response, TextResponse):
+            for line in response.text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sm_url = line.split(":", 1)[1].strip()
+                    if sm_url and self.is_internal(sm_url):
+                        yield scrapy.Request(sm_url, callback=self.parse_sitemap, dont_filter=True)
+
+        # Rules are now in their final state -- seed the crawl (issue #76). Emitted LAST so
+        # `self._robots` and any Crawl-delay pacing are already applied to every page URL
+        # that follows, including the start URL itself.
+        yield from self._start_url_requests()
 
     def parse_sitemap(self, response):
         # Record sitemap fetch. `sitemaps_fetched` vs `seeding/robots_fetched` distinguishes
