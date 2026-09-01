@@ -236,11 +236,50 @@ class TestSeedingTripwire:
         data = _write_and_read(
             tmp_path,
             {"response_received_count": 40, "seeding/seeds_emitted": 2,
-             "seeding/robots_fetched": 1, "seeding/sitemaps_fetched": 3},
+             "seeding/robots_fetched": 1, "seeding/sitemaps_fetched": 3,
+             "seeding/start_urls_emitted": 1},
             reason="finished",
         )
         assert data["seeding"] == {"seeds_emitted": 2, "robots_fetched": 1,
-                                   "sitemaps_fetched": 3}
+                                   "sitemaps_fetched": 3, "start_urls_emitted": 1,
+                                   "robots_failed": 0}
+
+    def test_status_file_reports_robots_failed(self, tmp_path):
+        """A crawl that ran allow-all because robots.txt was UNREACHABLE must be
+        distinguishable from one that read a permissive robots.txt (issue #76)."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "seeding/seeds_emitted": 2,
+             "seeding/robots_fetched": 0, "seeding/start_urls_emitted": 1,
+             "seeding/robots_failed": 1},
+            reason="finished",
+        )
+        assert data["seeding"]["robots_failed"] == 1
+        assert data["seeding"]["robots_fetched"] == 0
+
+    def test_seeding_that_stops_after_robots_is_logged_as_an_error(self, tmp_path, caplog):
+        """Phase-two tripwire (issue #76): robots.txt fetched, start URLs never emitted.
+        The crawl closes `completed` with a one-row inventory, so nothing else catches it."""
+        import logging
+        with caplog.at_level(logging.ERROR):
+            _write_and_read(
+                tmp_path,
+                {"response_received_count": 5000, "seeding/seeds_emitted": 1,
+                 "seeding/robots_fetched": 5000, "seeding/start_urls_emitted": 0},
+                reason="closespider_timeout",
+            )
+        assert "SEEDING STOPPED AFTER ROBOTS.TXT" in caplog.text
+
+    def test_healthy_two_phase_seeding_is_not_flagged(self, tmp_path, caplog):
+        import logging
+        with caplog.at_level(logging.ERROR):
+            _write_and_read(
+                tmp_path,
+                {"response_received_count": 40, "seeding/seeds_emitted": 2,
+                 "seeding/robots_fetched": 1, "seeding/start_urls_emitted": 1},
+                reason="finished",
+            )
+        assert "SEEDING STOPPED AFTER ROBOTS.TXT" not in caplog.text
 
     def test_zero_seeds_on_a_crawl_that_fetched_pages_is_logged_as_an_error(self, tmp_path, caplog):
         import logging

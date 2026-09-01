@@ -34,7 +34,8 @@ class WebsiteSpider(scrapy.Spider):
       - Treats base domain and www as internal; optional flag to allow all subdomains
       - Normalizes & de-duplicates URLs (drops fragments, strips junk params)
       - Records per-URL HTTP status, single-hop redirect target, and first referrer
-      - Seeds from robots.txt → sitemap(s)
+      - Seeds from robots.txt → sitemap(s); the start URL is emitted only after
+        robots.txt resolves, so the Disallow gate is never open (issue #76)
       - Can traverse paginated archives without recording each page:
           use -a reach_pagination=1
       - Alternatively, record pagination pages too:
@@ -280,6 +281,18 @@ class WebsiteSpider(scrapy.Spider):
             self.exclude_params_schedule = base
             self.exclude_params_emit = base
 
+    def _persist_robots_body(self, body: str) -> None:
+        """Carry robots.txt across resumable sessions (issue #76). Best-effort: a crawl with
+        no JOBDIR has no state to write to, and failing to persist must never break a
+        running crawl -- it only costs the resumed session its gate, as before."""
+        try:
+            self._bind_dedup_state()
+            state = getattr(self, "state", None)
+            if state is not None:
+                state["robots_body"] = body
+        except Exception:
+            self.logger.debug("Could not persist robots.txt to spider state", exc_info=True)
+
     def _bind_dedup_state(self):
         """Move the dedup structures INTO `self.state` so they persist across resumable
         sessions (issue #52). Called on FIRST USE, not from a signal -- see the ordering
@@ -341,6 +354,24 @@ class WebsiteSpider(scrapy.Spider):
             restored_emitted if isinstance(restored_emitted, set) else self.emitted)
         state["first_referrer"] = self.first_referrer = (
             restored_refs if isinstance(restored_refs, dict) else self.first_referrer)
+        # Restore the robots.txt rules too (issue #76). Without this the Disallow gate is
+        # OPEN at the start of every resumed session: `self._robots` is a plain attribute,
+        # JOBDIR restores the frontier but not spider attributes, and yoko-corpus runs one
+        # logical crawl as N sessions. Session 2 pops the robots.txt seed first, but the
+        # downloader immediately fills the other CONCURRENT_REQUESTS-1 slots from the
+        # restored frontier -- and any of those returning before robots.txt lands schedules
+        # its links un-gated. That is #76's exact bug surviving on the path corpus actually
+        # uses, which is why "removed by construction" needs this to be true.
+        #
+        # The BODY is persisted, not the Protego matcher: a plain string is guaranteed
+        # picklable across versions, and re-parsing is cheap and once per session.
+        restored_robots = state.get("robots_body")
+        if self._robots is None and isinstance(restored_robots, str):
+            try:
+                self._robots = Protego.parse(restored_robots)
+                self.logger.info("Resumed robots.txt rules from the previous session.")
+            except Exception:
+                self.logger.debug("Could not re-parse persisted robots.txt", exc_info=True)
         if self.seen:
             self.logger.info(
                 "Resumed dedup state: %d scheduled, %d emitted URLs carried over",
@@ -563,6 +594,9 @@ class WebsiteSpider(scrapy.Spider):
             urljoin(self.start_urls[0], "/robots.txt"),
             callback=self.parse_robots,
             errback=self.robots_failed,
+            # dont_filter is LOAD-BEARING for a JOBDIR resume: the dupefilter persists across
+            # sessions, so without it session 2 would filter this as already-seen, never run
+            # parse_robots, and therefore never emit the start URLs -- a zero-page resume.
             dont_filter=True,
         )
 
@@ -580,7 +614,22 @@ class WebsiteSpider(scrapy.Spider):
         self._start_urls_emitted = True
         for url in self.start_urls:
             self._stat("seeding/seeds_emitted")
-            yield scrapy.Request(url, callback=self.parse, dont_filter=True)
+            # `start_urls_emitted` is the SECOND half of the seeding tripwire (#52/#76).
+            # Seeding used to be one atomic event, so `seeds_emitted == 0` was a sound test
+            # of "did seeding run". It is now a two-phase protocol -- seed robots.txt, then
+            # emit the start URLs from a callback -- and a failure to reach phase two is the
+            # zero-page crawl this whole change has to avoid. Counted separately so
+            # stats_extension can assert BOTH halves ran.
+            self._stat("seeding/start_urls_emitted")
+            yield scrapy.Request(
+                url, callback=self.parse, dont_filter=True,
+                # Suppress the Referer. The start URL is now yielded from a callback, so
+                # Scrapy's RefererMiddleware would stamp `/robots.txt` on it and _emit_row's
+                # header fallback would report the site root as "linked from robots.txt" --
+                # a value yoko-corpus persists into page_versions.referrer and exports. The
+                # site root has no referrer; keep the emitted row byte-identical to before.
+                headers={"Referer": None},
+            )
 
     def robots_failed(self, failure):
         """robots.txt never arrived -- DNS failure, refused connection, timeout (issue #76).
@@ -622,40 +671,111 @@ class WebsiteSpider(scrapy.Spider):
 
     # ---------- Robots & sitemaps ----------
 
+    # How many on-domain redirects of /robots.txt we will follow before giving up and
+    # seeding anyway. robots.txt legitimately redirects once or twice (http->https,
+    # apex->www); beyond that it is a loop or a misconfiguration. Bounded explicitly
+    # because seeding now hangs off this callback (issue #76) -- an unbounded chain would
+    # spin until CLOSESPIDER_TIMEOUT and never emit a single page.
+    MAX_ROBOTS_REDIRECTS = 3
+
     def parse_robots(self, response):
-        # Record robots fetch. Counted so a crawl can show sitemap discovery actually
-        # happened -- a site with no robots.txt still 404s here, so a ZERO means the seed
-        # never went out, not that the site lacks one.
+        """Handle the robots.txt response and then seed the crawl.
+
+        Seeding hangs off this callback (issue #76), which makes every failure in here a
+        potential ZERO-PAGE crawl -- strictly worse than the race it replaced. So the work
+        is done in `_robots_outputs`, which is written never to raise, and the start URLs
+        are emitted here on every path except a redirect we are still following (where the
+        next hop seeds instead)."""
         self._stat("seeding/robots_fetched")
-        yield from self._emit_row(response)
+        outputs, seeding_deferred = self._robots_outputs(response)
+        yield from outputs
+        if not seeding_deferred:
+            yield from self._start_url_requests()
+
+    def _robots_outputs(self, response):
+        """Everything parse_robots wants to emit, plus whether seeding is deferred to a
+        redirect hop. Returns `(outputs, seeding_deferred)`.
+
+        MUST NOT RAISE. A malformed `Location` header or a malformed `Sitemap:` URL both
+        reach `urlparse`, which raises ValueError on a netloc that fails NFKC normalization
+        (a fullwidth solidus pasted into a CMS robots.txt does it) or on an unterminated
+        `[`. Before seeding moved here that cost only sitemap discovery; now an escaping
+        exception would skip the seed entirely and the crawl would report `completed` with
+        one row. Each stage is therefore contained separately, so a failure in one still
+        leaves the others -- and the seed -- intact."""
+        outputs = []
+
+        try:
+            outputs.extend(self._emit_row(response))
+        except Exception:
+            self.logger.warning(
+                "Could not emit the robots.txt row for %s -- continuing so the crawl "
+                "still seeds.", response.url, exc_info=True,
+            )
 
         # One-hop redirect follow -- only on-domain (issue corpus#71). robots.txt should redirect
         # within the site (http->https, apex->www); an off-domain hop is a handoff to another site,
         # not our robots, so don't fetch it as ours.
-        #
-        # Every exit from this branch must resolve seeding (issue #76): the followed hop
-        # re-enters parse_robots and seeds there, but a redirect with no Location, or one
-        # pointing off-domain, ends the robots chain here -- and if we returned without
-        # seeding, the crawl would fetch nothing at all.
         if response.status in self.REDIRECT_STATUSES:
-            target = response.headers.get("Location")
-            if target:
-                tgt = response.urljoin(target.decode("latin-1"))
-                if self.is_internal(tgt):
-                    yield scrapy.Request(
-                        tgt, callback=self.parse_robots, errback=self.robots_failed,
-                        dont_filter=True,
-                    )
-                    return
-            yield from self._start_url_requests()
-            return
+            nxt = self._robots_redirect_request(response)
+            if nxt is not None:
+                outputs.append(nxt)
+                return outputs, True  # the followed hop seeds instead
+            # No Location, an off-domain target, a malformed one, or the hop cap: the robots
+            # chain ends here, so this call has to seed or the crawl fetches nothing.
+            return outputs, False
+        return self._robots_body_outputs(response, outputs), False
 
+    def _robots_redirect_request(self, response):
+        """The next on-domain robots.txt request for a redirect, or None when the chain
+        ends here (no Location, off-domain, malformed, or the hop cap reached).
+
+        The hop cap is load-bearing: `REDIRECT_ENABLED` is False, so Scrapy's own
+        REDIRECT_MAX_TIMES never applies, and the followed request carries dont_filter
+        (it must, or a retried chain would be dropped with no errback and no seed). An
+        apex/www pair whose robots.txt rules point at each other would otherwise loop for
+        the full CLOSESPIDER_TIMEOUT, emit two rows, and report `completed`."""
+        hops = 0
+        try:
+            hops = int(response.request.meta.get("robots_hops", 0))
+        except Exception:
+            hops = 0
+        if hops >= self.MAX_ROBOTS_REDIRECTS:
+            self._stat("seeding/robots_redirect_limit")
+            self.logger.warning(
+                "robots.txt redirected more than %d times (last: %s) -- giving up on it and "
+                "crawling allow-all, as for a site with no robots.txt.",
+                self.MAX_ROBOTS_REDIRECTS, response.url,
+            )
+            return None
+        target = response.headers.get("Location")
+        if not target:
+            return None
+        try:
+            tgt = response.urljoin(target.decode("latin-1"))
+            if not self.is_internal(tgt):
+                return None
+        except Exception:
+            self.logger.warning(
+                "Unparseable Location on %s -- treating robots.txt as unreadable and "
+                "crawling allow-all.", response.url, exc_info=True,
+            )
+            return None
+        return scrapy.Request(
+            tgt, callback=self.parse_robots, errback=self.robots_failed,
+            dont_filter=True, meta={"robots_hops": hops + 1},
+        )
+
+    def _robots_body_outputs(self, response, outputs):
+        """Parse the rules and discover sitemaps. Best-effort in both halves."""
         # Parse robots.txt rules from the real body (issues #57/#59): Disallow gates scheduling
         # (is_robots_disallowed) and a Crawl-delay paces the host. Best-effort -- a malformed or
         # non-text robots.txt leaves rules unset (allow-all), never breaking the crawl.
         if response.status == 200 and isinstance(response, TextResponse):
             try:
-                self._robots = Protego.parse(response.text)
+                body = response.text
+                self._robots = Protego.parse(body)
+                self._persist_robots_body(body)
                 delay = self._robots.crawl_delay(self.ROBOTS_USER_AGENT)
                 if delay:
                     self._apply_crawl_delay(float(delay))
@@ -663,20 +783,29 @@ class WebsiteSpider(scrapy.Spider):
                 self.logger.debug("robots.txt parse failed for %s", response.url, exc_info=True)
 
         # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
-        # Guarded on TextResponse: a binary/non-text body has no `.text`, and since seeding
-        # now hangs off this callback (issue #76) an AttributeError here would take the whole
-        # crawl down, not just sitemap discovery.
+        # Guarded on TextResponse: a binary body has no `.text`. Each line is guarded on its
+        # own so ONE malformed `Sitemap:` URL cannot cost the others, or the seed.
         if isinstance(response, TextResponse):
-            for line in response.text.splitlines():
-                if line.lower().startswith("sitemap:"):
+            try:
+                lines = response.text.splitlines()
+            except Exception:
+                lines = []
+            for line in lines:
+                if not line.lower().startswith("sitemap:"):
+                    continue
+                try:
                     sm_url = line.split(":", 1)[1].strip()
                     if sm_url and self.is_internal(sm_url):
-                        yield scrapy.Request(sm_url, callback=self.parse_sitemap, dont_filter=True)
-
-        # Rules are now in their final state -- seed the crawl (issue #76). Emitted LAST so
-        # `self._robots` and any Crawl-delay pacing are already applied to every page URL
-        # that follows, including the start URL itself.
-        yield from self._start_url_requests()
+                        outputs.append(scrapy.Request(
+                            sm_url, callback=self.parse_sitemap, dont_filter=True,
+                        ))
+                except Exception:
+                    self._stat("seeding/sitemap_url_unparseable")
+                    self.logger.warning(
+                        "Skipping an unparseable Sitemap: line in %s", response.url,
+                        exc_info=True,
+                    )
+        return outputs
 
     def parse_sitemap(self, response):
         # Record sitemap fetch. `sitemaps_fetched` vs `seeding/robots_fetched` distinguishes

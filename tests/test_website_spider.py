@@ -1788,3 +1788,144 @@ class TestRobotsSeedRace:
         assert "https://gastro.org/" in urls
         assert len(list(s._schedule("https://gastro.org/news/a-post/"))) == 1
         assert list(s._schedule("https://gastro.org/search/x")) == []
+
+
+class TestRobotsSeedRaceHardening:
+    """Findings from the #76 code review: the paths that turn the fix itself into a
+    zero-page crawl. Each of these was reproducible on the first cut of the change."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _redirect(self, url, location, hops=None):
+        req = Request(url)
+        if hops is not None:
+            req.meta["robots_hops"] = hops
+        return TextResponse(
+            url=url, body=b"", status=301,
+            headers={"Location": location.encode()}, request=req,
+        )
+
+    def test_self_referential_redirect_loop_terminates_and_seeds(self):
+        """A robots.txt that 301s to ITSELF (the classic apex/www or http/https page-rule
+        bug). REDIRECT_ENABLED is False and the hop carries dont_filter, so nothing else
+        bounds this -- unbounded, it spins until CLOSESPIDER_TIMEOUT and emits one row while
+        reporting `completed`."""
+        s = self._spider()
+        url = "https://example.com/robots.txt"
+        hops, seeded = 0, []
+        resp = self._redirect(url, url)
+        for _ in range(20):
+            out = [r for r in s.parse_robots(resp) if isinstance(r, Request)]
+            if not out:
+                break
+            nxt = out[0]
+            if nxt.url != url:      # the start URL -> the chain resolved
+                seeded.append(nxt.url)
+                break
+            hops += 1
+            resp = self._redirect(url, url, hops=nxt.meta.get("robots_hops"))
+        assert hops <= WebsiteSpider.MAX_ROBOTS_REDIRECTS, f"unbounded after {hops} hops"
+        assert seeded == ["https://example.com/"], "loop terminated without seeding"
+
+    def test_ping_pong_redirect_terminates_and_seeds(self):
+        """A -> B -> A, the other shape of the same misconfiguration."""
+        s = self._spider()
+        a, b = "https://example.com/robots.txt", "https://www.example.com/robots.txt"
+        cur, nxt_url, seeded, hops = a, b, [], 0
+        meta_hops = None
+        for _ in range(20):
+            out = [r for r in s.parse_robots(self._redirect(cur, nxt_url, hops=meta_hops))
+                   if isinstance(r, Request)]
+            if not out:
+                break
+            r = out[0]
+            if not r.url.endswith("robots.txt"):
+                seeded.append(r.url)
+                break
+            hops += 1
+            meta_hops = r.meta.get("robots_hops")
+            cur, nxt_url = nxt_url, cur
+        assert hops <= WebsiteSpider.MAX_ROBOTS_REDIRECTS
+        assert seeded == ["https://example.com/"]
+
+    def test_malformed_sitemap_url_does_not_cost_the_seed(self):
+        """A fullwidth solidus in a `Sitemap:` line (a real CMS copy-paste artifact) makes
+        urlparse raise. Before the fix that exception escaped and skipped seeding, so the
+        crawl reported `completed` with one row."""
+        s = self._spider()
+        body = ("User-agent: *\nAllow: /\n"
+                "Sitemap: http://a／b.example.com/sitemap.xml\n").encode()
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert "https://example.com/" in urls
+        assert s._robots is not None, "the rules must still have been parsed"
+
+    def test_malformed_location_header_does_not_cost_the_seed(self):
+        s = self._spider()
+        resp = self._redirect("https://example.com/robots.txt", "http://[::1")
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert urls == ["https://example.com/"]
+
+    def test_start_url_carries_no_referrer(self):
+        """The site root has no referrer. Yielding it from a callback would otherwise let
+        RefererMiddleware stamp /robots.txt on it, and _emit_row's header fallback would
+        report the root as linked-from-robots.txt -- a value corpus persists and exports."""
+        s = self._spider()
+        body = b"User-agent: *\nAllow: /\n"
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        start = [r for r in s.parse_robots(resp)
+                 if isinstance(r, Request) and r.url == "https://example.com/"]
+        assert len(start) == 1
+        assert start[0].headers.get("Referer") is None
+
+    def test_robots_seed_and_start_url_carry_dont_filter(self):
+        """Load-bearing for a JOBDIR resume: the dupefilter persists across sessions, so
+        without dont_filter session 2 filters the robots seed, never runs parse_robots, and
+        therefore never emits the start URL -- a zero-page resume."""
+        s = self._spider()
+        seeds = list(s._seed_requests())
+        assert all(r.dont_filter for r in seeds)
+        body = b"User-agent: *\nAllow: /\n"
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        starts = [r for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert all(r.dont_filter for r in starts)
+
+    def test_robots_rules_survive_a_resumed_session(self):
+        """The gate must be CLOSED before the first restored frontier page is parsed on a
+        resume, or #76 survives on the multi-session path yoko-corpus actually uses."""
+        s1 = self._spider("gastro.org")
+        s1.state = {}
+        body = b"User-agent: *\nDisallow: /\n"
+        resp = TextResponse(url="https://gastro.org/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://gastro.org/robots.txt"), status=200)
+        list(s1.parse_robots(resp))
+        assert isinstance(s1.state.get("robots_body"), str)
+
+        # Session 2: same JOBDIR state, no robots.txt response yet.
+        s2 = self._spider("gastro.org")
+        s2.state = s1.state
+        assert s2._robots is None
+        assert list(s2._schedule("https://gastro.org/news/a-post/")) == []
+        assert s2._robots is not None, "rules must be restored on first schedule"
+        assert s2.crawler.stats.values.get("robots_disallowed_skipped") == 1
+
+    def test_no_jobdir_resume_is_unaffected(self):
+        """With no JOBDIR there is no state; persistence must be a silent no-op."""
+        s = self._spider()
+        body = b"User-agent: *\nDisallow: /private/\n"
+        resp = TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"), status=200)
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert urls == ["https://example.com/"]
+        assert s.is_robots_disallowed("https://example.com/private/x")
