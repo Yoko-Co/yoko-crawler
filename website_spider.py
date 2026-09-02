@@ -769,6 +769,11 @@ class WebsiteSpider(scrapy.Spider):
             "with no robots.txt. Crawl-delay and Disallow rules are unknown for this crawl.",
             failure.value if hasattr(failure, "value") else failure,
         )
+        # It named no sitemap, because we never read it (#77).
+        try:
+            yield from self._sitemap_probe_requests()
+        except Exception:
+            self.logger.debug("sitemap probing failed", exc_info=True)
         yield from self._start_url_requests()
 
     async def start(self):
@@ -847,7 +852,12 @@ class WebsiteSpider(scrapy.Spider):
                 outputs.append(nxt)
                 return outputs, True  # the followed hop seeds instead
             # No Location, an off-domain target, a malformed one, or the hop cap: the robots
-            # chain ends here, so this call has to seed or the crawl fetches nothing.
+            # chain ends here, so this call has to seed or the crawl fetches nothing. A
+            # robots.txt we could not READ named no sitemap by definition, so probe (#77).
+            try:
+                outputs.extend(self._sitemap_probe_requests())
+            except Exception:
+                self.logger.debug("sitemap probing failed", exc_info=True)
             return outputs, False
         return self._robots_body_outputs(response, outputs), False
 
@@ -911,6 +921,7 @@ class WebsiteSpider(scrapy.Spider):
         # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
         # Guarded on TextResponse: a binary body has no `.text`. Each line is guarded on its
         # own so ONE malformed `Sitemap:` URL cannot cost the others, or the seed.
+        listed_a_sitemap = False
         if isinstance(response, TextResponse):
             try:
                 lines = response.text.splitlines()
@@ -922,6 +933,7 @@ class WebsiteSpider(scrapy.Spider):
                 try:
                     sm_url = line.split(":", 1)[1].strip()
                     if sm_url and self.is_internal(sm_url):
+                        listed_a_sitemap = True
                         outputs.append(scrapy.Request(
                             sm_url, callback=self.parse_sitemap, dont_filter=True,
                         ))
@@ -931,7 +943,132 @@ class WebsiteSpider(scrapy.Spider):
                         "Skipping an unparseable Sitemap: line in %s", response.url,
                         exc_info=True,
                     )
+        # Sitemap discovery was single-source (issue #77): a site whose robots.txt omits the
+        # `Sitemap:` line got NO sitemap seeding and silently degraded to link-following
+        # only -- the same class of silent degradation as #52, reached a different way.
+        if not listed_a_sitemap:
+            # Contained like every other stage here: _robots_outputs must not raise, or the
+            # seed is skipped and the crawl reports `completed` with nothing (issue #76).
+            try:
+                outputs.extend(self._sitemap_probe_requests())
+            except Exception:
+                self.logger.debug("sitemap probing failed", exc_info=True)
         return outputs
+
+    # Conventional sitemap locations, probed only when robots.txt names none (issue #77).
+    # Ordered most-likely-first so the common case is found on the first hit; every one is
+    # tried regardless (a site can serve several), but a hit on any is enough to recover the
+    # coverage. `/sitemap_index.xml` leads because Yoast is the most common WP setup and is
+    # exactly what gastro.org serves -- 2,347 URLs we never looked for, because its
+    # robots.txt has no `Sitemap:` line.
+    SITEMAP_PROBE_PATHS = (
+        "/sitemap_index.xml",   # Yoast
+        "/sitemap.xml",         # the de facto standard
+        "/wp-sitemap.xml",      # WordPress core >= 5.5
+        "/sitemap-index.xml",
+    )
+
+    def _sitemap_probe_requests(self):
+        """Speculative fetches of the conventional sitemap locations.
+
+        Only reached when robots.txt listed no on-domain `Sitemap:`, so this costs a handful
+        of requests on the miss path and nothing at all on a site that points us at its own.
+        Robots-disallowed paths are skipped -- a probe is still a fetch, and guessing a URL
+        is not a reason to stop obeying the site."""
+        for path in self.SITEMAP_PROBE_PATHS:
+            url = urljoin(self.start_urls[0], path)
+            if self.is_robots_disallowed(url):
+                self._stat("seeding/sitemap_probes_disallowed")
+                continue
+            self._stat("seeding/sitemap_probes_sent")
+            yield scrapy.Request(
+                url, callback=self.parse_sitemap_probe, errback=self.sitemap_probe_failed,
+                dont_filter=True,
+                # Suppress the Referer for the same reason the start URL does: these are
+                # yielded from parse_robots, so RefererMiddleware would stamp robots.txt on
+                # them and the emitted row would assert that robots.txt LINKED to this
+                # sitemap -- false in the only situation this code can run, since robots.txt
+                # naming no sitemap is the trigger.
+                headers={"Referer": None},
+                meta={"guessed_source": True, "probe_hops": 0},
+            )
+
+    def parse_sitemap_probe(self, response):
+        """A GUESSED sitemap URL coming back. Unlike `parse_sitemap` this emits NOTHING
+        unless the guess was right.
+
+        That distinction is the whole point. `parse_sitemap` emits a row for every response
+        it sees, which is correct for a URL the site told us about -- but these are URLs we
+        invented, and most sites will 404 three of the four. Emitting those would put
+        phantom broken links in the crawl, and the report presents 404s as "broken links on
+        the site" with a referrer. We would be inventing defects in a client's site and then
+        reporting them back."""
+        # A redirect is the STRONGEST evidence a sitemap exists -- a site that 301s
+        # /sitemap.xml somewhere is telling us where it lives. `parse_sitemap` already
+        # follows one on-domain hop; dropping it here lost the discovery entirely for any
+        # site that redirects to a path we don't guess (/sitemaps/sitemap.xml, an apex->www
+        # hop). Bounded to one hop, on-domain only, same as the sibling.
+        if response.status in self.REDIRECT_STATUSES:
+            target = response.headers.get("Location")
+            hops = response.meta.get("probe_hops", 0)
+            if target and hops < 1:
+                try:
+                    tgt = response.urljoin(target.decode("latin-1"))
+                except Exception:
+                    tgt = None
+                if tgt and self.is_internal(tgt):
+                    yield scrapy.Request(
+                        tgt, callback=self.parse_sitemap_probe,
+                        errback=self.sitemap_probe_failed, dont_filter=True,
+                        headers={"Referer": None},
+                        meta={"guessed_source": True, "probe_hops": hops + 1},
+                    )
+                    return
+            self._stat("seeding/sitemap_probes_missed")
+            return
+        if response.status != 200 or not isinstance(response, TextResponse):
+            self._stat("seeding/sitemap_probes_missed")
+            return
+        # Slice BEFORE stripping: `.lstrip()` on a 64MB body copies the whole thing for a
+        # 512-char peek. Skip an XML declaration, a BOM, a stylesheet PI, comments and
+        # whitespace, then require the root element -- `<urlset` appearing anywhere in the
+        # first 512 bytes would accept an HTML page that merely mentions it. Prefix-agnostic
+        # (`<sm:urlset`), matching the `local-name()` xpath this feeds.
+        try:
+            head = response.text[:4096]
+        except Exception:
+            self._stat("seeding/sitemap_probes_missed")
+            return
+        if not self._looks_like_sitemap(head):
+            # A soft-404 HTML page, or a catch-all route. Common enough that treating it as
+            # a sitemap would be worse than missing one.
+            self._stat("seeding/sitemap_probes_not_a_sitemap")
+            return
+        self._stat("seeding/sitemap_probes_found")
+        self.logger.info(
+            "Found a sitemap at %s -- robots.txt listed none (issue #77)", response.url
+        )
+        yield from self.parse_sitemap(response)
+
+    # An XML prologue: declaration, BOM, stylesheet/other PIs, comments, DOCTYPE, whitespace.
+    _XML_PROLOGUE = re.compile(
+        r"^(?:\ufeff|\s+|<\?[^>]*\?>|<!--.*?-->|<!DOCTYPE[^>]*>)+", re.DOTALL | re.IGNORECASE
+    )
+    # The root element, optionally namespace-prefixed.
+    _SITEMAP_ROOT = re.compile(r"^<(?:[A-Za-z0-9_.-]+:)?(?:urlset|sitemapindex)[\s>]", re.IGNORECASE)
+
+    @classmethod
+    def _looks_like_sitemap(cls, head: str) -> bool:
+        """Whether this body's ROOT element is a sitemap. Anchored, so an HTML page that
+        merely contains the string `<urlset` is rejected; prefix-tolerant, so `<sm:urlset`
+        is accepted -- the xpath this feeds uses local-name() and would have parsed it."""
+        return bool(cls._SITEMAP_ROOT.match(cls._XML_PROLOGUE.sub("", head, count=1).lstrip()))
+
+    def sitemap_probe_failed(self, failure):
+        """A probe that never landed (DNS/refused/timeout). Speculative, so it is counted
+        and dropped -- it must never touch the crawl's outcome."""
+        self._stat("seeding/sitemap_probes_missed")
+        self.logger.debug("sitemap probe failed: %s", failure)
 
     def parse_sitemap(self, response):
         # Record sitemap fetch. `sitemaps_fetched` vs `seeding/robots_fetched` distinguishes
@@ -954,19 +1091,52 @@ class WebsiteSpider(scrapy.Spider):
             self.logger.info("Skipping non-text sitemap: %s", response.url)
             return
 
-        # Pull <loc> values from XML (supports sitemap + index)
+        # Pull <loc> values from XML (supports sitemap + index). Provenance rides along:
+        # a sitemap we GUESSED the location of is an unverified list (issue #77).
+        guessed = bool(response.meta.get("guessed_source"))
         for loc in response.xpath("//*[local-name()='loc']/text()").getall():
             if self.is_internal(loc):
-                yield from self._schedule(loc, referrer_emit=self.normalize_url(response.url, exclude_params=self.exclude_params_emit))
+                yield from self._schedule(
+                    loc,
+                    referrer_emit=self.normalize_url(response.url, exclude_params=self.exclude_params_emit),
+                    guessed_source=guessed,
+                )
 
         # Follow nested sitemap indexes if present
         for sm in response.xpath("//*[local-name()='sitemap']/*[local-name()='loc']/text()").getall():
             if self.is_internal(sm):
-                yield scrapy.Request(sm, callback=self.parse_sitemap, dont_filter=True)
+                yield scrapy.Request(
+                    sm, callback=self.parse_sitemap, dont_filter=True,
+                    meta={"guessed_source": True} if guessed else {},
+                )
 
     # ---------- Main parse ----------
 
     def parse(self, response):
+        # A dead URL from a sitemap WE GUESSED the location of is not a defect in the
+        # client's site (issue #77 review). robots.txt naming no sitemap is the ONLY
+        # condition under which we guess, so a guessed file is by construction one the site
+        # chose not to advertise -- very often a leftover from a previous platform. A stale
+        # /sitemap.xml listing 400 pre-migration URLs would otherwise emit 400 real 404 rows:
+        # the corpus counts every 4xx into blocked_page_count, divides by page_count, and
+        # flips the report to `wholesale_blocked` at 90% -- telling the client "we couldn't
+        # read this site" about a site we read perfectly, and inflating the headline page
+        # count with pages that do not exist.
+        #
+        # So it is emitted as a SKIP row instead: the corpus routes any row with a
+        # skip_reason to excluded_urls, never page_versions, so it never counts as a page,
+        # never scores as a block, and still surfaces honestly under coverage. A LIVE page
+        # from a guessed sitemap is a completely normal row -- this only diverts the dead
+        # ones, which is exactly the class we have no business asserting anything about.
+        if response.meta.get("guessed_source") and self._is_error_status(response.status):
+            self.crawler.stats.inc_value("guessed_sitemap_dead_urls")
+            yield self._skip_row(
+                self.normalize_url(response.url, exclude_params=self.exclude_params_emit),
+                "guessed_sitemap_dead",
+                response.meta.get("referrer_emit") or "",
+            )
+            return
+
         # Emit the fetched page once (using emit-mode normalization)
         yield from self._emit_row(response)
 
@@ -1286,6 +1456,14 @@ class WebsiteSpider(scrapy.Spider):
         row.update(self._enrichment(response))
         yield row
 
+    @staticmethod
+    def _is_error_status(status) -> bool:
+        """4xx/5xx. A dead URL, whatever the flavour."""
+        try:
+            return 400 <= int(status) < 600
+        except (TypeError, ValueError):
+            return False
+
     def _skip_row(self, url: str, reason: str, referrer_emit: str | None) -> dict:
         """A feed row for a URL we deliberately did NOT fetch (issue #43): the URL, a zero
         status (never fetched), the skip `reason`, and the referrer that linked to it. The
@@ -1301,10 +1479,14 @@ class WebsiteSpider(scrapy.Spider):
             "skip_reason": reason,
         }
 
-    def _schedule(self, url, *, referrer_emit: str | None = None):
+    def _schedule(self, url, *, referrer_emit: str | None = None, guessed_source=False):
         """
         Normalize with schedule-mode (pagination retained when reach_pagination=1),
         de-dup, and enqueue the next request. Record the first referrer seen.
+
+        `guessed_source` marks a URL we found in a sitemap WE GUESSED the location of
+        (issue #77) rather than one the site pointed us at. See `parse` for why that
+        provenance has to survive as far as the emitted row.
         """
         self._bind_dedup_state()  # first-use restore from JOBDIR (issue #52)
         if not self.is_internal(url):
@@ -1378,7 +1560,10 @@ class WebsiteSpider(scrapy.Spider):
         # Request the URL as NORMALIZED, not as the dedup key: the key reorders facet
         # slots into a canonical form that the site may not serve. The first ordering we
         # saw is a real, working URL.
-        yield scrapy.Request(normalized, callback=self.parse, dont_filter=True)
+        yield scrapy.Request(
+            normalized, callback=self.parse, dont_filter=True,
+            meta={"guessed_source": True} if guessed_source else {},
+        )
 
     def parse_asset(self, response):
         """
