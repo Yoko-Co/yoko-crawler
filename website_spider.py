@@ -764,7 +764,7 @@ class WebsiteSpider(scrapy.Spider):
             # stats_extension can assert BOTH halves ran.
             self._stat("seeding/start_urls_emitted")
             yield scrapy.Request(
-                url, callback=self.parse, dont_filter=True,
+                url, callback=self.parse, errback=self.page_failed, dont_filter=True,
                 # Suppress the Referer. The start URL is now yielded from a callback, so
                 # Scrapy's RefererMiddleware would stamp `/robots.txt` on it and _emit_row's
                 # header fallback would report the site root as "linked from robots.txt" --
@@ -952,7 +952,8 @@ class WebsiteSpider(scrapy.Spider):
                     if sm_url and self.is_internal(sm_url):
                         listed_a_sitemap = True
                         outputs.append(scrapy.Request(
-                            sm_url, callback=self.parse_sitemap, dont_filter=True,
+                            sm_url, callback=self.parse_sitemap,
+                            errback=self.sitemap_failed, dont_filter=True,
                         ))
                 except Exception:
                     self._stat("seeding/sitemap_url_unparseable")
@@ -1081,6 +1082,13 @@ class WebsiteSpider(scrapy.Spider):
         is accepted -- the xpath this feeds uses local-name() and would have parsed it."""
         return bool(cls._SITEMAP_ROOT.match(cls._XML_PROLOGUE.sub("", head, count=1).lstrip()))
 
+    def sitemap_failed(self, failure):
+        """A sitemap the site ADVERTISED that we could not fetch. Counted, not emitted as a
+        row: a sitemap is not a page, so reporting it under "pages we couldn't reach" would
+        be wrong. Without an errback it was an unhandled failure in the crawl log."""
+        self._stat("sitemap_fetch_failed")
+        self.logger.warning("Could not fetch a listed sitemap: %s", failure)
+
     def sitemap_probe_failed(self, failure):
         """A probe that never landed (DNS/refused/timeout). Speculative, so it is counted
         and dropped -- it must never touch the crawl's outcome."""
@@ -1100,7 +1108,9 @@ class WebsiteSpider(scrapy.Spider):
             if target:
                 tgt = response.urljoin(target.decode("latin-1"))
                 if self.is_internal(tgt):
-                    yield scrapy.Request(tgt, callback=self.parse_sitemap)
+                    yield scrapy.Request(
+                        tgt, callback=self.parse_sitemap, errback=self.sitemap_failed,
+                    )
             return
 
         # Skip non-text sitemaps like .gz
@@ -1123,7 +1133,8 @@ class WebsiteSpider(scrapy.Spider):
         for sm in response.xpath("//*[local-name()='sitemap']/*[local-name()='loc']/text()").getall():
             if self.is_internal(sm):
                 yield scrapy.Request(
-                    sm, callback=self.parse_sitemap, dont_filter=True,
+                    sm, callback=self.parse_sitemap, errback=self.sitemap_failed,
+                    dont_filter=True,
                     meta={"guessed_source": True} if guessed else {},
                 )
 
@@ -1481,6 +1492,117 @@ class WebsiteSpider(scrapy.Spider):
         except (TypeError, ValueError):
             return False
 
+    # Transport-failure classification (issue #73).
+    #
+    # These names are VERIFIED against the installed stack, not assumed. Scrapy 2.18 does
+    # NOT surface Twisted's exceptions: `scrapy/utils/_download_handlers.py` wraps every one
+    # of them (`DNSLookupError` -> `CannotResolveHostError`, `TxTimeoutError` ->
+    # `DownloadTimeoutError`, `TxConnectionRefusedError` -> `DownloadConnectionRefusedError`,
+    # `CancelledError` -> `DownloadCancelledError`, everything else -> `DownloadFailedError`).
+    # A first cut of this table listed the Twisted names and was therefore entirely dead: in
+    # production every failure would have classified as `other`, and the per-reason counts
+    # this whole chain exists to produce would all have been zero.
+    #
+    # The `--impersonate` path is a SECOND stack. scrapy-impersonate uses curl_cffi, whose
+    # exceptions never pass through Scrapy's wrapper -- and that path is the one used on
+    # exactly the Cloudflare/Kinsta-fronted clients where reachability matters most.
+    #
+    # Matching is still by class NAME so we import neither library's internals, which move
+    # between versions. Unknown names degrade to `other`, which is honest -- we saw a
+    # failure and cannot name it -- rather than crashing a crawl.
+    _TRANSPORT_FAILURE_KINDS = (
+        # Scrapy 2.13+ wrapped exceptions
+        (("CannotResolveHostError",), "dns"),
+        (("DownloadTimeoutError",), "timeout"),
+        (("DownloadConnectionRefusedError",), "connection"),
+        (("DownloadFailedError", "ResponseDataLossError"), "connection"),
+        (("UnsupportedURLSchemeError",), "other"),
+        # curl_cffi, via scrapy-impersonate
+        (("DNSError",), "dns"),
+        (("ConnectTimeout", "ReadTimeout", "Timeout"), "timeout"),
+        (("ConnectionError", "ProxyError", "IncompleteRead",
+          "ChunkedEncodingError"), "connection"),
+        (("CertificateVerifyError", "SSLError"), "tls"),
+        # Raw Twisted names, still reachable on older Scrapy within the `>=2.13,<3` pin and
+        # from code paths that bypass the wrapper. Harmless to keep; cheap insurance.
+        (("DNSLookupError",), "dns"),
+        (("TimeoutError", "TCPTimedOutError", "UserTimeoutError"), "timeout"),
+        (("CertificateError", "SSLHandshakeError", "OpenSSLError"), "tls"),
+        (("ConnectionRefusedError", "ConnectionLost", "ConnectionDone", "ConnectError",
+          "ConnectBindError", "ResponseNeverReceived", "ResponseFailed"), "connection"),
+    )
+    # Never reported as a site failure -- a fix for "we lose failures" must not invent them.
+    #
+    # `IgnoreRequest` is OUR OWN middleware declining the request (the SSRF guard); blaming
+    # the site for our decision would be wrong.
+    #
+    # A CANCELLATION is us aborting a download that the server was answering fine. The live
+    # source is DOWNLOAD_MAXSIZE (64MB): an extensionless download endpoint is fetched as a
+    # page, and Scrapy raises `DownloadCancelledError` when the body crosses the cap. The
+    # server responded perfectly; we hung up. Reporting that as "the host may be down or
+    # gone" is a defect we would be inventing in the client's site.
+    #
+    # NOTE the earlier justification for this guard -- that a CLOSESPIDER_TIMEOUT close
+    # cancels every in-flight download at once -- was wrong. `_Slot.close()` DRAINS
+    # in-flight requests rather than cancelling them, and the memusage and SIGTERM paths go
+    # through the same close. The guard is still needed, for the size-cap reason above.
+    _NOT_A_SITE_FAILURE = (
+        "IgnoreRequest", "DownloadCancelledError", "CancelledError",
+    )
+    @classmethod
+    def _classify_transport_failure(cls, exc_name: str) -> str | None:
+        """A stable reason token for a transport failure, or None when the failure is not
+        the site's fault and must not be reported as coverage."""
+        if exc_name in cls._NOT_A_SITE_FAILURE:
+            return None
+        for names, kind in cls._TRANSPORT_FAILURE_KINDS:
+            if exc_name in names:
+                return kind
+        return "other"
+
+    def page_failed(self, failure):
+        """A scheduled request that never produced a response (issue #73).
+
+        DNS failure, refused/reset connection, TLS error or a per-request timeout produce NO
+        response, so `parse` never runs and no row is emitted. Scrapy tallies
+        `downloader/exception_count`, but with no errback the specific URL and reason were
+        lost -- the page simply vanished from the crawl. "We tried to reach N pages and
+        couldn't" is real coverage, and it is distinct both from a 4xx/5xx (recorded) and
+        from the auth-gated skips (#43).
+
+        Fires only after RetryMiddleware has exhausted its retries, so a transient blip that
+        later succeeded is never reported.
+
+        Emitted as a SKIP row, the #43 mechanism: the corpus routes any row carrying a
+        skip_reason to excluded_urls and never to page_versions, so an unreachable URL
+        surfaces under coverage without ever counting as a page or scoring as a block."""
+        request = getattr(failure, "request", None)
+        url = getattr(request, "url", "") or ""
+        exc_name = type(getattr(failure, "value", failure)).__name__
+        kind = self._classify_transport_failure(exc_name)
+        if kind is None:
+            self._stat("transport_failures_not_reported")
+            self.logger.debug("Not a site failure (%s): %s", exc_name, url)
+            return
+        self._stat("transport_failures")
+        self._stat(f"transport_failures/{kind}")
+        self.logger.info("Unreachable (%s / %s): %s", kind, exc_name, url)
+        if not url:
+            return
+        # SCHEDULE-normalized, like the `login_gated` sibling in `_schedule` -- NOT
+        # emit-normalized. `reach_pagination=1` is always on in run_spider, so emit-mode
+        # strips `?page=N`: emitting `/blog/?page=14` as `/blog/` would list a URL that
+        # crawled fine under "never responded", and the corpus upsert is keyed on
+        # (crawl_id, url) so 18 failed pagination pages would collapse into one row with the
+        # wrong name. The identity of the thing that failed is the point of the row.
+        schedule_url = self.normalize_url(url, exclude_params=self.exclude_params_schedule)
+        self._bind_dedup_state()  # restore first_referrer on a resumed session (#52)
+        yield self._skip_row(
+            schedule_url,
+            f"unreachable_{kind}",
+            self.first_referrer.get(self.facet_dedup_key(schedule_url)),
+        )
+
     def _skip_row(self, url: str, reason: str, referrer_emit: str | None) -> dict:
         """A feed row for a URL we deliberately did NOT fetch (issue #43): the URL, a zero
         status (never fetched), the skip `reason`, and the referrer that linked to it. The
@@ -1564,6 +1686,7 @@ class WebsiteSpider(scrapy.Spider):
             yield scrapy.Request(
                 normalized,
                 callback=self.parse_asset,
+                errback=self.page_failed,
                 method="HEAD",
                 dont_filter=True,
             )
@@ -1578,7 +1701,7 @@ class WebsiteSpider(scrapy.Spider):
         # slots into a canonical form that the site may not serve. The first ordering we
         # saw is a real, working URL.
         yield scrapy.Request(
-            normalized, callback=self.parse, dont_filter=True,
+            normalized, callback=self.parse, errback=self.page_failed, dont_filter=True,
             meta={"guessed_source": True} if guessed_source else {},
         )
 

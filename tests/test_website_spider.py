@@ -2303,3 +2303,142 @@ class TestSitemapProbeHardening:
     def test_a_namespace_prefixed_root_is_accepted(self):
         """The xpath this feeds uses local-name() and would have parsed it."""
         assert WebsiteSpider._looks_like_sitemap('<sm:urlset xmlns:sm="http://x">')
+
+
+class TestTransportFailures:
+    """Issue #73: a URL whose request never produced a response vanished from the crawl.
+
+    Every exception here is the REAL class raised by the installed stack, imported rather
+    than fabricated. A first cut of this suite built fixtures with
+    `type("DNSLookupError", (Exception,), {})` -- it constructed the name it then asserted
+    the table matched, so eight tests passed against a table that was entirely dead in
+    production. Scrapy 2.18 wraps every Twisted download exception into its own class, and
+    the --impersonate path raises curl_cffi's instead."""
+
+    def _spider(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _failure(self, exc, url="https://example.com/gone"):
+        return types.SimpleNamespace(value=exc, request=Request(url))
+
+    def _kind(self, spider, exc, url="https://example.com/gone"):
+        rows = list(spider.page_failed(self._failure(exc, url)))
+        return rows[0]["skip_reason"] if rows else None
+
+    def test_scrapys_own_wrapped_exceptions_are_classified(self):
+        """These are what Scrapy 2.18 ACTUALLY raises -- it converts Twisted's exceptions in
+        `scrapy/utils/_download_handlers.py` before any errback sees them."""
+        from scrapy.exceptions import (
+            CannotResolveHostError, DownloadConnectionRefusedError, DownloadFailedError,
+            DownloadTimeoutError,
+        )
+        cases = [
+            (CannotResolveHostError("no such host"), "unreachable_dns"),
+            (DownloadTimeoutError("timed out"), "unreachable_timeout"),
+            (DownloadConnectionRefusedError("refused"), "unreachable_connection"),
+            (DownloadFailedError("reset"), "unreachable_connection"),
+        ]
+        for exc, expected in cases:
+            assert self._kind(self._spider(), exc) == expected, type(exc).__name__
+
+    def test_curl_cffi_exceptions_are_classified(self):
+        """The --impersonate path is a second stack whose exceptions never pass through
+        Scrapy's wrapper -- and it is the path used on the Cloudflare/Kinsta-fronted clients
+        where reachability matters most."""
+        from curl_cffi.requests import exceptions as ce
+        cases = [
+            (ce.DNSError("dns"), "unreachable_dns"),
+            (ce.ConnectTimeout("slow"), "unreachable_timeout"),
+            (ce.ReadTimeout("slow"), "unreachable_timeout"),
+            (ce.ConnectionError("refused"), "unreachable_connection"),
+            (ce.ProxyError("proxy"), "unreachable_connection"),
+            (ce.CertificateVerifyError("bad cert"), "unreachable_tls"),
+        ]
+        for exc, expected in cases:
+            assert self._kind(self._spider(), exc) == expected, type(exc).__name__
+
+    def test_an_unknown_failure_degrades_to_other(self):
+        """Honest: we saw a failure and cannot name it. Never a crash."""
+        s = self._spider()
+        assert self._kind(s, RuntimeError("something new")) == "unreachable_other"
+
+    def test_a_dns_failure_emits_a_complete_skip_row(self):
+        from scrapy.exceptions import CannotResolveHostError
+        s = self._spider()
+        rows = list(s.page_failed(self._failure(CannotResolveHostError("x"))))
+        assert len(rows) == 1
+        assert rows[0]["skip_reason"] == "unreachable_dns"
+        assert rows[0]["url"] == "https://example.com/gone"
+        assert rows[0]["status"] == 0, "never fetched, so never a status"
+        assert s.crawler.stats.values.get("transport_failures/dns") == 1
+
+    def test_our_own_ssrf_refusal_is_not_reported_as_a_site_failure(self):
+        """IgnoreRequest is OUR middleware declining the request. Reporting it as "we
+        couldn't reach this page" blames the site for our decision."""
+        from scrapy.exceptions import IgnoreRequest
+        s = self._spider()
+        assert list(s.page_failed(self._failure(IgnoreRequest("ssrf")))) == []
+        assert s.crawler.stats.values.get("transport_failures") is None
+        assert s.crawler.stats.values.get("transport_failures_not_reported") == 1
+
+    def test_a_size_capped_download_is_not_reported_as_unreachable(self):
+        """THE REVERSAL THIS COULD HAVE SHIPPED, and the guard that missed it. Scrapy raises
+        DownloadCancelledError when a body crosses DOWNLOAD_MAXSIZE (64MB) -- an
+        extensionless download endpoint serving a 90MB PDF is fetched as a page and aborted
+        mid-stream. The server answered perfectly; WE hung up. The first cut guarded the
+        Twisted name `CancelledError`, which Scrapy 2.18 never surfaces, so the report would
+        have told the client that URL "never responded -- the host may be down or gone"."""
+        from scrapy.exceptions import DownloadCancelledError
+        s = self._spider()
+        assert list(s.page_failed(self._failure(DownloadCancelledError("too big")))) == []
+        assert s.crawler.stats.values.get("transport_failures") is None
+
+    def test_the_failed_url_keeps_its_identity(self):
+        """SCHEDULE-normalized, not emit-normalized. run_spider always sets
+        reach_pagination=1, so emit-mode strips `?page=N` -- emitting `/blog/?page=14` as
+        `/blog/` would list a URL that crawled fine under "never responded", and the corpus
+        upsert keyed on (crawl_id, url) would collapse 18 failed pagination pages into one
+        row with the wrong name."""
+        from scrapy.exceptions import DownloadTimeoutError
+        s = WebsiteSpider(domain="example.com", reach_pagination="1")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        rows = list(s.page_failed(
+            self._failure(DownloadTimeoutError("x"), "https://example.com/blog/?page=14")))
+        assert rows[0]["url"] == "https://example.com/blog/?page=14"
+
+    def test_the_referrer_is_carried_through(self):
+        """Which page linked to the dead host is the actionable half of the signal."""
+        from scrapy.exceptions import CannotResolveHostError
+        s = self._spider()
+        key = s.facet_dedup_key(s.normalize_url("https://example.com/gone",
+                                                exclude_params=s.exclude_params_schedule))
+        s.first_referrer[key] = "https://example.com/sponsors"
+        rows = list(s.page_failed(self._failure(CannotResolveHostError("x"))))
+        assert rows[0]["referrer"] == "https://example.com/sponsors"
+
+    def test_scheduled_requests_carry_the_errback(self):
+        s = self._spider()
+        reqs = list(s._schedule("https://example.com/about"))
+        assert reqs and all(r.errback == s.page_failed for r in reqs)
+
+    def test_asset_head_requests_carry_the_errback(self):
+        s = self._spider()
+        reqs = list(s._schedule("https://example.com/brochure.pdf"))
+        assert reqs and all(r.errback == s.page_failed for r in reqs)
+
+    def test_every_scheduled_request_in_the_spider_has_an_errback(self):
+        """A request without one loses its failure silently -- the bug this issue is about."""
+        import re as _re, inspect as _inspect
+        src = _inspect.getsource(WebsiteSpider)
+        calls = _re.findall(r"scrapy\.Request\((.*?)\)\n", src, _re.DOTALL)
+        missing = [c for c in calls if "errback" not in c]
+        assert not missing, f"{len(missing)} scrapy.Request(...) without an errback"
+
+    def test_a_failure_with_no_request_does_not_raise(self):
+        from scrapy.exceptions import CannotResolveHostError
+        s = self._spider()
+        exc = CannotResolveHostError("x")
+        assert list(s.page_failed(types.SimpleNamespace(value=exc))) == []
+        assert s.crawler.stats.values.get("transport_failures") == 1

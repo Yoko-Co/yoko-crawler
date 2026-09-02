@@ -231,6 +231,20 @@ class ProgressWriter:
             # linked-file asset row), so the better configured the site the less likely we
             # identified it.
             "platform_signals": self.stats.get_value("platform_signals", {}) or {},
+            # Transport-failure coverage (issue #73): URLs that produced NO response at all
+            # -- DNS failure, refused connection, TLS error, per-request timeout. Distinct
+            # from a 4xx/5xx (which `blocking.status_counts` already carries) and from the
+            # auth-gated skips (#43). Counted after retries are exhausted, and never
+            # counting our own SSRF-guard refusals or the cancellations a crawl close
+            # produces -- neither is the site failing to answer.
+            "unreachable": {
+                "total": self.stats.get_value("transport_failures", 0),
+                "dns": self.stats.get_value("transport_failures/dns", 0),
+                "connection": self.stats.get_value("transport_failures/connection", 0),
+                "timeout": self.stats.get_value("transport_failures/timeout", 0),
+                "tls": self.stats.get_value("transport_failures/tls", 0),
+                "other": self.stats.get_value("transport_failures/other", 0),
+            },
             # Restriction observability (issue #74). The crawler deliberately does not fetch
             # several classes of URL, and until now NONE of those counts left Scrapy's stats
             # -- so a crawl the site itself had walled off was indistinguishable from a crawl
