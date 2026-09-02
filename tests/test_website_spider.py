@@ -2792,7 +2792,7 @@ class TestRobotsFetchBudget:
         assert DownloadTimeoutError  # imported: the name in RETRY_EXCEPTIONS resolves
         assert (d.RETRY_TIMES + 1) * d.DOWNLOAD_TIMEOUT == 540
         # ... against a 7200s session budget. The bound has to be a real fraction of that.
-        assert (d.RETRY_TIMES + 1) * WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT == 180
+        assert (d.RETRY_TIMES + 1) * WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT == 180
 
     def test_default_path_honours_our_bound_over_the_setting(self):
         """DownloadTimeoutMiddleware uses `setdefault`, so ours must survive it. If that
@@ -2800,7 +2800,7 @@ class TestRobotsFetchBudget:
         from scrapy.downloadermiddlewares.downloadtimeout import DownloadTimeoutMiddleware
         req = self._seed(self._spider())
         DownloadTimeoutMiddleware(180).process_request(req)
-        assert req.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert req.meta["download_timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
 
     def test_impersonate_path_is_bounded_too(self):
         """scrapy-impersonate hands curl_cffi whatever RequestParser produces and adds no
@@ -2809,7 +2809,7 @@ class TestRobotsFetchBudget:
         from scrapy_impersonate.parser import RequestParser
         req = self._seed(self._spider())
         args = RequestParser(req).as_dict()
-        assert args["timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert args["timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
 
     def test_impersonate_ignores_the_key_the_default_path_uses(self):
         """The reason `impersonate_args` is needed at all. Guards the day scrapy-impersonate
@@ -2830,8 +2830,8 @@ class TestRobotsFetchBudget:
             request=Request("https://example.com/robots.txt"),
         )
         hop = s._robots_redirect_request(resp)
-        assert hop.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
-        assert RequestParser(hop).as_dict()["timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert hop.meta["download_timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
+        assert RequestParser(hop).as_dict()["timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
         # ... without losing the hop counter that bounds the chain in the first place.
         assert hop.meta["robots_hops"] == 1
 
@@ -2854,7 +2854,7 @@ class TestRobotsFetchBudget:
         proceeds ALLOW-ALL -- so too short a bound silently converts "slow site" into "no
         robots.txt" and crawls a site that said Disallow, which is #76's harm by another
         door. 60s for 1KB is unreachable by any host that could serve a crawl at all."""
-        assert WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT >= 60, (
+        assert WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT >= 60, (
             "below 60s a slow-but-real robots.txt times out into robots_failed, which "
             "proceeds ALLOW-ALL -- _robots_budget_meta explicitly calls 30s inside the "
             "range a real site can take"
@@ -3184,8 +3184,8 @@ class TestRobotsBudgetCoverage:
                   if isinstance(r, Request) and r.url.endswith(".xml")]
         assert probes
         for r in probes:
-            assert r.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
-            assert RequestParser(r).as_dict()["timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+            assert r.meta["download_timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
+            assert RequestParser(r).as_dict()["timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
 
     def test_the_probe_redirect_follow_carries_the_budget(self):
         s = self._spider()
@@ -3196,7 +3196,7 @@ class TestRobotsBudgetCoverage:
         )
         resp.meta.update({"guessed_source": True, "probe_hops": 0})
         hop = next(r for r in s.parse_sitemap_probe(resp) if isinstance(r, Request))
-        assert hop.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert hop.meta["download_timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
         assert hop.meta["probe_hops"] == 1
 
     def test_the_retry_margin_is_pinned_not_inherited(self):
@@ -3228,9 +3228,9 @@ class TestRobotsBudgetCoverage:
         s = self._spider()
         seed = next(iter(s._seed_requests()))
         restored = pickle.loads(pickle.dumps(seed.to_dict(spider=s)))
-        assert restored["meta"]["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert restored["meta"]["download_timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
         assert restored["meta"]["impersonate_args"] == {
-            "timeout": WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT}
+            "timeout": WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT}
         assert restored["meta"]["max_retry_times"] == WebsiteSpider.ROBOTS_MAX_RETRY_TIMES
 
     def test_the_budget_survives_a_retry(self):
@@ -3239,7 +3239,7 @@ class TestRobotsBudgetCoverage:
         s = self._spider()
         seed = next(iter(s._seed_requests()))
         again = seed.copy()
-        assert again.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert again.meta["download_timeout"] == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
         assert again.meta["max_retry_times"] == WebsiteSpider.ROBOTS_MAX_RETRY_TIMES
 
     def test_impersonate_args_is_inert_when_not_impersonating(self):
@@ -3294,3 +3294,79 @@ class TestAllowAllIsVisible:
             list(s.robots_failed(types.SimpleNamespace(value=OSError("dns is down"))))
         assert "dns is down" in caplog.text
         assert "OSError" in caplog.text
+
+
+class TestRobotsTimeoutOverride:
+    """Issue #92: the robots.txt budget gets an operator knob, mirroring the crawl-delay one
+    beside it -- but RAISE-ONLY, which is the whole design.
+
+    A SHORTER budget does not make crawls snappier. Timing out routes to `robots_failed`,
+    which proceeds ALLOW-ALL -- so tuning this down makes a slow site look like one with no
+    robots.txt and crawls it against a Disallow it never managed to read. The knob exists for
+    the opposite case: a genuinely slow host an operator wants to wait longer for."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_unset_uses_the_default(self, monkeypatch):
+        monkeypatch.delenv("YOKO_CRAWL_ROBOTS_TIMEOUT", raising=False)
+        s = self._spider()
+        assert s.robots_download_timeout == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
+
+    def test_a_higher_value_is_honoured_end_to_end(self, monkeypatch):
+        """Through the REAL consumers, not just the attribute -- the same discipline #82
+        needed, since the two download paths read different keys."""
+        from scrapy.downloadermiddlewares.downloadtimeout import DownloadTimeoutMiddleware
+        from scrapy_impersonate.parser import RequestParser
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "180")
+        s = self._spider()
+        assert s.robots_download_timeout == 180
+        seed = next(iter(s._seed_requests()))
+        DownloadTimeoutMiddleware(180).process_request(seed)
+        assert seed.meta["download_timeout"] == 180
+        assert RequestParser(seed).as_dict()["timeout"] == 180
+
+    def test_a_lower_value_is_refused_not_honoured(self, monkeypatch, caplog):
+        """The load-bearing one. Accepting 5s here would silently trade robots obedience for
+        speed on exactly the sites least able to answer quickly."""
+        import logging
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "5")
+        with caplog.at_level(logging.WARNING):
+            s = self._spider()
+        assert s.robots_download_timeout == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
+        assert "IGNORED" in caplog.text
+        assert "allow-all" in caplog.text, "the log must say WHY, not just that it clamped"
+
+    def test_zero_and_negative_cannot_disable_the_bound(self, monkeypatch):
+        """`0` reads as "no timeout" in several libraries; here it must not disable the gate."""
+        for raw in ("0", "-1", "-999"):
+            monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", raw)
+            assert self._spider().robots_download_timeout == \
+                WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT, raw
+
+    def test_junk_falls_back_loudly_rather_than_crashing_the_crawl(self, monkeypatch, caplog):
+        import logging
+        for raw in ("", "  ", "abc", "60s", "nan"):
+            monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", raw)
+            with caplog.at_level(logging.WARNING):
+                s = self._spider()
+            assert s.robots_download_timeout == \
+                WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT, raw
+
+    def test_a_float_string_is_accepted_as_a_whole_number_of_seconds(self, monkeypatch):
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "90.5")
+        assert self._spider().robots_download_timeout == 90
+
+    def test_the_knob_matches_its_sibling_in_shape(self, monkeypatch):
+        """#92's actual complaint was the ASYMMETRY -- one robots knob env-tunable, the other
+        not. Both are now resolved per-instance from the environment with a DEFAULT_ prefix
+        on the class constant, so neither reads as the odd one out."""
+        assert hasattr(WebsiteSpider, "DEFAULT_MAX_ROBOTS_CRAWL_DELAY")
+        assert hasattr(WebsiteSpider, "DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT")
+        monkeypatch.setenv("YOKO_CRAWL_MAX_ROBOTS_DELAY", "20")
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "120")
+        s = self._spider()
+        assert s.max_robots_crawl_delay == 20.0
+        assert s.robots_download_timeout == 120
