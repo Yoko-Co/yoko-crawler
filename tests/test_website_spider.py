@@ -1945,3 +1945,101 @@ class TestRobotsSeedRaceHardening:
         urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
         assert urls == ["https://example.com/"]
         assert s.is_robots_disallowed("https://example.com/private/x")
+
+
+class TestPlatformSignals:
+    """corpus #112: the crawler records what the server says about its CMS, because the URL
+    space cannot see a well-configured WordPress site. Review found this half had NO tests
+    and it is where the capture-point and selector bugs lived."""
+
+    def _spider(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _page(self, body=b"<html><head></head><body>hi</body></html>", headers=None,
+              status=200, url="https://example.com/"):
+        h = {"Content-Type": "text/html; charset=utf-8"}
+        h.update(headers or {})
+        return TextResponse(url=url, body=body, headers=h,
+                            request=Request(url), status=status)
+
+    def _signals(self, spider):
+        return spider.crawler.stats.values.get("platform_signals")
+
+    def test_wp_rest_link_header_is_recorded(self):
+        s = self._spider()
+        s._record_platform_signals(self._page(headers={
+            "Link": '<https://example.com/wp-json/>; rel="https://api.w.org/"'}))
+        assert self._signals(s)["wp-rest-api-link"]
+
+    def test_wp_rest_link_tag_is_recorded(self):
+        s = self._spider()
+        s._record_platform_signals(self._page(
+            body=b'<html><head><link rel="https://api.w.org/" href="/wp-json/"></head></html>'))
+        assert self._signals(s)["wp-rest-api-link"] == "https://api.w.org/"
+
+    def test_rel_is_matched_as_a_token_list(self):
+        """`rel` is space-separated; `rel="https://api.w.org/ alternate"` is valid markup."""
+        s = self._spider()
+        s._record_platform_signals(self._page(
+            body=b'<html><head><link rel="https://api.w.org/ alternate" href="/wp-json/">'
+                 b'</head></html>'))
+        assert self._signals(s)["wp-rest-api-link"] == "https://api.w.org/"
+
+    def test_generator_is_matched_case_insensitively(self):
+        """Drupal core emits `name="Generator"` with a capital G, and CSS attribute-VALUE
+        matching is case-sensitive — a [name="generator"] selector is blind to it."""
+        s = self._spider()
+        s._record_platform_signals(self._page(
+            body=b'<html><head><meta name="Generator" content="Drupal 10"></head></html>'))
+        assert self._signals(s)["generator"] == "Drupal 10"
+
+    def test_a_bare_x_powered_by_does_not_latch(self):
+        """THE BUG: latching on a non-identifying header stops us looking. A WordPress site
+        whose homepage is edge-cached (REST link and generator stripped) carries both on its
+        interior pages — latching on `PHP/8.2` leaves it reported as "Custom / other"."""
+        s = self._spider()
+        s._record_platform_signals(self._page(headers={"X-Powered-By": "PHP/8.2"}))
+        assert self._signals(s) is None
+        assert s._platform_recorded is False
+        # ...and the next page, which does identify the CMS, is still inspected.
+        s._record_platform_signals(self._page(
+            body=b'<html><head><meta name="generator" content="WordPress 6.9.4"></head></html>',
+            url="https://example.com/about"))
+        assert self._signals(s)["generator"] == "WordPress 6.9.4"
+
+    def test_an_identifying_signal_latches(self):
+        """One good observation is the whole answer; re-deriving per page is waste."""
+        s = self._spider()
+        s._record_platform_signals(self._page(
+            body=b'<html><head><meta name="generator" content="WordPress 6.9.4"></head></html>'))
+        assert s._platform_recorded is True
+        s._record_platform_signals(self._page(
+            body=b'<html><head><meta name="generator" content="Drupal 10"></head></html>',
+            url="https://example.com/other"))
+        assert self._signals(s)["generator"] == "WordPress 6.9.4"  # unchanged
+
+    def test_non_200_and_non_text_are_ignored(self):
+        s = self._spider()
+        s._record_platform_signals(self._page(status=404))
+        assert self._signals(s) is None
+
+    def test_values_are_length_capped(self):
+        s = self._spider()
+        s._record_platform_signals(self._page(
+            body=b'<html><head><meta name="generator" content="' + b"W" * 500
+                 + b'"></head></html>'))
+        assert len(self._signals(s)["generator"]) == WebsiteSpider._PLATFORM_VALUE_MAXLEN
+
+    def test_a_site_that_identifies_itself_with_nothing_records_nothing(self):
+        """Must stay absent, which the corpus reads as "no signal" — never as "not
+        WordPress"."""
+        s = self._spider()
+        s._record_platform_signals(self._page())
+        assert self._signals(s) is None
+
+    def test_recording_never_raises(self):
+        s = self._spider()
+        s.crawler = types.SimpleNamespace(stats=None)
+        s._record_platform_signals(self._page())  # no stats -> no-op, no exception

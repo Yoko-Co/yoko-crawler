@@ -326,6 +326,7 @@ class WebsiteSpider(scrapy.Spider):
             return
         try:
             signals = {}
+            identifying = False
             for header, needle, token in self._PLATFORM_HEADER_SIGNALS:
                 raw = response.headers.getlist(header.encode())
                 if not raw:
@@ -334,20 +335,37 @@ class WebsiteSpider(scrapy.Spider):
                 if needle and needle not in value.lower():
                     continue
                 signals[token] = value[: self._PLATFORM_VALUE_MAXLEN]
-            # <meta name="generator" content="WordPress 6.9.4"> and the spec'd WP REST
-            # discovery link, both in the head of the very page we just fetched.
-            gen = response.css('meta[name="generator"]::attr(content)').get()
-            if gen:
+                # A needle-matched header proved WHAT it is; a bare one (x-powered-by:
+                # PHP/8.2) merely exists.
+                identifying = identifying or bool(needle)
+            # <meta name="generator" content="WordPress 6.9.4">. XPath with a lowercase
+            # translate because CSS attribute-VALUE matching is case-sensitive in cssselect
+            # and Drupal core emits `name="Generator"` -- a `[name="generator"]` selector is
+            # silently blind to it.
+            gen = response.xpath(
+                "//meta[translate(@name, 'GENRATO', 'genrato')='generator']/@content"
+            ).get()
+            if gen and gen.strip():
                 signals["generator"] = gen.strip()[: self._PLATFORM_VALUE_MAXLEN]
-            if response.css('link[rel="https://api.w.org/"]'):
+                identifying = True
+            # `rel` is a space-separated TOKEN list, so `~=` not `=`:
+            # rel="https://api.w.org/ alternate" is valid and must still match.
+            if response.css('link[rel~="https://api.w.org/"]'):
                 signals["wp-rest-api-link"] = "https://api.w.org/"
-            if not signals:
-                # Nothing identifying on this page -- a later one may carry a generator, so
-                # don't latch. A site that never identifies itself stays unrecorded, which
-                # the corpus reads as "no signal", not as "not WordPress".
+                identifying = True
+            if not identifying:
+                # Nothing here NAMES a platform -- a bare `x-powered-by: PHP/8.2` is not an
+                # answer. Record nothing and keep looking: latching on it would stop us
+                # inspecting the interior pages, and a WordPress site whose homepage is
+                # served from an edge cache that strips the REST link and the generator
+                # carries both on its uncached pages. Latching there would leave the site
+                # reported as "Custom / other" -- issue #112, un-fixed, on a site that was
+                # telling us the answer one page later.
                 return
-            self._platform_recorded = True
+            # Flag set AFTER the write: if set_value raised we would be latched but
+            # unrecorded for the whole session.
             stats.set_value("platform_signals", signals)
+            self._platform_recorded = True
             self.logger.info("Platform signals for %s: %s", self.base_domain, sorted(signals))
         except Exception:
             self.logger.debug("could not record platform signals", exc_info=True)
@@ -952,8 +970,6 @@ class WebsiteSpider(scrapy.Spider):
         # Emit the fetched page once (using emit-mode normalization)
         yield from self._emit_row(response)
 
-        self._record_platform_signals(response)
-
         # A bot-wall challenge/block page (Cloudflare/WAF): the row is emitted (its 403/429
         # is the signal the corpus reads), but we do NOT follow its links -- they are the
         # wall's own challenge URLs (e.g. `?ki-cf-botcl=1`), not the site's navigation.
@@ -986,6 +1002,12 @@ class WebsiteSpider(scrapy.Spider):
         ctype = (response.headers.get("Content-Type") or b"").decode("latin-1").lower()
         if "html" not in ctype and "xml" not in ctype:
             return
+
+        # Platform fingerprint (corpus #112). BELOW the content-type guard on purpose: a
+        # linked .json/.csv export is not in ASSET_EXTENSIONS, so it arrives here as a full
+        # GET, and running a selector over it would build an lxml tree across up to
+        # DOWNLOAD_MAXSIZE (64MB) of non-markup for nothing.
+        self._record_platform_signals(response)
 
         # Page-level robots directive: <meta name="robots" content="...nofollow..."> (or the
         # `none` shorthand) means the site asks crawlers not to follow this page's links.
