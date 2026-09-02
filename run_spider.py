@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+import traceback
 import time
 
 from scrapy.crawler import CrawlerProcess
@@ -48,22 +49,40 @@ _DOWNLOAD_MAXSIZE = 64 * 1024 * 1024  # 64 MB
 _DOWNLOAD_WARNSIZE = 8 * 1024 * 1024  # 8 MB
 
 
-def _write_failed_status(status_file, error):
+def _status_already_advanced(status_file) -> bool:
+    """True when the spider has written its own status, so ours must not overwrite it (#98).
+
+    `job_manager` writes a `queued` stub before spawning and `ProgressWriter` moves it off
+    that value on `spider_opened`. Anything past the stub is the spider's own reporting and
+    is better evidence of what happened than a late failure handler's guess."""
+    try:
+        with open(status_file) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("status") not in (None, "queued")
+
+
+def _write_failed_status(status_file, error, failure_reason=None):
     """Write a terminal 'failed' status so job_manager surfaces ``error`` via the
     API instead of an opaque exit code -- ProgressWriter hasn't started yet when
-    a startup validation check fails."""
+    a startup validation check fails.
+
+    ``failure_reason`` carries the #44 classification token when the caller knows it.
+    Left None by the pre-flight validation callers, whose `error` string is already the
+    specific message; set to `spider_init_error` for a spider that never opened (#98)."""
     try:
+        payload = {
+            "status": "failed",
+            "urls_discovered": 0,
+            "urls_crawled": 0,
+            "updated_at": time.time(),
+            "error": error,
+        }
+        if failure_reason is not None:
+            payload["failure_reason"] = failure_reason
         with open(status_file, "w") as f:
-            json.dump(
-                {
-                    "status": "failed",
-                    "urls_discovered": 0,
-                    "urls_crawled": 0,
-                    "updated_at": time.time(),
-                    "error": error,
-                },
-                f,
-            )
+            json.dump(payload, f)
     except OSError:
         pass
 
@@ -438,17 +457,100 @@ def main():
         _write_failed_status(args.status_file, str(exc))
         sys.exit(1)
 
-    process = CrawlerProcess(settings=build_settings(args))
-    process.crawl(
-        WebsiteSpider,
-        domain=args.domain,
-        reach_pagination=1,
-        include_subdomains=0,
-        keep_pagination=0,
-        emit_content=1 if args.emit_content else 0,
-        output_format=args.format,
-    )
+    def _fail_before_the_spider_opened(error, traceback_text=None):
+        """Report a crawl that never opened, then exit non-zero (#98)."""
+        if traceback_text:
+            print(traceback_text, file=sys.stderr)
+        print(
+            f"SPIDER FAILED TO START: the crawl never opened, so it inventoried "
+            f"nothing. ({error})",
+            file=sys.stderr,
+        )
+        # `spider_init_error` joins the #44 failure_reason vocabulary the corpus maps onto
+        # its own failure_class. Distinct from `crawl_error` (an abnormal Scrapy CLOSE),
+        # because nothing was ever crawled -- there is no partial result to interpret.
+        _write_failed_status(
+            args.status_file,
+            f"Spider failed to start: {error}",
+            failure_reason="spider_init_error",
+        )
+        sys.exit(1)
+
+    # Everything from settings construction to `crawl()` can raise SYNCHRONOUSLY, before any
+    # Deferred exists to attach an errback to -- `custom_settings`/`update_settings` raise out
+    # of `process.crawl()` itself, and `build_settings` can reject a proxy. Those exited 1 but
+    # wrote NO classified status, reproducing #98's shape through a different door (#98
+    # review). Same handler as the async path, so the two cannot drift.
+    try:
+        process = CrawlerProcess(settings=build_settings(args))
+        deferred = process.crawl(
+            WebsiteSpider,
+            domain=args.domain,
+            reach_pagination=1,
+            include_subdomains=0,
+            keep_pagination=0,
+            emit_content=1 if args.emit_content else 0,
+            output_format=args.format,
+        )
+    except Exception as exc:                                  # noqa: BLE001
+        _fail_before_the_spider_opened(
+            f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__,
+            traceback.format_exc(),
+        )
+
+    # A spider that fails to CONSTRUCT must not look like a successful empty crawl (#98).
+    #
+    # Scrapy routes a `__init__`/`from_crawler` exception into the Deferred that `crawl()`
+    # returns. With no errback attached that Deferred goes unhandled: Twisted logs the
+    # traceback at garbage-collection time -- AFTER anything this function prints, so not
+    # even reliably ordered -- `process.start()` returns normally, and `main()` falls off the
+    # end and exits 0. `ProgressWriter` only starts on `spider_opened`, which never fired, so
+    # no status file is written either. `job_manager._monitor` then finds no terminal status,
+    # takes its `elif returncode == 0` branch, and reports the crawl COMPLETED with zero
+    # pages -- indistinguishable, to yoko-corpus, from a site that genuinely had nothing.
+    #
+    # Measured on this exact tree before the fix: exit code 0, and the job reported COMPLETED
+    # with zero pages. Note what production actually sees, since it is NOT "no status file":
+    # `job_manager._write_initial_status` always writes a `queued` stub before spawning, so the
+    # file exists and is simply stuck at the stub -- which is precisely why every existing check
+    # was satisfied. (Run standalone, with no job_manager, there is no file at all.) An `inf` in
+    # one droplet env var (#92) would have produced a run of clean-looking zero-page reports
+    # against client sites with nothing anywhere saying why.
+    #
+    # Attaching the errback also CONSUMES the failure, which is why the unhandled-Deferred
+    # traceback disappears -- so we log it ourselves, at ERROR, before exiting non-zero.
+    startup_failure = {}
+
+    def _spider_never_started(failure):
+        startup_failure["error"] = (
+            f"{type(failure.value).__name__}: {failure.value}"
+            if str(failure.value) else type(failure.value).__name__
+        )
+        startup_failure["traceback"] = failure.getTraceback()
+        return None      # handled -- do not re-raise into the reactor
+
+    deferred.addErrback(_spider_never_started)
     process.start()
+
+    if startup_failure:
+        # Only overwrite a status that never advanced. Measured on Scrapy 2.18, this Deferred
+        # errbacks ONLY at or before `spider_opened` -- a failure in `start()` or in a parse
+        # callback does NOT reach it -- so `spider_init_error` is honest today. But that is a
+        # property of Scrapy's internals, not a contract: if a future version routed a
+        # post-open failure here, this would clobber ProgressWriter's real terminal status
+        # with `urls_crawled: 0` and mislabel it (#98 review, raised independently by two
+        # reviewers). Checking first costs one stat and removes the whole class.
+        if _status_already_advanced(args.status_file):
+            print(
+                "Crawl failed after the spider had already opened; leaving the spider's own "
+                f"status in place. ({startup_failure['error']})",
+                file=sys.stderr,
+            )
+            print(startup_failure["traceback"], file=sys.stderr)
+            sys.exit(1)
+        _fail_before_the_spider_opened(
+            startup_failure["error"], startup_failure["traceback"]
+        )
 
 
 if __name__ == "__main__":

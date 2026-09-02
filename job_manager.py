@@ -375,8 +375,46 @@ class JobManager:
             if status_data and status_data.get("status") in ("completed", "failed"):
                 job.status = status_data["status"]
                 job.error = status_data.get("error")
-            elif job.process.returncode == 0:
+            elif job.process.returncode == 0 and not self._spider_never_opened(job, status_data):
                 job.status = "completed"
+            elif job.process.returncode == 0:
+                # Exit 0 with the status file STILL the queued stub is not success -- it is a
+                # crawl that never opened (#98).
+                #
+                # The discriminator is deliberately "the spider never overwrote our stub",
+                # not "there is no status file": `_write_initial_status` always writes one
+                # before the subprocess starts, so absence never happens on this path. That
+                # is exactly how the bug survived -- the stub satisfied every existing check,
+                # the `("completed", "failed")` branch was missed, and the crawl fell through
+                # to `elif returncode == 0` and reported COMPLETED with zero pages, which
+                # yoko-corpus cannot distinguish from a site that genuinely had nothing.
+                #
+                # `run_spider` now catches spider-construction failures itself and exits
+                # non-zero, so that route lands on the `else` below, not here.
+                #
+                # An earlier version of this comment justified the second guard with a list of
+                # causes -- kill, OOM, a failed exec -- that was simply WRONG: every one of
+                # them yields a NON-ZERO returncode and never reaches this branch (#98 review).
+                # The real independent cause is narrower and worth stating accurately: a
+                # SIGTERM landing inside the startup window leaves the crawl Deferred unfired,
+                # so guard 1 never runs and the process still exits 0. Beyond that this is a
+                # regression guard -- it holds if a future edit drops the errback -- and it
+                # cannot be bypassed from inside the subprocess. That is a smaller claim than
+                # the one it replaces, and it is the true one.
+                job.status = "failed"
+                job.error = (
+                    "Crawl never started: the process exited cleanly, produced no output, "
+                    "and no status was ever reported for it, so nothing was crawled. "
+                    "Reported as failed rather than an empty success."
+                )
+                logger.error(
+                    "CRAWL NEVER STARTED: the subprocess exited cleanly but produced no "
+                    "output and never reported a status, so the spider never opened. "
+                    "Reported as failed rather than an empty success, which the corpus "
+                    "cannot tell apart from a site that genuinely had nothing. Check the "
+                    "job log for a startup traceback.",
+                    job_id=job_id,
+                )
             else:
                 job.status = "failed"
                 job.error = f"Process exited with code {job.process.returncode}"
@@ -420,6 +458,35 @@ class JobManager:
                         job.process.kill()
                     except ProcessLookupError:
                         pass
+
+    @staticmethod
+    def _spider_never_opened(job: Job, status_data) -> bool:
+        """True when the subprocess exited without the spider ever opening (#98).
+
+        `ProgressWriter` attaches on `spider_opened` and writes every 3s after, so any crawl
+        that ran has moved the status off the pre-spawn `queued` stub. A missing or unreadable
+        file says the same thing, since `_write_initial_status` wrote one before spawning.
+
+        But the status alone is NOT sufficient evidence, and this is the review finding that
+        matters most here: `ProgressWriter._write_status` swallows OSError by design, so a
+        read-only or full status path makes a crawl that fetched five thousand pages exit 0
+        with the stub untouched -- and calling that "never started" fails a client's crawl that
+        worked, hiding a real inventory behind a 409. That false positive is worse per
+        occurrence than the empty-success it replaces.
+
+        So the claim is corroborated against the FEED, which is written on a different path and
+        cannot lie in the dangerous direction: a spider that never constructed cannot have
+        emitted a row. Output present => the spider opened, whatever the status file says."""
+        opened_by_status = not (
+            status_data is None or status_data.get("status") == "queued"
+        )
+        if opened_by_status:
+            return False
+        try:
+            produced_output = job.result_file.stat().st_size > 0
+        except OSError:
+            produced_output = False
+        return not produced_output
 
     async def _read_status_file(self, job: Job) -> dict | None:
         """Read the status file asynchronously, returning None on any error."""
@@ -576,9 +643,9 @@ class JobManager:
             # crawled the site, even though both report status "completed".
             "close_reason": status_data.get("close_reason"),
             # Structured failure token (issue #44): a stable discriminator
-            # (unreachable / ssrf_blocked / crawl_error) the corpus maps onto its own
-            # failure_class, instead of scraping the humanized `error` prose. None
-            # unless the crawl failed with a classified cause.
+            # (unreachable / ssrf_blocked / crawl_error / spider_init_error) the corpus
+            # maps onto its own failure_class, instead of scraping the humanized `error`
+            # prose. None unless the crawl failed with a classified cause.
             "failure_reason": status_data.get("failure_reason"),
             # Block/restriction observability (from the status file's `blocking` section):
             # waf_challenge_count (Cloudflare wall) vs origin_forbidden_count (member-
