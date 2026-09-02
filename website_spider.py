@@ -964,7 +964,7 @@ class WebsiteSpider(scrapy.Spider):
             # other two: `float()` happily accepts "inf"/"Infinity"/"1e400", and `int()` then
             # raises OverflowError on the result. Letting it escape killed spider construction,
             # which `run_spider.py` exits 0 from and the job manager reports as a COMPLETED
-            # zero-page crawl (#92 review; the exit-code seam is filed as #97). "nan" is the one
+            # zero-page crawl (#92 review; the exit-code seam is filed as #98). "nan" is the one
             # non-finite spelling that raises ValueError instead -- which is exactly why having
             # only "nan" in the junk test gave false confidence this class was covered.
             self.logger.warning(
