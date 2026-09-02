@@ -429,3 +429,18 @@ class TestRestrictionsBlock:
         )
         assert data["seeding"]["sitemap_probes_sent"] == 4
         assert data["seeding"]["sitemap_probes_found"] == 1
+
+
+def test_a_scheme_refused_empty_crawl_is_not_reported_as_unreachable(tmp_path):
+    """#89 review: `ssrf_guard/blocked_scheme` is an SSRF-guard drop like any other. Left
+    uncounted, a crawl the guard emptied by refusing non-http(s) URLs was classified
+    `unreachable`, whose text tells the operator the address is wrong -- sending them to
+    re-type a domain that was never the problem."""
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 0, "ssrf_guard/blocked_scheme": 3,
+         "downloader/exception_count": 3},
+        reason="finished",
+    )
+    assert data["failure_reason"] == "ssrf_blocked"
+    assert data["status"] == "failed"
