@@ -511,9 +511,40 @@ class WebsiteSpider(scrapy.Spider):
 
     # ---------- URL helpers ----------
 
+    # The only schemes a web crawl may fetch. Everything else is refused by `is_internal`
+    # BEFORE the host is even considered (issue #89).
+    #
+    # This is a scheme confusion bug, and the host check cannot catch it: `is_internal`
+    # compared only the hostname, so `file://<the-crawled-domain>/etc/passwd` matched the
+    # domain and was accepted. Scrapy registers handlers for `file`, `ftp`, `s3` and `data`
+    # in DOWNLOAD_HANDLERS_BASE, and `FileDownloadHandler` resolves the URL through
+    # `w3lib.url.file_uri_to_path`, which DISCARDS the host and reads the bare path -- so a
+    # site we crawl could make the crawler read a local file on the crawl host and carry it
+    # into the JOBDIR state and the NDJSON rows. `SsrfGuardMiddleware` does not close this
+    # either: it resolves the hostname and blocks reserved ADDRESSES, and the crawled
+    # domain resolves publicly, so the request passes it and reaches the local-file handler.
+    #
+    # Three intake paths take a value the REMOTE SERVER controls and had `is_internal` as
+    # their only validation: a `Location:` on a robots.txt redirect, a `Sitemap:` line, and
+    # a sitemap's `<loc>`. (The `<a href>` path was already safe -- `is_navigational_href`
+    # screens `_NONNAV_SCHEMES` first. The knowledge existed; the choke point did not cover
+    # these three.) Fixing it HERE rather than at each call site is deliberate: it fails
+    # closed, so a call site nobody enumerated cannot open the gate.
+    _FETCHABLE_SCHEMES = frozenset({"http", "https"})
+
     def is_internal(self, url: str) -> bool:
-        """Accept bare domain or www; optionally allow any subdomain of base domain."""
-        host = (urlparse(url).hostname or "").lower().rstrip(".")
+        """Accept bare domain or www; optionally allow any subdomain of base domain.
+
+        Non-http(s) schemes are refused outright -- see `_FETCHABLE_SCHEMES` (issue #89).
+        A scheme-LESS URL is refused by the same term, which is a fix rather than a
+        restriction: `Sitemap:` lines and sitemap `<loc>` values are NOT urljoined, so a
+        protocol-relative `//host/sitemap.xml` used to pass the host check and then reach
+        `scrapy.Request`, which raises `ValueError: Missing scheme in request url`. That is
+        now a clean skip instead of an exception mid-parse."""
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in self._FETCHABLE_SCHEMES:
+            return False
+        host = (parsed.hostname or "").lower().rstrip(".")
         if self.include_subdomains:
             return host == self.base_domain or host.endswith(f".{self.base_domain}")
         return host in {self.base_domain, f"www.{self.base_domain}"}

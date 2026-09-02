@@ -2442,3 +2442,136 @@ class TestTransportFailures:
         exc = CannotResolveHostError("x")
         assert list(s.page_failed(types.SimpleNamespace(value=exc))) == []
         assert s.crawler.stats.values.get("transport_failures") == 1
+
+
+class TestSchemeConfusion:
+    """Issue #89: `is_internal` compared the HOST and never the scheme, so a URL naming any
+    protocol was accepted as long as its hostname matched the crawled domain.
+
+    Three intake paths take a value the REMOTE SERVER controls and had `is_internal` as
+    their only validation -- a `Location:` on a robots.txt redirect, a `Sitemap:` line, and
+    a sitemap `<loc>`. The `<a href>` path was already safe via `_NONNAV_SCHEMES`, which is
+    what makes this a gap in coverage rather than in knowledge.
+    """
+
+    def _spider(self, domain="example.com", **kw):
+        s = WebsiteSpider(domain=domain, **kw)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_the_library_behaviour_that_makes_this_exploitable(self):
+        """Pinned against the REAL w3lib, because the whole finding rests on it: the host is
+        DISCARDED, so `file://<crawled-domain>/x` reads `/x` off the crawl host. Asserting
+        our own rejection without this would leave the reason unrecorded."""
+        from w3lib.url import file_uri_to_path
+        assert file_uri_to_path("file://example.com/etc/passwd") == "/etc/passwd"
+        from scrapy.settings import default_settings as d
+        # ... and Scrapy has a handler ready to act on it.
+        assert "file" in d.DOWNLOAD_HANDLERS_BASE
+        assert {"ftp", "s3", "data"} <= set(d.DOWNLOAD_HANDLERS_BASE)
+
+    def test_non_http_schemes_are_refused_despite_a_matching_host(self):
+        s = self._spider()
+        for url in (
+            "file://example.com/etc/passwd",
+            "file://www.example.com/etc/passwd",
+            "ftp://example.com/x",
+            "s3://example.com/x",
+            "data:text/plain,hi",
+            "javascript:alert(1)",
+        ):
+            assert s.is_internal(url) is False, url
+
+    def test_http_and_https_are_unaffected(self):
+        s = self._spider()
+        assert s.is_internal("https://example.com/page") is True
+        assert s.is_internal("http://example.com/page") is True
+        assert s.is_internal("https://www.example.com/page") is True
+        assert s.is_internal("https://elsewhere.test/page") is False
+
+    def test_subdomain_mode_is_unaffected(self):
+        s = self._spider(include_subdomains=True)
+        assert s.is_internal("https://blog.example.com/x") is True
+        assert s.is_internal("file://blog.example.com/etc/passwd") is False
+
+    def test_uppercase_scheme_still_matches(self):
+        """A site controls the exact bytes; `FILE://` must not slip past a lowercase set,
+        and `HTTPS://` must not be refused."""
+        s = self._spider()
+        assert s.is_internal("HTTPS://example.com/x") is True
+        assert s.is_internal("FILE://example.com/etc/passwd") is False
+
+    def test_protocol_relative_is_a_clean_skip_not_an_exception(self):
+        """`Sitemap:` lines and `<loc>` values are NOT urljoined, so `//host/x` used to pass
+        the host check and reach `scrapy.Request`, which RAISES. Verified against the real
+        Request, so this pins the bug the scheme term also fixes."""
+        s = self._spider()
+        assert s.is_internal("//example.com/sitemap.xml") is False
+        with pytest.raises(ValueError):
+            Request("//example.com/sitemap.xml")
+
+    def test_a_hostile_robots_redirect_is_refused_AND_still_seeds(self):
+        """The load-bearing one. Refusing the hop must not cost the crawl its seed --
+        turning a hostile redirect into a zero-page crawl would be the #76 failure, which is
+        strictly worse than the redirect."""
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/robots.txt", body=b"", status=301,
+            headers={"Location": b"file://example.com/etc/passwd"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        assert s._robots_redirect_request(resp) is None
+        out = [r for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert "https://example.com/" in [r.url for r in out]
+        assert not any(r.url.startswith("file:") for r in out)
+        assert s.crawler.stats.values.get("seeding/start_urls_emitted") == 1
+
+    def test_a_hostile_sitemap_line_in_robots_is_refused(self):
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/robots.txt",
+            body=b"User-agent: *\nAllow: /\nSitemap: file://example.com/etc/passwd\n",
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert not any(u.startswith("file:") for u in urls)
+        # Refused, so robots named no USABLE sitemap -- the conventional locations are
+        # probed, exactly as for a robots.txt that named none at all.
+        assert any("sitemap" in u for u in urls)
+        assert "https://example.com/" in urls
+
+    def test_a_hostile_loc_in_a_sitemap_is_refused(self):
+        s = self._spider()
+        body = (b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                b"<url><loc>file://example.com/etc/passwd</loc></url>"
+                b"<url><loc>https://example.com/real-page/</loc></url></urlset>")
+        resp = TextResponse(
+            url="https://example.com/sitemap.xml", body=body,
+            headers={"Content-Type": "application/xml"},
+            request=Request("https://example.com/sitemap.xml"),
+        )
+        rows = list(s.parse_sitemap(resp))
+        urls = [r.url for r in rows if isinstance(r, Request)]
+        assert not any(u.startswith("file:") for u in urls)
+        assert "https://example.com/real-page/" in urls
+
+    def test_a_hostile_nested_sitemap_index_is_refused(self):
+        s = self._spider()
+        body = (b'<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                b"<sitemap><loc>ftp://example.com/evil.xml</loc></sitemap>"
+                b"<sitemap><loc>https://example.com/sitemap-2.xml</loc></sitemap></sitemapindex>")
+        resp = TextResponse(
+            url="https://example.com/sitemap.xml", body=body,
+            headers={"Content-Type": "application/xml"},
+            request=Request("https://example.com/sitemap.xml"),
+        )
+        urls = [r.url for r in s.parse_sitemap(resp) if isinstance(r, Request)]
+        assert not any(u.startswith("ftp:") for u in urls)
+        assert "https://example.com/sitemap-2.xml" in urls
+
+    def test_schedule_refuses_a_non_http_url(self):
+        """`_schedule` is the funnel every discovered URL passes through."""
+        s = self._spider()
+        assert list(s._schedule("file://example.com/etc/passwd")) == []
+        assert len(list(s._schedule("https://example.com/ok/"))) == 1

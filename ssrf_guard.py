@@ -31,8 +31,32 @@ class SsrfGuardMiddleware:
     def from_crawler(cls, crawler):
         return cls(stats=crawler.stats)
 
+    # Schemes this crawler is ever allowed to fetch. Mirrors
+    # WebsiteSpider._FETCHABLE_SCHEMES deliberately -- see the note in process_request.
+    _FETCHABLE_SCHEMES = frozenset({"http", "https"})
+
     def process_request(self, request, spider):
-        host = urlparse(request.url).hostname
+        parsed = urlparse(request.url)
+        # Refuse a non-http(s) scheme outright (issue #89). The host check below cannot do
+        # this job: it asks whether a HOSTNAME resolves to a blocked address, and
+        # `file://<a-real-public-domain>/etc/passwd` has a hostname that resolves perfectly
+        # well -- while Scrapy's FileDownloadHandler ignores that host and reads the local
+        # path. So "the host is fine" and "this request is safe to hand to a download
+        # handler" are different questions, and only the first was being asked.
+        #
+        # `is_internal` is the primary gate and rejects these before they are ever built;
+        # this is the second layer, because that gate lives on the spider and a future
+        # request built anywhere else would not pass through it. The duplicated constant is
+        # the point -- importing the spider's would couple a security guard to the module
+        # it exists to be independent of.
+        if parsed.scheme.lower() not in self._FETCHABLE_SCHEMES:
+            if self._stats is not None:
+                self._stats.inc_value("ssrf_guard/blocked_scheme")
+            raise IgnoreRequest(
+                f"SSRF guard: refusing non-http(s) scheme {parsed.scheme!r} "
+                f"({request.url[:120]})"
+            )
+        host = parsed.hostname
         if not host:
             return None
         blocked = self._checked.get(host)
