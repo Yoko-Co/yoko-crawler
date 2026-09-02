@@ -1108,7 +1108,9 @@ class WebsiteSpider(scrapy.Spider):
             if target:
                 tgt = response.urljoin(target.decode("latin-1"))
                 if self.is_internal(tgt):
-                    yield scrapy.Request(tgt, callback=self.parse_sitemap)
+                    yield scrapy.Request(
+                        tgt, callback=self.parse_sitemap, errback=self.sitemap_failed,
+                    )
             return
 
         # Skip non-text sitemaps like .gz
@@ -1490,25 +1492,63 @@ class WebsiteSpider(scrapy.Spider):
         except (TypeError, ValueError):
             return False
 
-    # Transport-failure classification (issue #73). Matched against the exception's class
-    # NAME so we never import Twisted internals, which move between versions -- a rename
-    # would silently reclassify to `other`, not crash a crawl.
+    # Transport-failure classification (issue #73).
+    #
+    # These names are VERIFIED against the installed stack, not assumed. Scrapy 2.18 does
+    # NOT surface Twisted's exceptions: `scrapy/utils/_download_handlers.py` wraps every one
+    # of them (`DNSLookupError` -> `CannotResolveHostError`, `TxTimeoutError` ->
+    # `DownloadTimeoutError`, `TxConnectionRefusedError` -> `DownloadConnectionRefusedError`,
+    # `CancelledError` -> `DownloadCancelledError`, everything else -> `DownloadFailedError`).
+    # A first cut of this table listed the Twisted names and was therefore entirely dead: in
+    # production every failure would have classified as `other`, and the per-reason counts
+    # this whole chain exists to produce would all have been zero.
+    #
+    # The `--impersonate` path is a SECOND stack. scrapy-impersonate uses curl_cffi, whose
+    # exceptions never pass through Scrapy's wrapper -- and that path is the one used on
+    # exactly the Cloudflare/Kinsta-fronted clients where reachability matters most.
+    #
+    # Matching is still by class NAME so we import neither library's internals, which move
+    # between versions. Unknown names degrade to `other`, which is honest -- we saw a
+    # failure and cannot name it -- rather than crashing a crawl.
     _TRANSPORT_FAILURE_KINDS = (
+        # Scrapy 2.13+ wrapped exceptions
+        (("CannotResolveHostError",), "dns"),
+        (("DownloadTimeoutError",), "timeout"),
+        (("DownloadConnectionRefusedError",), "connection"),
+        (("DownloadFailedError", "ResponseDataLossError"), "connection"),
+        (("UnsupportedURLSchemeError",), "other"),
+        # curl_cffi, via scrapy-impersonate
+        (("DNSError",), "dns"),
+        (("ConnectTimeout", "ReadTimeout", "Timeout"), "timeout"),
+        (("ConnectionError", "ProxyError", "IncompleteRead",
+          "ChunkedEncodingError"), "connection"),
+        (("CertificateVerifyError", "SSLError"), "tls"),
+        # Raw Twisted names, still reachable on older Scrapy within the `>=2.13,<3` pin and
+        # from code paths that bypass the wrapper. Harmless to keep; cheap insurance.
         (("DNSLookupError",), "dns"),
         (("TimeoutError", "TCPTimedOutError", "UserTimeoutError"), "timeout"),
-        (("SSLError", "CertificateError", "SSLHandshakeError", "OpenSSLError"), "tls"),
+        (("CertificateError", "SSLHandshakeError", "OpenSSLError"), "tls"),
         (("ConnectionRefusedError", "ConnectionLost", "ConnectionDone", "ConnectError",
-          "ConnectBindError", "ResponseNeverReceived", "ResponseFailed",
-          "ClientConnectionFailedError"), "connection"),
+          "ConnectBindError", "ResponseNeverReceived", "ResponseFailed"), "connection"),
     )
-    # Never reported as a site failure. `IgnoreRequest` is OUR OWN middleware declining the
-    # request (the SSRF guard), and a cancellation is US stopping the crawl -- reporting
-    # either as "we couldn't reach this page" would blame the site for our decision. The
-    # cancellation case is the one that matters in practice: when a crawl closes on
-    # CLOSESPIDER_TIMEOUT, every in-flight download is cancelled at once, so without this
-    # guard a routine timeout-close would emit a burst of phantom "host unreachable" rows.
-    _NOT_A_SITE_FAILURE = ("IgnoreRequest", "CancelledError")
-
+    # Never reported as a site failure -- a fix for "we lose failures" must not invent them.
+    #
+    # `IgnoreRequest` is OUR OWN middleware declining the request (the SSRF guard); blaming
+    # the site for our decision would be wrong.
+    #
+    # A CANCELLATION is us aborting a download that the server was answering fine. The live
+    # source is DOWNLOAD_MAXSIZE (64MB): an extensionless download endpoint is fetched as a
+    # page, and Scrapy raises `DownloadCancelledError` when the body crosses the cap. The
+    # server responded perfectly; we hung up. Reporting that as "the host may be down or
+    # gone" is a defect we would be inventing in the client's site.
+    #
+    # NOTE the earlier justification for this guard -- that a CLOSESPIDER_TIMEOUT close
+    # cancels every in-flight download at once -- was wrong. `_Slot.close()` DRAINS
+    # in-flight requests rather than cancelling them, and the memusage and SIGTERM paths go
+    # through the same close. The guard is still needed, for the size-cap reason above.
+    _NOT_A_SITE_FAILURE = (
+        "IgnoreRequest", "DownloadCancelledError", "CancelledError",
+    )
     @classmethod
     def _classify_transport_failure(cls, exc_name: str) -> str | None:
         """A stable reason token for a transport failure, or None when the failure is not
@@ -1549,13 +1589,18 @@ class WebsiteSpider(scrapy.Spider):
         self.logger.info("Unreachable (%s / %s): %s", kind, exc_name, url)
         if not url:
             return
-        emit_url = self.normalize_url(url, exclude_params=self.exclude_params_emit)
+        # SCHEDULE-normalized, like the `login_gated` sibling in `_schedule` -- NOT
+        # emit-normalized. `reach_pagination=1` is always on in run_spider, so emit-mode
+        # strips `?page=N`: emitting `/blog/?page=14` as `/blog/` would list a URL that
+        # crawled fine under "never responded", and the corpus upsert is keyed on
+        # (crawl_id, url) so 18 failed pagination pages would collapse into one row with the
+        # wrong name. The identity of the thing that failed is the point of the row.
+        schedule_url = self.normalize_url(url, exclude_params=self.exclude_params_schedule)
+        self._bind_dedup_state()  # restore first_referrer on a resumed session (#52)
         yield self._skip_row(
-            emit_url,
+            schedule_url,
             f"unreachable_{kind}",
-            self.first_referrer.get(self.facet_dedup_key(
-                self.normalize_url(url, exclude_params=self.exclude_params_schedule)
-            )),
+            self.first_referrer.get(self.facet_dedup_key(schedule_url)),
         )
 
     def _skip_row(self, url: str, reason: str, referrer_emit: str | None) -> dict:
