@@ -209,6 +209,16 @@ class ProgressWriter:
                 "origin_forbidden_count": self.stats.get_value("origin_forbidden_count", 0),
                 "status_counts": self._status_counts(),
             },
+            # Platform fingerprints observed on the first HTML response (corpus #112).
+            # OBSERVATION, not a verdict: the crawler records the headers and head tags it
+            # saw; yoko-corpus maps them onto a platform name. Empty when the site never
+            # identified itself, which a consumer must read as "no signal" -- NOT as "not
+            # WordPress". Detection used to run on the URL space alone, which is structurally
+            # blind to a WordPress site with pretty permalinks (`wp-json`/`wp-admin` are
+            # paths we are built never to schedule, and `/wp-content/` only surfaces as a
+            # linked-file asset row), so the better configured the site the less likely we
+            # identified it.
+            "platform_signals": self.stats.get_value("platform_signals", {}) or {},
             # Restriction observability (issue #74). The crawler deliberately does not fetch
             # several classes of URL, and until now NONE of those counts left Scrapy's stats
             # -- so a crawl the site itself had walled off was indistinguishable from a crawl
