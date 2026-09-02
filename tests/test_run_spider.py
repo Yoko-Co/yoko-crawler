@@ -248,3 +248,73 @@ def test_impersonate_without_presale_still_gets_the_declared_bound():
     s = build_settings(make_args(impersonate="chrome", profile="standard"))
     assert s["CONCURRENT_REQUESTS"] == 16
     assert s["DOWNLOAD_TIMEOUT"] == 60
+
+
+class TestSpiderStartupFailure:
+    """Issue #98. Scrapy routes a spider `__init__`/`from_crawler` exception into the Deferred
+    that `CrawlerProcess.crawl()` returns. With no errback attached that Deferred goes
+    UNHANDLED: Twisted logs the traceback at garbage-collection time (after anything main()
+    prints, so not even reliably ordered), `process.start()` returns normally, and the script
+    exits 0.
+
+    Verified end to end on this tree by injecting a raise into `WebsiteSpider.__init__` and
+    running the real `run_spider.py`: before the fix, exit 0 and no status file written; after,
+    exit 1 and a `failed` status carrying `failure_reason: spider_init_error`."""
+
+    def _run_main(self, tmp_path, spider_exc):
+        """Drive the real `main()` with a CrawlerProcess whose spider blows up on construct."""
+        import runpy
+        status_file = tmp_path / "status.json"
+        argv = ["run_spider.py", "--domain", "example.com",
+                "--status-file", str(status_file), "--output", str(tmp_path / "o.jsonl")]
+
+        real_process = None
+
+        class _Process:
+            def __init__(self, settings=None):
+                nonlocal real_process
+                real_process = self
+                self._deferred = None
+
+            def crawl(self, *a, **kw):
+                from twisted.internet.defer import Deferred, fail
+                from twisted.python.failure import Failure
+                return fail(Failure(spider_exc)) if spider_exc else Deferred()
+
+            def start(self):
+                pass
+
+        import run_spider
+        with patch.object(run_spider, "CrawlerProcess", _Process), \
+                patch.object(run_spider, "check_resolution_sync", lambda d: None), \
+                patch.object(sys, "argv", argv):
+            try:
+                run_spider.main()
+            except SystemExit as exc:
+                return exc.code, status_file
+        return 0, status_file
+
+    def test_a_spider_that_cannot_construct_exits_nonzero(self, tmp_path):
+        code, status_file = self._run_main(tmp_path, ValueError("construction exploded"))
+        assert code == 1, (
+            "exiting 0 here is what made job_manager report the crawl COMPLETED with zero "
+            "pages -- indistinguishable from a site that genuinely had nothing"
+        )
+
+    def test_it_writes_a_classified_failed_status(self, tmp_path):
+        import json
+        code, status_file = self._run_main(tmp_path, ValueError("construction exploded"))
+        data = json.loads(status_file.read_text())
+        assert data["status"] == "failed"
+        assert data["failure_reason"] == "spider_init_error", (
+            "the corpus keys on failure_reason to classify; an unclassified failure reads "
+            "as 'unclassified', not as 'the spider never started'"
+        )
+        assert "construction exploded" in data["error"], \
+            "the operator needs the actual cause, not just that something failed"
+
+    def test_a_healthy_start_neither_exits_nor_writes_a_failure(self, tmp_path):
+        """The guard must not fire on the ordinary path."""
+        code, status_file = self._run_main(tmp_path, None)
+        assert code == 0
+        assert not status_file.exists(), "no failure status should be written on a clean run"

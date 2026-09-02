@@ -454,3 +454,77 @@ class TestHumanizeError:
 
     def test_none_error(self):
         assert _humanize_error(None) == "Crawl failed"
+
+
+class TestSpiderNeverStarted:
+    """Issue #98: a subprocess that exits 0 having written NO status file did not fail --
+    it fell through to `elif returncode == 0` and reported a COMPLETED zero-page crawl,
+    which yoko-corpus cannot tell apart from a site that genuinely had nothing.
+
+    Measured on the pre-fix tree with a spider raising in `__init__`: exit code 0, and the
+    job reported `completed`. Note the discriminator is NOT a missing status file --
+    `_write_initial_status` writes a `queued` stub before spawning, and that stub is exactly
+    what satisfied every existing check. `ProgressWriter` attaches on `spider_opened` and
+    writes every 3s after, so a crawl that actually ran has moved off `queued`."""
+
+    async def _monitor_with(self, jm, *, returncode, status_payload):
+        proc = make_fake_process(returncode=returncode)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("example.com", resumable=False)
+        if status_payload is not None:
+            job.status_file.write_text(json.dumps(status_payload))
+        else:
+            job.status_file.unlink(missing_ok=True)
+        await jm._monitor(job.job_id)
+        return job
+
+    async def test_a_status_left_at_the_queued_stub_is_failed_not_completed(self):
+        """THE bug. The spider never opened, so our own pre-spawn stub is still there --
+        and it looked enough like a status to carry the crawl through to `completed`."""
+        jm = JobManager(max_concurrent=3)
+        job = await self._monitor_with(
+            jm, returncode=0,
+            status_payload={"status": "queued", "urls_crawled": 0},
+        )
+        assert job.status == "failed", (
+            "a status still at the pre-spawn stub means the spider never opened; reporting "
+            "it completed hands the corpus a zero-page crawl that looks like a real result"
+        )
+        assert "never started" in (job.error or "")
+
+    async def test_clean_exit_with_no_status_file_is_failed_too(self):
+        """Asserts the REASON, not just the status. Dropping the `status_data is None` branch
+        makes `.get()` raise on None and the job lands on `failed` anyway -- so a status-only
+        assertion passed against a broken guard (caught by mutation, #98)."""
+        jm = JobManager(max_concurrent=3)
+        job = await self._monitor_with(jm, returncode=0, status_payload=None)
+        assert job.status == "failed"
+        assert "never started" in (job.error or ""), (
+            "must fail through the guard with its explanation, not incidentally via a crash"
+        )
+
+    async def test_a_real_completed_crawl_is_untouched(self):
+        """The guard must not turn ordinary successful crawls red."""
+        jm = JobManager(max_concurrent=3)
+        job = await self._monitor_with(
+            jm, returncode=0,
+            status_payload={"status": "completed", "urls_crawled": 42},
+        )
+        assert job.status == "completed"
+
+    async def test_a_crawl_that_wrote_progress_but_no_terminal_status_still_completes(self):
+        """A status file exists but was never finalised (the monitor is the backstop for
+        that case, and #98 must not change it): the spider DID open, so exit 0 still means
+        completed. This is the boundary the new branch must not swallow."""
+        jm = JobManager(max_concurrent=3)
+        job = await self._monitor_with(
+            jm, returncode=0,
+            status_payload={"status": "running", "urls_crawled": 7},
+        )
+        assert job.status == "completed"
+
+    async def test_a_nonzero_exit_keeps_its_own_message(self):
+        jm = JobManager(max_concurrent=3)
+        job = await self._monitor_with(jm, returncode=3, status_payload=None)
+        assert job.status == "failed"
+        assert "exited with code 3" in (job.error or "")

@@ -48,22 +48,26 @@ _DOWNLOAD_MAXSIZE = 64 * 1024 * 1024  # 64 MB
 _DOWNLOAD_WARNSIZE = 8 * 1024 * 1024  # 8 MB
 
 
-def _write_failed_status(status_file, error):
+def _write_failed_status(status_file, error, failure_reason=None):
     """Write a terminal 'failed' status so job_manager surfaces ``error`` via the
     API instead of an opaque exit code -- ProgressWriter hasn't started yet when
-    a startup validation check fails."""
+    a startup validation check fails.
+
+    ``failure_reason`` carries the #44 classification token when the caller knows it.
+    Left None by the pre-flight validation callers, whose `error` string is already the
+    specific message; set to `spider_init_error` for a spider that never opened (#98)."""
     try:
+        payload = {
+            "status": "failed",
+            "urls_discovered": 0,
+            "urls_crawled": 0,
+            "updated_at": time.time(),
+            "error": error,
+        }
+        if failure_reason is not None:
+            payload["failure_reason"] = failure_reason
         with open(status_file, "w") as f:
-            json.dump(
-                {
-                    "status": "failed",
-                    "urls_discovered": 0,
-                    "urls_crawled": 0,
-                    "updated_at": time.time(),
-                    "error": error,
-                },
-                f,
-            )
+            json.dump(payload, f)
     except OSError:
         pass
 
@@ -439,7 +443,7 @@ def main():
         sys.exit(1)
 
     process = CrawlerProcess(settings=build_settings(args))
-    process.crawl(
+    deferred = process.crawl(
         WebsiteSpider,
         domain=args.domain,
         reach_pagination=1,
@@ -448,7 +452,53 @@ def main():
         emit_content=1 if args.emit_content else 0,
         output_format=args.format,
     )
+
+    # A spider that fails to CONSTRUCT must not look like a successful empty crawl (#98).
+    #
+    # Scrapy routes a `__init__`/`from_crawler` exception into the Deferred that `crawl()`
+    # returns. With no errback attached that Deferred goes unhandled: Twisted logs the
+    # traceback at garbage-collection time -- AFTER anything this function prints, so not
+    # even reliably ordered -- `process.start()` returns normally, and `main()` falls off the
+    # end and exits 0. `ProgressWriter` only starts on `spider_opened`, which never fired, so
+    # no status file is written either. `job_manager._monitor` then finds no terminal status,
+    # takes its `elif returncode == 0` branch, and reports the crawl COMPLETED with zero
+    # pages -- indistinguishable, to yoko-corpus, from a site that genuinely had nothing.
+    #
+    # Measured on this exact tree before the fix: exit code 0, no status file, job COMPLETED.
+    # An `inf` in one droplet env var (#92) would have produced a run of clean-looking
+    # zero-page reports against client sites with nothing anywhere saying why.
+    #
+    # Attaching the errback also CONSUMES the failure, which is why the unhandled-Deferred
+    # traceback disappears -- so we log it ourselves, at ERROR, before exiting non-zero.
+    startup_failure = {}
+
+    def _spider_never_started(failure):
+        startup_failure["error"] = (
+            f"{type(failure.value).__name__}: {failure.value}"
+            if str(failure.value) else type(failure.value).__name__
+        )
+        startup_failure["traceback"] = failure.getTraceback()
+        return None      # handled -- do not re-raise into the reactor
+
+    deferred.addErrback(_spider_never_started)
     process.start()
+
+    if startup_failure:
+        print(startup_failure["traceback"], file=sys.stderr)
+        print(
+            "SPIDER FAILED TO START: the crawl never opened, so it inventoried nothing. "
+            f"({startup_failure['error']})",
+            file=sys.stderr,
+        )
+        # `spider_init_error` joins the #44 failure_reason vocabulary the corpus maps onto
+        # its own failure_class. Distinct from `crawl_error` (an abnormal Scrapy CLOSE),
+        # because nothing was ever crawled -- there is no partial result to interpret.
+        _write_failed_status(
+            args.status_file,
+            f"Spider failed to start: {startup_failure['error']}",
+            failure_reason="spider_init_error",
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

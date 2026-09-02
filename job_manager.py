@@ -375,8 +375,38 @@ class JobManager:
             if status_data and status_data.get("status") in ("completed", "failed"):
                 job.status = status_data["status"]
                 job.error = status_data.get("error")
-            elif job.process.returncode == 0:
+            elif job.process.returncode == 0 and not self._spider_never_opened(status_data):
                 job.status = "completed"
+            elif job.process.returncode == 0:
+                # Exit 0 with the status file STILL the queued stub is not success -- it is a
+                # crawl that never opened (#98).
+                #
+                # The discriminator is deliberately "the spider never overwrote our stub",
+                # not "there is no status file": `_write_initial_status` always writes one
+                # before the subprocess starts, so absence never happens on this path. That
+                # is exactly how the bug survived -- the stub satisfied every existing check,
+                # the `("completed", "failed")` branch was missed, and the crawl fell through
+                # to `elif returncode == 0` and reported COMPLETED with zero pages, which
+                # yoko-corpus cannot distinguish from a site that genuinely had nothing.
+                #
+                # `run_spider` now catches spider-construction failures itself and exits
+                # non-zero, so this branch should be unreachable through that route. It is
+                # kept as an INDEPENDENT second guard because it catches causes the first one
+                # structurally cannot see: the subprocess killed between spawn and first
+                # write, an OOM, an exec that died before Python started, or a future edit
+                # that loses the errback. Two guards, different failure modes -- the first is
+                # specific and explains itself, this one is general and cannot be bypassed
+                # from inside the subprocess.
+                job.status = "failed"
+                job.error = (
+                    "Crawl never started: the process exited cleanly but the spider never "
+                    "reported opening, so nothing was crawled. Reported as failed rather "
+                    "than an empty success."
+                )
+                logger.error(
+                    "Subprocess exited cleanly but the spider never opened",
+                    job_id=job_id,
+                )
             else:
                 job.status = "failed"
                 job.error = f"Process exited with code {job.process.returncode}"
@@ -420,6 +450,18 @@ class JobManager:
                         job.process.kill()
                     except ProcessLookupError:
                         pass
+
+    @staticmethod
+    def _spider_never_opened(status_data) -> bool:
+        """True when the subprocess left the status file at the pre-spawn stub (#98).
+
+        `ProgressWriter` attaches on `spider_opened` and writes every 3s after, so any crawl
+        that actually ran has moved the status off `queued`. Still `queued` at exit means the
+        spider never opened -- and a missing/unreadable file (`None`) means the same thing
+        more emphatically, since we wrote one before spawning."""
+        if status_data is None:
+            return True
+        return status_data.get("status") == "queued"
 
     async def _read_status_file(self, job: Job) -> dict | None:
         """Read the status file asynchronously, returning None on any error."""
