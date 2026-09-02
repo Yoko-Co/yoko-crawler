@@ -28,6 +28,35 @@ from script_allowlist import load_benign_script_hosts
 # (the single source of truth for field names). content_text is handled
 # separately: present only when --emit-content is set.
 
+
+def _depth_reset_supported() -> bool:
+    """Does the INSTALLED Scrapy honour the `depth_reset` meta key (added in 2.18)?
+
+    Feature-detected against the real DepthMiddleware rather than trusted from a version
+    string, because the failure it guards is precisely a fix that no-ops in silence (#81):
+    on an older Scrapy the key is unrecognised, the start URL stays at depth 1, and nothing
+    logs, raises, or fails a test. Detecting it by BEHAVIOUR also means a backport or a
+    rename cannot make this lie. Any exception means "assume unsupported" -- a spurious
+    warning is a far cheaper mistake than a silent off-by-one."""
+    try:
+        from scrapy.http import Request as _R, Response as _Rs
+        from scrapy.spidermiddlewares.depth import DepthMiddleware
+
+        class _NullStats:
+            def inc_value(self, *a, **k): pass
+            def max_value(self, *a, **k): pass
+
+        parent = _Rs("https://example.invalid/", request=_R("https://example.invalid/"))
+        parent.meta["depth"] = 7
+        child = _R("https://example.invalid/child", meta={"depth_reset": True})
+        out = DepthMiddleware(0, _NullStats(), False, 1).get_processed_request(child, parent)
+        return out is not None and out.meta.get("depth") == 0
+    except Exception:
+        return False
+
+
+_DEPTH_RESET_SUPPORTED = _depth_reset_supported()
+
 class WebsiteSpider(scrapy.Spider):
     """
     Internal crawler that:
@@ -836,7 +865,49 @@ class WebsiteSpider(scrapy.Spider):
             # sessions, so without it session 2 would filter this as already-seen, never run
             # parse_robots, and therefore never emit the start URLs -- a zero-page resume.
             dont_filter=True,
+            meta=self._robots_budget_meta(),
         )
+
+    # How long we will wait for robots.txt, PER ATTEMPT, on either download path.
+    #
+    # Since #76 robots.txt is the crawl's only seed, so in the first session nothing else is
+    # in flight while it retries. A black-holed host (accepts the connection, never answers)
+    # therefore stalls the WHOLE crawl, where before #76 the start URL was being fetched in
+    # parallel throughout and this cost nothing (issue #82). At Scrapy's DOWNLOAD_TIMEOUT of
+    # 180s and RETRY_TIMES of 2 that is 3 x 180s = 540s of a 7200s session -- 7.5% of the
+    # budget with zero pages fetched. 60s x 3 = 180s instead.
+    #
+    # WHY NOT SHORTER, AND WHY RETRIES ARE UNTOUCHED. The two failure directions here are
+    # not symmetric. Waiting too long costs crawl budget; giving up too early routes us to
+    # `robots_failed`, which proceeds ALLOW-ALL -- so an aggressive timeout silently converts
+    # "this site was slow" into "this site has no robots.txt" and crawls a site that said
+    # Disallow. That is #76's harm arriving through the back door, so the bound is sized to
+    # be unreachable by any site we could actually crawl: 180s is sized for a page, this is
+    # 1KB of text, and a host that cannot deliver it in 60s cannot serve a crawl either.
+    # Retries stay at the setting default for the same reason -- they are what stops one
+    # transient blip from flipping the gate open, and they do not lengthen the honest case.
+    ROBOTS_DOWNLOAD_TIMEOUT = 60
+
+    def _robots_budget_meta(self):
+        """Bound the robots.txt fetch on BOTH download paths -- they honour different keys.
+
+        `download_timeout` is set by DownloadTimeoutMiddleware with `setdefault`, so an
+        explicit value here wins on the default path. scrapy-impersonate reads NEITHER that
+        key nor DOWNLOAD_TIMEOUT: it hands curl_cffi no timeout at all and inherits its 30s
+        session default, which is why that path needs `impersonate_args` instead. (That gap
+        applies to every impersonated request, not just this one, and is filed separately --
+        raising it globally would take pages from 30s to 180s and is not #82's call to make.)
+
+        Setting both keys deliberately makes the impersonate path wait LONGER than it does
+        today, 2 x 60s rather than 2 x 30s. Robots semantics must not depend on which
+        `--impersonate` flag the operator passed, and 30s is inside the range a slow-but-real
+        site can take -- on that path a slow robots.txt is silently abandoned and the crawl
+        proceeds allow-all. Impersonation is used for exactly the WAF-fronted sites where
+        that matters most. The extra 60s worst case is a fifth of what #82 gives back."""
+        return {
+            "download_timeout": self.ROBOTS_DOWNLOAD_TIMEOUT,
+            "impersonate_args": {"timeout": self.ROBOTS_DOWNLOAD_TIMEOUT},
+        }
 
     def _start_url_requests(self):
         """Emit the start URL(s), exactly once per crawl. Called once robots.txt has
@@ -850,6 +921,18 @@ class WebsiteSpider(scrapy.Spider):
         if self._start_urls_emitted:
             return
         self._start_urls_emitted = True
+        if not _DEPTH_RESET_SUPPORTED:
+            # requirements.txt now floors Scrapy at 2.18 for this, but a floor only binds a
+            # fresh install and this crawler is deployed by hand onto a long-lived droplet
+            # venv. On an older Scrapy `depth_reset` is simply an unrecognised meta key --
+            # ignored in silence, leaving the #81 off-by-one in place while the code reads
+            # as if it were fixed. Say so out loud instead.
+            self.logger.warning(
+                "Scrapy %s does not support the `depth_reset` meta key (added in 2.18), so "
+                "the start URL stays at depth 1 and every page below it is off by one. "
+                "Harmless while DEPTH_LIMIT is unset; upgrade before relying on a depth "
+                "bound. (issue #81)", scrapy.__version__,
+            )
         for url in self.start_urls:
             self._stat("seeding/seeds_emitted")
             # `start_urls_emitted` is the SECOND half of the seeding tripwire (#52/#76).
@@ -861,6 +944,21 @@ class WebsiteSpider(scrapy.Spider):
             self._stat("seeding/start_urls_emitted")
             yield scrapy.Request(
                 url, callback=self.parse, errback=self.page_failed, dont_filter=True,
+                # Put the start URL back at depth 0 (issue #81). It is yielded from a
+                # callback now, so DepthMiddleware reads it as a CHILD of the robots.txt
+                # response and stamps depth=1 -- two when robots.txt redirected -- shifting
+                # every page below it by the same amount. DEPTH_LIMIT is unset today so
+                # nothing breaks, but #54 contemplates bounding depth and whoever lands it
+                # would silently get N-1 levels for a requested N, with the cause sitting in
+                # a change that predates their work. `depth_reset` also restores BFO
+                # ordering: homepage links go back to depth 1, so they again outrank
+                # sitemap-discovered URLs at depth 2 instead of tying with them.
+                #
+                # Note `meta={"depth": 0}` does NOT work -- the issue's suggested shape.
+                # DepthMiddleware.get_processed_request ASSIGNS `request.meta["depth"]`
+                # unconditionally, so a pre-set value is overwritten and the fix would look
+                # applied while changing nothing. `depth_reset` is the supported key.
+                meta={"depth_reset": True},
                 # Suppress the Referer. The start URL is now yielded from a callback, so
                 # Scrapy's RefererMiddleware would stamp `/robots.txt` on it and _emit_row's
                 # header fallback would report the site root as "linked from robots.txt" --
@@ -1009,9 +1107,14 @@ class WebsiteSpider(scrapy.Spider):
                 "crawling allow-all.", response.url, exc_info=True,
             )
             return None
+        # Same per-attempt bound as the first fetch (#82). Every hop is still the crawl's
+        # only request, so an unbounded hop is an unbounded stall -- and the chain multiplies
+        # it: MAX_ROBOTS_REDIRECTS of 3 means up to FOUR black-holed fetches, which at the
+        # un-bounded 540s each is 2160s, 30% of a 7200s session, before a page is fetched.
         return scrapy.Request(
             tgt, callback=self.parse_robots, errback=self.robots_failed,
-            dont_filter=True, meta={"robots_hops": hops + 1},
+            dont_filter=True,
+            meta={"robots_hops": hops + 1, **self._robots_budget_meta()},
         )
 
     def _robots_body_outputs(self, response, outputs):
@@ -1632,8 +1735,8 @@ class WebsiteSpider(scrapy.Spider):
         (("ConnectionError", "ProxyError", "IncompleteRead",
           "ChunkedEncodingError"), "connection"),
         (("CertificateVerifyError", "SSLError"), "tls"),
-        # Raw Twisted names, still reachable on older Scrapy within the `>=2.13,<3` pin and
-        # from code paths that bypass the wrapper. Harmless to keep; cheap insurance.
+        # Raw Twisted names, still reachable from code paths that bypass the wrapper (and
+        # from a droplet venv older than the requirements floor). Cheap insurance.
         (("DNSLookupError",), "dns"),
         (("TimeoutError", "TCPTimedOutError", "UserTimeoutError"), "timeout"),
         (("CertificateError", "SSLHandshakeError", "OpenSSLError"), "tls"),
