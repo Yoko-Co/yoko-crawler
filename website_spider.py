@@ -24,6 +24,32 @@ from content_extractor import (
 from embed_allowlist import load_benign_hosts
 from script_allowlist import load_benign_script_hosts
 
+# Bounds for the robots.txt fetch budget (issue #92). MODULE-level, deliberately, and this
+# is load-bearing rather than stylistic: Scrapy assigns `-a` spider arguments directly into
+# `self.__dict__`, so a floor read as `self.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT` is shadowable --
+# `-a DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT=1` was measured honouring a 5s budget in review, which
+# is precisely the allow-all the floor exists to prevent. A module constant is out of reach
+# of that mechanism.
+#
+# FLOOR (60s): below this, a slow-but-real robots.txt times out into `robots_failed`, which
+# proceeds ALLOW-ALL -- the knob may only ever raise.
+#
+# CEILING (600s, 10x the default): robots.txt is the crawl's ONLY seed (#76), so nothing is
+# fetched until it resolves and one fetch costs (ROBOTS_MAX_RETRY_TIMES + 1) x the budget --
+# 1800s at the ceiling, a quarter of the 7200s CLOSESPIDER_TIMEOUT, with the redirect-hop and
+# sitemap-probe multipliers on top of that. Past the ceiling the stall outruns job_manager's
+# 7500s watchdog, which SIGKILLs the subprocess into `status: failed` with a NULL
+# failure_reason and deletes the JOBDIR. That is strictly worse than the allow-all the floor
+# guards against, so the raise direction needs a bound too -- the sibling crawl-delay knob has
+# always had one (`min(asked, cap)`), and this one lacking it was the real asymmetry (#92
+# review).
+_ROBOTS_TIMEOUT_FLOOR = 60
+_ROBOTS_TIMEOUT_CEILING = 600
+
+# Mirrors job_manager._WATCHDOG_TIMEOUT. Duplicated rather than imported: the spider runs in a
+# subprocess that must not import the API process's modules. Only ever used in a log message.
+_JOB_WATCHDOG_TIMEOUT = 7500
+
 # Zero/empty enrichment defaults come from content_extractor.empty_enrichment()
 # (the single source of truth for field names). content_text is handled
 # separately: present only when --emit-content is set.
@@ -296,6 +322,19 @@ class WebsiteSpider(scrapy.Spider):
             )
         except (TypeError, ValueError):
             self.max_robots_crawl_delay = self.DEFAULT_MAX_ROBOTS_CRAWL_DELAY
+        # Operator override for the robots.txt fetch budget (issue #92). Env-tunable like the
+        # knob above, but do NOT read the two as symmetric -- they are bounded in opposite
+        # directions and the difference is the point. The crawl-delay knob is a float CAP: the
+        # site asks, we honour at most the cap. This one is an int FLOOR: the operator asks,
+        # we honour at least the default. A shorter robots.txt bound silently converts "this
+        # site was slow" into "this site has no robots.txt" -- `robots_failed` proceeds
+        # ALLOW-ALL -- so tuning it down does not make crawls snappier, it makes them crawl
+        # sites that said Disallow. Below-floor values are refused and logged; the knob exists
+        # for the opposite case, a genuinely slow host worth waiting longer for, without a
+        # redeploy. It is capped too (`_ROBOTS_TIMEOUT_CEILING`), because an unbounded raise
+        # stalls past the watchdog into a SIGKILLed `failed` crawl -- worse than the allow-all
+        # the floor prevents (#92 review). Like `_apply_crawl_delay`, every clamp is logged.
+        self.robots_download_timeout = self._resolve_robots_timeout()
 
         # Build exclude sets for scheduling vs emitting. Only SEQUENCE_PARAMS are ever
         # kept -- REORDER_PARAMS (sort/order/dir) stay in UNWANTED_PARAMS in every mode, so
@@ -893,7 +932,7 @@ class WebsiteSpider(scrapy.Spider):
     # Disallow. That is #76's harm arriving through the back door, so the bound is sized to
     # be unreachable by any site we could actually crawl: 180s is sized for a page, this is
     # 1KB of text, and a host that cannot deliver it in 60s cannot serve a crawl either.
-    ROBOTS_DOWNLOAD_TIMEOUT = 60
+    DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT = _ROBOTS_TIMEOUT_FLOOR
 
     # Attempts for robots.txt specifically, pinned rather than inherited (#82 review).
     #
@@ -905,6 +944,63 @@ class WebsiteSpider(scrapy.Spider):
     # passed. RetryMiddleware reads this meta key in preference to the setting, so pages keep
     # the operator's RETRY_TIMES while robots.txt keeps its margin on both paths.
     ROBOTS_MAX_RETRY_TIMES = 2
+
+    def _resolve_robots_timeout(self) -> int:
+        """The robots.txt per-attempt budget, from `YOKO_CRAWL_ROBOTS_TIMEOUT` (issue #92).
+
+        Unset, unparseable, non-finite, or BELOW the floor -> the floor. Above the ceiling ->
+        the ceiling. Both bounds are module constants, NOT `self.` lookups, because Scrapy
+        assigns `-a` spider arguments straight into `self.__dict__` -- reading the floor off
+        the instance let `-a DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT=1` shadow it and honour a 5s
+        budget (#92 review). The floor is not defensive tidiness: this is the one constant
+        whose wrong value routes a slow site to `robots_failed` and crawls it allow-all."""
+        raw = os.environ.get("YOKO_CRAWL_ROBOTS_TIMEOUT")
+        if raw is None:
+            return _ROBOTS_TIMEOUT_FLOOR
+        try:
+            requested = int(float(raw))
+        except (TypeError, ValueError, OverflowError) as exc:
+            # OverflowError is the load-bearing member of that tuple and NOT a subclass of the
+            # other two: `float()` happily accepts "inf"/"Infinity"/"1e400", and `int()` then
+            # raises OverflowError on the result. Letting it escape killed spider construction,
+            # which `run_spider.py` exits 0 from and the job manager reports as a COMPLETED
+            # zero-page crawl (#92 review; the exit-code seam is filed as #98). "nan" is the one
+            # non-finite spelling that raises ValueError instead -- which is exactly why having
+            # only "nan" in the junk test gave false confidence this class was covered.
+            self.logger.warning(
+                "YOKO_CRAWL_ROBOTS_TIMEOUT=%r is not a usable number (%s) -- using the %ds "
+                "default.", raw, type(exc).__name__, _ROBOTS_TIMEOUT_FLOOR,
+            )
+            return _ROBOTS_TIMEOUT_FLOOR
+        if requested < _ROBOTS_TIMEOUT_FLOOR:
+            self.logger.warning(
+                "YOKO_CRAWL_ROBOTS_TIMEOUT=%r (%ds) is below the %ds floor and was IGNORED. "
+                "A shorter robots.txt budget does not speed a crawl up -- it makes a slow "
+                "site look like one with no robots.txt, and the crawl then proceeds "
+                "allow-all against a site that may have said Disallow. Raise it, not lower "
+                "it. (issue #92)",
+                raw, requested, _ROBOTS_TIMEOUT_FLOOR,
+            )
+            return _ROBOTS_TIMEOUT_FLOOR
+        if requested > _ROBOTS_TIMEOUT_CEILING:
+            self.logger.warning(
+                "YOKO_CRAWL_ROBOTS_TIMEOUT=%r (%ds) exceeds the %ds ceiling and was CLAMPED. "
+                "robots.txt is the crawl's only seed, so the stall before the first page is "
+                "%d attempts x the budget, multiplied again by redirect hops and sitemap "
+                "probes; past the ceiling that outruns the %ds watchdog, which SIGKILLs the "
+                "crawl into `failed` with no failure_reason -- worse than the allow-all this "
+                "knob guards against. (issue #92)",
+                raw, requested, _ROBOTS_TIMEOUT_CEILING,
+                self.ROBOTS_MAX_RETRY_TIMES + 1, _JOB_WATCHDOG_TIMEOUT,
+            )
+            return _ROBOTS_TIMEOUT_CEILING
+        if requested > _ROBOTS_TIMEOUT_FLOOR:
+            self.logger.info(
+                "robots.txt fetch budget raised to %ds by YOKO_CRAWL_ROBOTS_TIMEOUT "
+                "(default %ds, ceiling %ds).",
+                requested, _ROBOTS_TIMEOUT_FLOOR, _ROBOTS_TIMEOUT_CEILING,
+            )
+        return requested
 
     def _robots_budget_meta(self):
         """Bound the robots.txt fetch on BOTH download paths -- they honour different keys.
@@ -934,8 +1030,8 @@ class WebsiteSpider(scrapy.Spider):
         ROBOTS_MAX_RETRY_TIMES, which is why the attempt count is pinned here rather than
         inherited)."""
         return {
-            "download_timeout": self.ROBOTS_DOWNLOAD_TIMEOUT,
-            "impersonate_args": {"timeout": self.ROBOTS_DOWNLOAD_TIMEOUT},
+            "download_timeout": self.robots_download_timeout,
+            "impersonate_args": {"timeout": self.robots_download_timeout},
             "max_retry_times": self.ROBOTS_MAX_RETRY_TIMES,
         }
 
