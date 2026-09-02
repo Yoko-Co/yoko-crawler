@@ -643,9 +643,10 @@ class JobManager:
             # crawled the site, even though both report status "completed".
             "close_reason": status_data.get("close_reason"),
             # Structured failure token (issue #44): a stable discriminator
-            # (unreachable / ssrf_blocked / crawl_error / spider_init_error) the corpus
-            # maps onto its own failure_class, instead of scraping the humanized `error`
-            # prose. None unless the crawl failed with a classified cause.
+            # (unreachable / ssrf_blocked / crawl_error / spider_init_error /
+            # seeding_incomplete) the corpus maps onto its own failure_class, instead of
+            # scraping the humanized `error` prose. None unless the crawl failed with a
+            # classified cause.
             "failure_reason": status_data.get("failure_reason"),
             # Block/restriction observability (from the status file's `blocking` section):
             # waf_challenge_count (Cloudflare wall) vs origin_forbidden_count (member-
