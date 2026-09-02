@@ -141,8 +141,14 @@ def main(argv=None):
         help="seconds to wait between requests, be polite (default: 0.3)",
     )
     parser.add_argument(
-        "--timeout", type=float, default=30.0,
-        help="per-request timeout in seconds (default: 30)",
+        # Matches the crawler's impersonated bound (run_spider's DOWNLOAD_TIMEOUT, #88).
+        # This tool exists to REPRODUCE what the crawler saw, and it is what an operator
+        # reaches for when triaging `unreachable.timeout` rows -- so a lower default here
+        # makes a page the crawler would now fetch report ERROR, and the row gets closed as
+        # "host down". That is the real-page-as-transport-failure mode #88 removed,
+        # surviving in the tool used to confirm it was removed.
+        "--timeout", type=float, default=60.0,
+        help="per-request timeout in seconds (default: 60, matching the crawler)",
     )
     parser.add_argument(
         "--retries", type=int, default=1,

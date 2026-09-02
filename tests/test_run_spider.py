@@ -211,3 +211,40 @@ def test_cli_rejects_invalid_profile():
     # argparse rejects the bad choice during parsing, before any crawl starts.
     assert result.returncode != 0
     assert "profile" in result.stderr.lower()
+
+
+def test_impersonated_crawls_declare_their_own_download_timeout():
+    """Issue #88: this path used to run on curl_cffi's undeclared 30s session default -- a
+    bound nobody chose and one that moves when the dependency changes. The number has to be
+    in this file."""
+    s = build_settings(make_args(impersonate="chrome"))
+    assert s["DOWNLOAD_TIMEOUT"] == 60
+
+
+def test_the_impersonate_timeout_is_sized_for_serial_crawls():
+    """Not Scrapy's 180s: `--impersonate` goes with WAF-fronted sites, crawled via
+    `--profile presale` (delay >= 3 -> CONCURRENT_REQUESTS 1), where ONE hung request stalls
+    the whole crawl for the full timeout."""
+    s = build_settings(make_args(impersonate="chrome", profile="presale"))
+    assert s["CONCURRENT_REQUESTS"] == 1
+    assert s["DOWNLOAD_TIMEOUT"] == 60
+
+
+def test_standard_crawls_are_untouched():
+    """The default path already honoured DOWNLOAD_TIMEOUT; #88 must not change it.
+
+    Asserts ABSENCE specifically. The first version allowed `or == 180`, whose second arm was
+    dead -- `make_args()` defaults to `impersonate='off'`, and `build_settings` returns before
+    the setting is ever added, so the key is simply not there."""
+    s = build_settings(make_args())
+    assert "DOWNLOAD_TIMEOUT" not in s
+    assert "tls_impersonate.ImpersonateMiddleware" not in s["DOWNLOADER_MIDDLEWARES"]
+
+
+def test_impersonate_without_presale_still_gets_the_declared_bound():
+    """`--impersonate` and `--profile presale` are INDEPENDENT flags -- the API can send
+    `{"impersonate": "chrome"}` alone -- so the 16-wide pairing must be covered too. The
+    bound's justification leans on the serial case, but its APPLICABILITY must not."""
+    s = build_settings(make_args(impersonate="chrome", profile="standard"))
+    assert s["CONCURRENT_REQUESTS"] == 16
+    assert s["DOWNLOAD_TIMEOUT"] == 60

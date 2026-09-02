@@ -144,3 +144,37 @@ def test_negative_retries_is_rejected(tmp_path):
     f.write_text("example.com\n")
     with pytest.raises(SystemExit):
         main([str(f), "--retries", "-1"])
+
+
+def test_the_reproduction_tools_default_matches_the_crawlers_bound():
+    """#88 review: `check_urls.py` is what an operator reaches for when triaging an
+    `unreachable.timeout` row, and its own docstring claims parity with the crawler. If its
+    default is tighter than the crawler's bound, a page the crawler would now fetch reports
+    ERROR here and the row gets closed as "host down" -- the real-page-as-transport-failure
+    mode #88 exists to remove, surviving in the tool used to confirm it was removed.
+
+    Asserted against `run_spider`'s actual setting rather than a copied literal, so the two
+    cannot drift apart silently."""
+    import check_urls
+    from run_spider import build_settings
+    from tests.test_run_spider import make_args
+
+    crawler_bound = build_settings(make_args(impersonate="chrome"))["DOWNLOAD_TIMEOUT"]
+    parser = check_urls.build_parser() if hasattr(check_urls, "build_parser") else None
+    if parser is not None:
+        default = parser.get_default("timeout")
+    else:                                   # parser built inline in main()
+        import re
+        src = inspect_source(check_urls)
+        m = re.search(r'"--timeout",\s*type=float,\s*default=([0-9.]+)', src)
+        assert m, "could not locate check_urls' --timeout default"
+        default = float(m.group(1))
+    assert default >= crawler_bound, (
+        f"check_urls defaults to {default}s but the crawler allows {crawler_bound}s -- "
+        "re-running a slow-but-real page through this tool would report it as an error"
+    )
+
+
+def inspect_source(mod):
+    import inspect
+    return inspect.getsource(mod)

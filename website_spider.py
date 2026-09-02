@@ -910,11 +910,16 @@ class WebsiteSpider(scrapy.Spider):
         """Bound the robots.txt fetch on BOTH download paths -- they honour different keys.
 
         `download_timeout` is set by DownloadTimeoutMiddleware with `setdefault`, so an
-        explicit value here wins on the default path. scrapy-impersonate reads NEITHER that
-        key nor DOWNLOAD_TIMEOUT: it hands curl_cffi no timeout at all and inherits its 30s
-        session default, which is why that path needs `impersonate_args` instead. (That gap
-        applies to every impersonated request, not just this one, and is filed separately --
-        raising it globally would take pages from 30s to 180s and is not #82's call to make.)
+        explicit value here wins on the default path. scrapy-impersonate reads neither that
+        key nor DOWNLOAD_TIMEOUT itself, which is why this also writes `impersonate_args`.
+
+        SINCE #88, `ImpersonateMiddleware` forwards `download_timeout` into
+        `impersonate_args["timeout"]`, so the explicit key here is no longer the ONLY thing
+        reaching curl on that path -- but do not delete it as redundant. It is what keeps the
+        robots gate's bound INDEPENDENT of the page bound: the forwarder uses `setdefault`,
+        so this explicit value still wins, and the two being equal today (both 60s) is a
+        coincidence of the numbers rather than a property. Move DOWNLOAD_TIMEOUT and the
+        robots budget stays where it was put, which is the point.
 
         Setting both keys deliberately makes the impersonate path wait LONGER than it does
         today, 2 x 60s rather than 2 x 30s. Robots semantics must not depend on which

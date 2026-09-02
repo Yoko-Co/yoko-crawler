@@ -81,9 +81,67 @@ class ImpersonateMiddleware:
     def process_request(self, request, spider):
         # setdefault so an explicit per-request meta override still wins.
         request.meta.setdefault("impersonate", random.choice(self.pool))
+        self._forward_download_timeout(request)
         # Advertise a UA matching whichever fingerprint this request uses, so
         # UA and JA3 stay consistent (incl. firefox/safari and per-request
         # "random" rotation). setdefault preserves an explicit --user-agent.
         request.headers.setdefault(
             "User-Agent", user_agent_for(request.meta["impersonate"])
         )
+
+    @staticmethod
+    def _forward_download_timeout(request):
+        """Carry Scrapy's timeout across to curl_cffi (issue #88).
+
+        scrapy-impersonate builds curl_cffi's kwargs from
+        method/url/params/data/headers/cookies/allow_redirects/proxy/impersonate and reads
+        NEITHER `download_timeout` NOR the DOWNLOAD_TIMEOUT setting, so it called
+        `AsyncSession.request()` with no timeout at all and silently inherited curl_cffi's
+        session default -- measured at 30.0s against a socket that accepts and never
+        answers. That is a bound nobody in this repo chose, invisible in `run_spider.py`,
+        and it MOVES if curl_cffi changes its default.
+
+        30s is also inside the range a slow-but-real page can take, and impersonation is
+        used for exactly the WAF-fronted, slow-to-answer sites where that is most likely --
+        so the undeclared bound was recording real pages as transport failures on the one
+        path least able to afford it.
+
+        `DownloadTimeoutMiddleware` runs at priority 350 and this middleware at 725, so by
+        the time we see the request `meta["download_timeout"]` is already populated from the
+        setting (or from an explicit per-request value, which is how the robots.txt budget in
+        `website_spider._robots_budget_meta` reaches this path). Forwarding it here means one
+        timeout mechanism for both download paths instead of two, and per-request overrides
+        keep working without either side knowing about the other.
+
+        NOTE what curl's scalar `timeout` actually bounds: curl_cffi maps it to
+        CURLOPT_TIMEOUT_MS, a hard cap on the WHOLE transfer, not time-to-first-byte and not
+        an idle timeout. With DOWNLOAD_MAXSIZE at 64MB a 60s cap implies >1.1 MB/s sustained
+        for a maximal body, and under `--proxy` the CONNECT comes out of the same budget.
+        That is not a regression -- the inherited 30s was the same kind of cap, and Scrapy's
+        own path enforces a total too -- but the number should be read as a transfer budget,
+        not a latency allowance.
+        """
+        timeout = request.meta.get("download_timeout")
+        if not timeout:
+            # Mirrors DownloadTimeoutMiddleware's own `if self._timeout:`. Note what this
+            # does NOT do: with DOWNLOAD_TIMEOUT 0 nothing is forwarded and this path falls
+            # back to curl_cffi's default, i.e. the undeclared ceiling #88 exists to remove,
+            # in the one case meant to remove it. Left as-is deliberately rather than
+            # forwarding 0 (libcurl reads TIMEOUT_MS 0 as INDEFINITE, which would hang a
+            # slot until CLOSESPIDER_TIMEOUT), and Scrapy's own 0 is not "no limit" either
+            # -- it skips the meta key and the default path lands on a 10s connect timeout.
+            # No caller sets 0, and `run_spider` always declares a value on this path.
+            # `test_download_timeout_zero_falls_back_to_curls_default` pins the real
+            # behaviour so it is documented rather than discovered.
+            return
+        args = request.meta.get("impersonate_args")
+        # REBUILD rather than mutate in place. `Request.copy()`/`replace()` shallow-copy
+        # meta, so mutating the nested dict installs one object shared by every derived
+        # request -- a retry, a redirect, anything built from this one. Dormant today
+        # (every impersonated request gets the same value, and `_robots_budget_meta()`
+        # builds a fresh dict per call), live the moment a derived request is re-timed.
+        args = dict(args) if isinstance(args, dict) else {}
+        # An explicit `impersonate_args["timeout"]` is a deliberate override and still wins;
+        # that is how the robots.txt budget pins its own bound on this path.
+        args.setdefault("timeout", timeout)
+        request.meta["impersonate_args"] = args
