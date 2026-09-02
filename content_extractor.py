@@ -920,7 +920,10 @@ def count_structure(
             if target and target != page_url.partition("#")[0] and len(internal_targets) < _MAX_INTERNAL_TARGETS:
                 internal_targets[target] = None
         else:
-            host = (urlparse(resolved).hostname or "").lower()
+            try:
+                host = (urlparse(resolved).hostname or "").lower()
+            except ValueError:
+                host = ""
             if host and len(external_hosts) < _MAX_EXTERNAL_HOSTS:
                 external_hosts[host] = None
         path = _href_path(resolved)

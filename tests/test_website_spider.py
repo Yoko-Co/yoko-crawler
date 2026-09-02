@@ -2448,10 +2448,13 @@ class TestSchemeConfusion:
     """Issue #89: `is_internal` compared the HOST and never the scheme, so a URL naming any
     protocol was accepted as long as its hostname matched the crawled domain.
 
-    Three intake paths take a value the REMOTE SERVER controls and had `is_internal` as
-    their only validation -- a `Location:` on a robots.txt redirect, a `Sitemap:` line, and
-    a sitemap `<loc>`. The `<a href>` path was already safe via `_NONNAV_SCHEMES`, which is
-    what makes this a gap in coverage rather than in knowledge.
+    FIVE intake paths take a value the REMOTE SERVER controls and had `is_internal` as their
+    only validation: a `Location:` on a robots.txt redirect, a `Sitemap:` line, a sitemap
+    `<loc>`, and the `Location:` on a page redirect and on an asset redirect. The first
+    version of this docstring said three, and also said the `<a href>` path was already safe
+    via `_NONNAV_SCHEMES` -- it was not, because `s3:` was missing from that tuple. Both
+    errors argue the same thing: the gate belongs in `is_internal`, where failing closed does
+    not depend on enumerating the call sites correctly.
     """
 
     def _spider(self, domain="example.com", **kw):
@@ -2575,3 +2578,189 @@ class TestSchemeConfusion:
         s = self._spider()
         assert list(s._schedule("file://example.com/etc/passwd")) == []
         assert len(list(s._schedule("https://example.com/ok/"))) == 1
+
+
+class TestSchemeGateHardening:
+    """Findings from the #89 review: the ways a gate documented as failing CLOSED did not."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_a_malformed_url_returns_false_instead_of_raising(self):
+        """`urlparse` raises on a bad netloc, and this gate runs mid-iteration over a
+        SITE-SUPPLIED list -- so one malformed value aborted the loop and cost every later
+        entry. Verified against the real urlparse, which is what raises."""
+        from urllib.parse import urlparse as _up
+        with pytest.raises(ValueError):
+            _up("http://[::1/x")          # the real raise this guards
+        s = self._spider()
+        assert s.is_internal("http://[::1/x") is False
+
+    def test_one_malformed_loc_does_not_cost_the_rest_of_the_sitemap(self):
+        """The consequence that makes it more than cosmetic: a site hands us a broken URL
+        and gets the remainder of its sitemap silently dropped."""
+        s = self._spider()
+        body = (b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                b"<url><loc>http://[::1/broken</loc></url>"
+                b"<url><loc>https://example.com/real-page/</loc></url></urlset>")
+        resp = TextResponse(url="https://example.com/sitemap.xml", body=body,
+                            headers={"Content-Type": "application/xml"},
+                            request=Request("https://example.com/sitemap.xml"))
+        urls = [r.url for r in s.parse_sitemap(resp) if isinstance(r, Request)]
+        assert "https://example.com/real-page/" in urls
+
+    def test_a_relative_sitemap_line_is_recovered_not_dropped(self):
+        """robots.txt is supposed to name an ABSOLUTE Sitemap: URL and plenty of sites do
+        not. Refusing scheme-less values without urljoining first turned that into silent
+        coverage loss -- the half my first docstring missed."""
+        s = self._spider()
+        # Deliberately NOT a path in SITEMAP_PROBE_PATHS. The first version of this test used
+        # `/sitemap.xml`, which the #77 probe fallback also emits -- so it passed with the fix
+        # reverted and proved nothing.
+        assert "/news-sitemap.xml" not in WebsiteSpider.SITEMAP_PROBE_PATHS
+        resp = TextResponse(
+            url="https://example.com/robots.txt",
+            body=b"User-agent: *\nAllow: /\nSitemap: /news-sitemap.xml\n",
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert "https://example.com/news-sitemap.xml" in urls
+
+    def test_a_protocol_relative_sitemap_line_is_recovered(self):
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/robots.txt",
+            body=b"User-agent: *\nAllow: /\nSitemap: //example.com/sm.xml\n",
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert "https://example.com/sm.xml" in urls
+
+    def test_urljoin_does_not_launder_a_hostile_scheme(self):
+        """The reason urljoin is safe here: an absolute scheme passes through it UNCHANGED,
+        so the gate still sees `file://` and still refuses it. And a protocol-relative
+        off-domain host resolves to https and is then refused on the host compare."""
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/robots.txt",
+            body=(b"User-agent: *\nAllow: /\nSitemap: file://example.com/etc/passwd\n"
+                  b"Sitemap: //evil.test/sm.xml\n"),
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        assert not any(u.startswith("file:") for u in urls)
+        assert not any("evil.test" in u for u in urls)
+
+    def test_a_refused_sitemap_line_does_not_suppress_the_probe_fallback(self):
+        """`listed_a_sitemap` gates the #77 conventional-location probes. Setting it before
+        the Request existed meant a Sitemap: line we could not queue still cost us the
+        fallback that exists precisely to cover a site with no usable sitemap."""
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/robots.txt",
+            body=b"User-agent: *\nAllow: /\nSitemap: file://example.com/etc/passwd\n",
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
+        probes = [u for u in urls if any(u.endswith(p) for p in WebsiteSpider.SITEMAP_PROBE_PATHS)]
+        assert probes, "the probe fallback was suppressed by a sitemap we never queued"
+
+    def test_the_guard_and_the_spider_agree_on_what_is_fetchable(self):
+        """The constant is duplicated on purpose (decoupling a security guard from the module
+        it guards). Duplication is only safe while they cannot disagree in the OPEN direction."""
+        from ssrf_guard import SsrfGuardMiddleware
+        assert WebsiteSpider._FETCHABLE_SCHEMES <= SsrfGuardMiddleware._FETCHABLE_SCHEMES
+
+
+class TestFetchGateVsSameSite:
+    """#89 review: `is_internal` now answers a different question than it used to.
+
+    It is a FETCH gate (may we hand this to a download handler?). `content_extractor` was
+    using the same callable to CLASSIFY links (does this point at the client's own site?),
+    where the scheme is irrelevant -- so hardening one silently changed the other."""
+
+    def _counts(self, html, page_url="https://example.com/page", predicate=None):
+        from lxml import html as lxml_html
+        from content_extractor import count_structure
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return count_structure(
+            lxml_html.fromstring(html), page_url,
+            is_internal=predicate or s.is_same_site,
+            asset_extensions=WebsiteSpider.ASSET_EXTENSIONS,
+        )
+
+    HTML = ('<html><body><main><p>x</p>'
+            '<a href="ftp://example.com/downloads/report.pdf">files</a>'
+            '<a href="https://vendor.test/app">vendor</a>'
+            '</main></body></html>')
+
+    def test_an_ftp_link_to_our_own_domain_is_not_reported_as_a_third_party(self):
+        """`<a href="ftp://<our-domain>/downloads">` is not rare on older association sites.
+        Under the fetch gate it stopped counting as internal, fell through to the external
+        branch, and listed the client's OWN domain back to them as an external integration."""
+        c = self._counts(self.HTML)
+        assert "example.com" not in (c.get("external_link_hosts") or [])
+        assert "vendor.test" in (c.get("external_link_hosts") or [])
+
+    def test_the_fetch_gate_would_have_gotten_this_wrong(self):
+        """Pins WHY the predicate had to be split, rather than just asserting the fix."""
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        c = self._counts(self.HTML, predicate=s.is_internal)
+        assert "example.com" in (c.get("external_link_hosts") or []), (
+            "if this stops being true the split is no longer load-bearing"
+        )
+
+    def test_the_two_predicates_differ_only_on_scheme(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        # Same answer for anything fetchable ...
+        for u in ("https://example.com/x", "http://www.example.com/x",
+                  "https://elsewhere.test/x"):
+            assert s.is_internal(u) == s.is_same_site(u), u
+        # ... and they diverge exactly where they should.
+        assert s.is_internal("ftp://example.com/x") is False
+        assert s.is_same_site("ftp://example.com/x") is True
+        # Neither may raise on a malformed URL.
+        assert s.is_same_site("http://[::1/x") is False
+
+    def test_the_fetch_gate_is_what_still_guards_scheduling(self):
+        """The split must not loosen the thing #89 fixed."""
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        assert list(s._schedule("ftp://example.com/x")) == []
+        assert list(s._schedule("file://example.com/etc/passwd")) == []
+
+
+class TestRemoteRedirectsCannotSmuggleAScheme:
+    """The two intake paths the first version of the #89 comment MISSED: a page redirect and
+    an asset redirect both feed a remote `Location:` into `_schedule`."""
+
+    def _spider(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_a_page_redirect_to_file_is_refused(self):
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/page", body=b"", status=301,
+            headers={"Location": b"file://example.com/etc/passwd"},
+            request=Request("https://example.com/page"),
+        )
+        urls = [r.url for r in s.parse(resp) if isinstance(r, Request)]
+        assert not any(u.startswith("file:") for u in urls)
+
+    def test_an_href_with_a_handler_scheme_is_not_navigational(self):
+        """`s3:` was absent from _NONNAV_SCHEMES, which is what made the original comment's
+        "<a href> was already safe" claim false."""
+        s = self._spider()
+        assert s.is_navigational_href("s3://example.com/x") is False
+        assert s.is_internal("s3://example.com/x") is False

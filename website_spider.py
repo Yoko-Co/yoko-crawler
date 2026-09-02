@@ -524,27 +524,89 @@ class WebsiteSpider(scrapy.Spider):
     # either: it resolves the hostname and blocks reserved ADDRESSES, and the crawled
     # domain resolves publicly, so the request passes it and reaches the local-file handler.
     #
-    # Three intake paths take a value the REMOTE SERVER controls and had `is_internal` as
-    # their only validation: a `Location:` on a robots.txt redirect, a `Sitemap:` line, and
-    # a sitemap's `<loc>`. (The `<a href>` path was already safe -- `is_navigational_href`
-    # screens `_NONNAV_SCHEMES` first. The knowledge existed; the choke point did not cover
-    # these three.) Fixing it HERE rather than at each call site is deliberate: it fails
-    # closed, so a call site nobody enumerated cannot open the gate.
+    # FIVE intake paths take a value the REMOTE SERVER controls and had `is_internal` as
+    # their only validation: a `Location:` on a robots.txt redirect, a `Sitemap:` line, a
+    # sitemap's `<loc>`, and the `Location:` on a page redirect and on an asset redirect
+    # (both of which reach `_schedule`, whose only gate is this one).
+    #
+    # And the `<a href>` path was NOT already safe, contrary to the first version of this
+    # comment: `_NONNAV_SCHEMES` lists `file:`/`ftp:`/`data:` but NOT `s3:`, so
+    # `is_navigational_href("s3://<domain>/x")` returned True and `s3` is in Scrapy's
+    # DOWNLOAD_HANDLERS_BASE. (`s3:` has since been added there too, but that is
+    # defence-in-depth -- this gate is what actually closes it.)
+    #
+    # Which is the argument for fixing it HERE rather than at each call site: the first
+    # count of the call sites was wrong in both directions, and a gate that fails closed
+    # does not depend on getting that count right.
     _FETCHABLE_SCHEMES = frozenset({"http", "https"})
+
+    @staticmethod
+    def _resolve_site_url(response, raw):
+        """Resolve a site-supplied URL against `response`, or None if it cannot be resolved.
+
+        `urljoin` RAISES ValueError on a malformed netloc, exactly like `urlparse` -- so
+        making `is_internal` fail closed (#89 review) was not enough on its own: adding the
+        urljoin in front of it just moved the same raise one line earlier, still aborting a
+        loop over a site-supplied list and still costing every later entry. Both halves have
+        to be non-raising for the "one bad value does not sink the rest" property to hold."""
+        try:
+            return response.urljoin((raw or "").strip()) or None
+        except ValueError:
+            return None
 
     def is_internal(self, url: str) -> bool:
         """Accept bare domain or www; optionally allow any subdomain of base domain.
 
         Non-http(s) schemes are refused outright -- see `_FETCHABLE_SCHEMES` (issue #89).
-        A scheme-LESS URL is refused by the same term, which is a fix rather than a
-        restriction: `Sitemap:` lines and sitemap `<loc>` values are NOT urljoined, so a
-        protocol-relative `//host/sitemap.xml` used to pass the host check and then reach
-        `scrapy.Request`, which raises `ValueError: Missing scheme in request url`. That is
-        now a clean skip instead of an exception mid-parse."""
-        parsed = urlparse(url)
-        if parsed.scheme.lower() not in self._FETCHABLE_SCHEMES:
+        A scheme-LESS URL is refused by the same term, so callers that take a raw
+        site-supplied value must `urljoin` it against the response FIRST -- which is what
+        the `Sitemap:` and `<loc>` readers now do. urljoin resolves `/sitemap.xml` and
+        `//host/sitemap.xml` against an http(s) base while leaving an absolute hostile
+        scheme untouched for this gate to refuse, so it recovers coverage without laundering
+        anything (`//evil.test/x` becomes `https://evil.test/x` and then fails the host
+        compare). An earlier version of this docstring called refusing scheme-less URLs "a
+        fix rather than a restriction" -- half true, and the missing half was a silent
+        coverage loss on any site whose robots.txt names its sitemap relatively.
+
+        NEVER RAISES. `urlparse` raises ValueError on a malformed netloc (`http://[::1/x` ->
+        "Invalid IPv6 URL"), and this gate is called mid-iteration over a site-supplied list:
+        one bad `<loc>` would abort `parse_sitemap` and lose every LATER entry, which is a
+        site handing us a malformed URL and getting the rest of its sitemap dropped. A gate
+        documented as failing closed has to actually fail closed, so a parse failure is
+        False, not an exception."""
+        try:
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower()
+            host = (parsed.hostname or "").lower().rstrip(".")
+        except ValueError:
             return False
-        host = (parsed.hostname or "").lower().rstrip(".")
+        if scheme not in self._FETCHABLE_SCHEMES:
+            return False
+        return self._host_is_ours(host)
+
+    def is_same_site(self, url: str) -> bool:
+        """Whether a URL belongs to the crawled site, IGNORING whether we would fetch it.
+
+        Split out from `is_internal` in the #89 review, because that predicate now answers a
+        different question than it used to. `is_internal` is a FETCH gate: it refuses
+        non-http(s) because we must never hand `file://` to a download handler. But
+        `content_extractor` uses the same callable to CLASSIFY links, where the question is
+        "does this point at the client's own site" -- and there the scheme is irrelevant.
+
+        Passing the fetch gate there had a client-visible consequence:
+        `<a href="ftp://<our-domain>/downloads">`, not rare on older association sites,
+        stopped counting as an internal link and fell through to the external branch, so the
+        report listed the client's OWN domain back to them as a third-party integration.
+        Two questions, two predicates."""
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        return self._host_is_ours(host)
+
+    def _host_is_ours(self, host: str) -> bool:
+        """The host comparison both predicates share, so they cannot drift apart."""
         if self.include_subdomains:
             return host == self.base_domain or host.endswith(f".{self.base_domain}")
         return host in {self.base_domain, f"www.{self.base_domain}"}
@@ -556,6 +618,9 @@ class WebsiteSpider(scrapy.Spider):
     _NONNAV_SCHEMES = (
         "mailto:", "tel:", "callto:", "sms:", "whatsapp:", "javascript:",
         "data:", "blob:", "file:", "ftp:", "ftps:",
+        # `s3:` has a registered Scrapy download handler too, and its absence here is what
+        # made the "<a href> was already safe" claim above false (#89 review).
+        "s3:",
     )
 
     def is_navigational_href(self, href: str) -> bool:
@@ -980,12 +1045,22 @@ class WebsiteSpider(scrapy.Spider):
                     continue
                 try:
                     sm_url = line.split(":", 1)[1].strip()
+                    # urljoin FIRST (#89 review). robots.txt is supposed to carry an absolute
+                    # Sitemap: URL and plenty of sites do not, so a bare `/sitemap.xml` used
+                    # to fail the host check and a `//host/sitemap.xml` used to pass it and
+                    # then raise in scrapy.Request. Resolving against the robots.txt response
+                    # recovers both; an absolute hostile scheme passes through urljoin
+                    # unchanged and is still refused below.
+                    sm_url = self._resolve_site_url(response, sm_url)
                     if sm_url and self.is_internal(sm_url):
-                        listed_a_sitemap = True
                         outputs.append(scrapy.Request(
                             sm_url, callback=self.parse_sitemap,
                             errback=self.sitemap_failed, dont_filter=True,
                         ))
+                        # Set AFTER the Request exists: the flag suppresses the #77 probe
+                        # fallback, so setting it first meant a Sitemap: line we failed to
+                        # queue still cost us the fallback that exists to cover that case.
+                        listed_a_sitemap = True
                 except Exception:
                     self._stat("seeding/sitemap_url_unparseable")
                     self.logger.warning(
@@ -1153,7 +1228,9 @@ class WebsiteSpider(scrapy.Spider):
         # a sitemap we GUESSED the location of is an unverified list (issue #77).
         guessed = bool(response.meta.get("guessed_source"))
         for loc in response.xpath("//*[local-name()='loc']/text()").getall():
-            if self.is_internal(loc):
+            # Resolved against the sitemap, same reason as the Sitemap: line above (#89).
+            loc = self._resolve_site_url(response, loc)
+            if loc and self.is_internal(loc):
                 yield from self._schedule(
                     loc,
                     referrer_emit=self.normalize_url(response.url, exclude_params=self.exclude_params_emit),
@@ -1162,7 +1239,8 @@ class WebsiteSpider(scrapy.Spider):
 
         # Follow nested sitemap indexes if present
         for sm in response.xpath("//*[local-name()='sitemap']/*[local-name()='loc']/text()").getall():
-            if self.is_internal(sm):
+            sm = self._resolve_site_url(response, sm)
+            if sm and self.is_internal(sm):
                 yield scrapy.Request(
                     sm, callback=self.parse_sitemap, errback=self.sitemap_failed,
                     dont_filter=True,
@@ -1386,7 +1464,7 @@ class WebsiteSpider(scrapy.Spider):
                 counts = count_structure(
                     result.subtree,
                     response.url,
-                    is_internal=self.is_internal,
+                    is_internal=self.is_same_site,
                     asset_extensions=self.ASSET_EXTENSIONS,
                 )
                 # Embeds are page-wide: surprising iframes live in headers,

@@ -72,6 +72,12 @@ class ProgressWriter:
             responses = self.stats.get_value("response_received_count", 0)
             if responses == 0:
                 blocked = self.stats.get_value("ssrf_guard/blocked", 0)
+                # A scheme refusal is also an SSRF-guard drop (#89). Without counting it
+                # here, a crawl the guard emptied by refusing `file://`/`s3://` fell through
+                # to the generic `unreachable`, whose operator-facing text says the address
+                # is wrong and to check it -- sending someone to re-type a domain that was
+                # never the problem.
+                blocked += self.stats.get_value("ssrf_guard/blocked_scheme", 0)
                 exceptions = self.stats.get_value("downloader/exception_count", 0)
                 # Order matters: the SSRF guard drops a host via IgnoreRequest, which Scrapy
                 # ALSO counts in downloader/exception_count -- so an all-SSRF-blocked crawl
