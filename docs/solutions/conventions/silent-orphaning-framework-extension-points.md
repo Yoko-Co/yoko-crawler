@@ -63,7 +63,7 @@ you do not need all three fixes.
 
 The fix breaks all three:
 
-1. Pin extension-point frameworks: `scrapy>=2.13,<3`.
+1. Pin extension-point frameworks: `scrapy>=2.18,<3` (was `>=2.13`; raised for `depth_reset`, #81 — a second instance of this same class, caught by applying this entry).
 2. Share one `_seed_requests()` generator between `start_requests()` (legacy) and
    `async def start()` (current) so the two entry points cannot drift, and rewrite
    tests to drive a real `scrapy.crawler.Crawler` calling `spider.start()` — the entry

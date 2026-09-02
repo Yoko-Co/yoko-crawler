@@ -210,6 +210,16 @@ class ProgressWriter:
                 # between "the seeder never ran" and "we asked and the network refused" --
                 # and the crawl's robots posture is unrecoverable after the fact.
                 "robots_failed": self.stats.get_value("seeding/robots_failed", 0),
+                # 1 means the installed Scrapy does NOT honour the `depth_reset` meta key
+                # (added in 2.18), so the start URL sat at depth 1 and every page below it
+                # is off by one (#81). Inert while DEPTH_LIMIT is unset, but it must not be
+                # invisible: the whole point of #81 is that an unsupported key is ignored in
+                # SILENCE, and a droplet venv is hand-managed, so the requirements floor does
+                # not bind it. Reported even when 0, so the field is a positive assertion the
+                # mechanism works rather than an ambiguous absence.
+                "depth_reset_unsupported": self.stats.get_value(
+                    "seeding/depth_reset_unsupported", 0
+                ),
             },
             # Block/restriction observability. These are OBSERVED counts, NOT a verdict: on a
             # Cloudflare-fronted site a single 403 can be both a bot challenge and a login page

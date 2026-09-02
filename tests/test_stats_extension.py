@@ -244,7 +244,8 @@ class TestSeedingTripwire:
                                    "sitemaps_fetched": 3, "start_urls_emitted": 1,
                                    "robots_failed": 0, "sitemap_probes_sent": 0,
                                    "sitemap_probes_found": 0,
-                                   "sitemap_probes_disallowed": 0}
+                                   "sitemap_probes_disallowed": 0,
+                                   "depth_reset_unsupported": 0}
 
     def test_status_file_reports_robots_failed(self, tmp_path):
         """A crawl that ran allow-all because robots.txt was UNREACHABLE must be

@@ -877,6 +877,15 @@ class WebsiteSpider(scrapy.Spider):
     # 180s and RETRY_TIMES of 2 that is 3 x 180s = 540s of a 7200s session -- 7.5% of the
     # budget with zero pages fetched. 60s x 3 = 180s instead.
     #
+    # WORSE ON THE CRAWLS THIS TOOL EXISTS FOR, which is why the issue's "paid every session"
+    # framing is right and my first reading of it was wrong. `--profile presale` -- the
+    # politer bundle for prospect sites we do not control -- forces `delay >= 3`, and
+    # `run_spider.py` sets `CONCURRENT_REQUESTS: 1` for any delay that high. With ONE slot
+    # there is no "other work in flight" to absorb the stall even on a RESUMED session with a
+    # full frontier, so a black-holed host costs the full budget every session, not just the
+    # first. And the chain multiplies it: bounded, a host that 301s fast and then black-holes
+    # still costs 4 hops x 3 attempts x 60s = 720s (10% of a session), versus 2160s unbounded.
+    #
     # WHY NOT SHORTER, AND WHY RETRIES ARE UNTOUCHED. The two failure directions here are
     # not symmetric. Waiting too long costs crawl budget; giving up too early routes us to
     # `robots_failed`, which proceeds ALLOW-ALL -- so an aggressive timeout silently converts
@@ -884,9 +893,18 @@ class WebsiteSpider(scrapy.Spider):
     # Disallow. That is #76's harm arriving through the back door, so the bound is sized to
     # be unreachable by any site we could actually crawl: 180s is sized for a page, this is
     # 1KB of text, and a host that cannot deliver it in 60s cannot serve a crawl either.
-    # Retries stay at the setting default for the same reason -- they are what stops one
-    # transient blip from flipping the gate open, and they do not lengthen the honest case.
     ROBOTS_DOWNLOAD_TIMEOUT = 60
+
+    # Attempts for robots.txt specifically, pinned rather than inherited (#82 review).
+    #
+    # Retries are what stop ONE transient blip from flipping the gate open, so the margin
+    # matters more here than anywhere else in the crawl -- and inheriting it made the margin
+    # depend on a CLI flag: `run_spider.py` sets `RETRY_TIMES: 1` whenever `--impersonate` is
+    # on, so the gate got 2 attempts there and 3 on the default path. Same argument as the
+    # timeout: whether we honour a site's Disallow must not depend on which flag the operator
+    # passed. RetryMiddleware reads this meta key in preference to the setting, so pages keep
+    # the operator's RETRY_TIMES while robots.txt keeps its margin on both paths.
+    ROBOTS_MAX_RETRY_TIMES = 2
 
     def _robots_budget_meta(self):
         """Bound the robots.txt fetch on BOTH download paths -- they honour different keys.
@@ -903,10 +921,17 @@ class WebsiteSpider(scrapy.Spider):
         `--impersonate` flag the operator passed, and 30s is inside the range a slow-but-real
         site can take -- on that path a slow robots.txt is silently abandoned and the crawl
         proceeds allow-all. Impersonation is used for exactly the WAF-fronted sites where
-        that matters most. The extra 60s worst case is a fifth of what #82 gives back."""
+        that matters most. The extra 60s worst case is a fifth of what #82 gives back.
+
+        Note the two paths' arithmetic differs and neither number is "the" worst case:
+        default path 3 x 60s = 180s (down from 540s), impersonated 3 x 60s = 180s (up from
+        2 x 30s = 60s, since `--impersonate` also sets `RETRY_TIMES: 1` -- see
+        ROBOTS_MAX_RETRY_TIMES, which is why the attempt count is pinned here rather than
+        inherited)."""
         return {
             "download_timeout": self.ROBOTS_DOWNLOAD_TIMEOUT,
             "impersonate_args": {"timeout": self.ROBOTS_DOWNLOAD_TIMEOUT},
+            "max_retry_times": self.ROBOTS_MAX_RETRY_TIMES,
         }
 
     def _start_url_requests(self):
@@ -921,13 +946,21 @@ class WebsiteSpider(scrapy.Spider):
         if self._start_urls_emitted:
             return
         self._start_urls_emitted = True
+        # Record the probe's answer as a STAT, not just a log line (#81 review). This is the
+        # failure class `docs/solutions/conventions/silent-orphaning-framework-extension-points.md`
+        # was written about, and it prescribes counting the thing that should have happened
+        # and surfacing it -- which `stats_extension` already does for the sibling seeding
+        # tripwire two functions away. A warning buried in the Scrapy log of a hand-managed
+        # droplet is not that. Always set, so `0` is a positive assertion the key works
+        # rather than an ambiguous absence.
+        self._stat("seeding/depth_reset_unsupported", 0 if _DEPTH_RESET_SUPPORTED else 1)
         if not _DEPTH_RESET_SUPPORTED:
             # requirements.txt now floors Scrapy at 2.18 for this, but a floor only binds a
             # fresh install and this crawler is deployed by hand onto a long-lived droplet
             # venv. On an older Scrapy `depth_reset` is simply an unrecognised meta key --
             # ignored in silence, leaving the #81 off-by-one in place while the code reads
             # as if it were fixed. Say so out loud instead.
-            self.logger.warning(
+            self.logger.error(
                 "Scrapy %s does not support the `depth_reset` meta key (added in 2.18), so "
                 "the start URL stays at depth 1 and every page below it is off by one. "
                 "Harmless while DEPTH_LIMIT is unset; upgrade before relying on a depth "
@@ -950,9 +983,29 @@ class WebsiteSpider(scrapy.Spider):
                 # every page below it by the same amount. DEPTH_LIMIT is unset today so
                 # nothing breaks, but #54 contemplates bounding depth and whoever lands it
                 # would silently get N-1 levels for a requested N, with the cause sitting in
-                # a change that predates their work. `depth_reset` also restores BFO
-                # ordering: homepage links go back to depth 1, so they again outrank
-                # sitemap-discovered URLs at depth 2 instead of tying with them.
+                # a change that predates their work.
+                #
+                # It ALSO re-separates BFO ordering -- homepage links go back to depth 1 and
+                # again outrank sitemap-listed URLs at depth 2 instead of tying. That is a
+                # TRADE, not a free win, and the earlier version of this comment overclaimed
+                # it. Depth is the BFO tiebreak (DEPTH_PRIORITY=1), and Scrapy's priority
+                # queue drains EVERY depth-1 request before ANY depth-2 one -- so on a site
+                # whose homepage links straight into a shallow-wide facet trap, that trap now
+                # claims the whole budget ahead of sitemap-curated content, where today's
+                # off-by-one tie interleaves them.
+                # `docs/solutions/architecture-patterns/queue-discipline-turns-a-url-trap-into-a-trapdoor.md`
+                # measured exactly this (289 of 300 pages lost to a shallow-wide trap that
+                # BFO does not bound) and names #54's DEPTH_LIMIT / per-prefix cap as the
+                # real fix. Restoring the pre-#76 ordering is still right -- the alternative
+                # is keeping an accidental mitigation produced by a bug -- but #54 is what
+                # actually bounds the trap.
+                #
+                # ON THE `robots_failed` PATH THIS KEY DOES NOTHING. Scrapy runs no spider
+                # middleware on errback output, so DepthMiddleware never sees these requests
+                # and never consumes the key. Depth still comes out right there, via
+                # `_init_depth`'s base case (no `depth` in meta -> the response is depth 0),
+                # so the behaviour is correct on both paths but by two different mechanisms.
+                # Harmless to send, and sending it unconditionally keeps one code path.
                 #
                 # Note `meta={"depth": 0}` does NOT work -- the issue's suggested shape.
                 # DepthMiddleware.get_processed_request ASSIGNS `request.meta["depth"]`
@@ -975,10 +1028,21 @@ class WebsiteSpider(scrapy.Spider):
         produce a ZERO-page crawl. Allow-all is the same posture as a site with no
         robots.txt: we could not read a "no", so we do not invent one."""
         self._stat("seeding/robots_failed")
+        # Log the exception TYPE, not just its str() (#82 review). Scrapy 2.18 wraps every
+        # download exception in its own class, and those wrappers carry NO message:
+        # str(DownloadTimeoutError()), str(CannotResolveHostError()) and
+        # str(DownloadConnectionRefusedError()) are all `''`. So this line -- the ONLY signal
+        # that a crawl proceeded allow-all -- was rendering as "robots.txt could not be
+        # fetched ()" for essentially every real failure on the default path. It went
+        # unnoticed because the test for it passes an OSError, which stringifies fine: the
+        # fixture did not match the shape production produces. #82's shorter bound makes the
+        # timeout variant routine, so the blank got worse.
+        exc = failure.value if hasattr(failure, "value") else failure
+        detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
         self.logger.warning(
             "robots.txt could not be fetched (%s) -- proceeding allow-all, as for a site "
             "with no robots.txt. Crawl-delay and Disallow rules are unknown for this crawl.",
-            failure.value if hasattr(failure, "value") else failure,
+            detail,
         )
         # It named no sitemap, because we never read it (#77).
         try:
@@ -1006,8 +1070,14 @@ class WebsiteSpider(scrapy.Spider):
             yield request
 
     def start_requests(self):
-        """Seed the crawl on Scrapy < 2.13, where `start()` does not exist. Kept so the
-        pinned range stays crawlable from either entry point; `start` is what runs today."""
+        """Seed the crawl on Scrapy < 2.13, where `start()` does not exist.
+
+        UNREACHABLE under the current floor: #81 raised `requirements.txt` to
+        `scrapy>=2.18,<3`, so no supported version lacks `start()`. Kept anyway, because it
+        costs one line and the failure it guards is the one this whole file is scarred by
+        (#52): a version outside the declared range is exactly the situation where seeding
+        goes missing in SILENCE, and a droplet venv is installed by hand. Deleting it would
+        trade a free fallback for a zero-page crawl on the one machine that matters."""
         return self._seed_requests()
 
     # ---------- Robots & sitemaps ----------
@@ -1111,10 +1181,23 @@ class WebsiteSpider(scrapy.Spider):
         # only request, so an unbounded hop is an unbounded stall -- and the chain multiplies
         # it: MAX_ROBOTS_REDIRECTS of 3 means up to FOUR black-holed fetches, which at the
         # un-bounded 540s each is 2160s, 30% of a 7200s session, before a page is fetched.
+        #
+        # `depth_reset` keeps every hop at depth 0, like the first fetch (#81 review). Without
+        # it each hop is a child of the last, and the moment #54 sets DEPTH_LIMIT,
+        # DepthMiddleware returns None for a hop past the bound -- silently dropping the
+        # request that SEEDING WAS DEFERRED TO. Reproduced on a real engine: a robots.txt
+        # that redirects twice with DEPTH_LIMIT=1 yields 2 rows, both robots.txt itself,
+        # `start_urls_emitted` unset, closing `finished`. That is the zero-page crawl #76
+        # exists to prevent, arriving through the fix for it. Sitemap probes stay at depth 1
+        # and sitemap URLs at depth 2, so this changes no page ordering.
         return scrapy.Request(
             tgt, callback=self.parse_robots, errback=self.robots_failed,
             dont_filter=True,
-            meta={"robots_hops": hops + 1, **self._robots_budget_meta()},
+            meta={
+                "robots_hops": hops + 1,
+                "depth_reset": True,
+                **self._robots_budget_meta(),
+            },
         )
 
     def _robots_body_outputs(self, response, outputs):
@@ -1217,7 +1300,23 @@ class WebsiteSpider(scrapy.Spider):
                 # sitemap -- false in the only situation this code can run, since robots.txt
                 # naming no sitemap is the trigger.
                 headers={"Referer": None},
-                meta={"guessed_source": True, "probe_hops": 0},
+                # Same per-attempt bound as robots.txt (#82 review). These are on the SAME
+                # seeding path and are emitted before any page exists, so an unbounded probe
+                # is the same stall: under `--profile presale` (CONCURRENT_REQUESTS 1) the
+                # four of them run one at a time, up to 4 x 540s = 2160s -- 30% of a session
+                # -- against a host that black-holes the probe paths specifically. They are
+                # also 1KB-of-XML fetches, so the same sizing argument applies unchanged.
+                #
+                # `depth` is set EXPLICITLY rather than left implicit because the two seeding
+                # paths disagree otherwise: DepthMiddleware overwrites it to 1 on the
+                # `parse_robots` path (no change), but runs at all on the `robots_failed`
+                # path, where errback output skips the spider middleware entirely and
+                # `_init_depth` would otherwise call these depth 0 -- so the same site got
+                # different probe depths depending on whether robots.txt answered.
+                meta={
+                    "guessed_source": True, "probe_hops": 0, "depth": 1,
+                    **self._robots_budget_meta(),
+                },
             )
 
     def parse_sitemap_probe(self, response):
@@ -1248,7 +1347,12 @@ class WebsiteSpider(scrapy.Spider):
                         tgt, callback=self.parse_sitemap_probe,
                         errback=self.sitemap_probe_failed, dont_filter=True,
                         headers={"Referer": None},
-                        meta={"guessed_source": True, "probe_hops": hops + 1},
+                        # Carries the budget for the same reason as the first probe (#82
+                        # review) -- bounding only the first hop leaves the follow unbounded.
+                        meta={
+                            "guessed_source": True, "probe_hops": hops + 1,
+                            **self._robots_budget_meta(),
+                        },
                     )
                     return
             self._stat("seeding/sitemap_probes_missed")
