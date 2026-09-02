@@ -258,6 +258,9 @@ class WebsiteSpider(scrapy.Spider):
         # scheduled. A robots.txt redirect chain re-enters parse_robots, so this guard
         # keeps the start URLs emitted exactly once no matter how many times we land here.
         self._start_urls_emitted = False
+        # One platform observation per crawl (corpus #112) -- the platform is a site
+        # property, so re-deriving it per page is waste.
+        self._platform_recorded = False
         try:
             self.max_robots_crawl_delay = float(
                 os.environ.get("YOKO_CRAWL_MAX_ROBOTS_DELAY", self.DEFAULT_MAX_ROBOTS_CRAWL_DELAY)
@@ -280,6 +283,74 @@ class WebsiteSpider(scrapy.Spider):
                 base -= self.SEQUENCE_PARAMS
             self.exclude_params_schedule = base
             self.exclude_params_emit = base
+
+    # Response headers and head tags that identify the CMS behind a site. Observation only --
+    # the crawler records what it saw and yoko-corpus decides what platform that means, the
+    # same split as the blocking/restriction counts.
+    #
+    # Why this exists (corpus #112): platform detection ran on the URL SPACE, looking for
+    # `/wp-content/`, `/wp-json/`, `/wp-admin/`. But `wp-json` is in INFRA_PATH_SEGMENTS and
+    # `wp-admin` in LOGIN_PATH_SEGMENTS -- we are built never to schedule them -- and
+    # `/wp-content/` only ever appears as an ASSET row, which needs an <a href> to a file;
+    # images are <img src> and are never scheduled. So a WordPress site with pretty
+    # permalinks and no linked PDFs scores ZERO WordPress markers. The better configured the
+    # site, the less likely we identified it. gastro.org (WordPress, WP Engine, Yoast) was
+    # reported as "Custom / other", which flips the headline from a content migration to a
+    # from-scratch rebuild -- the more expensive story.
+    #
+    # Every signal below is available on the FIRST response of any crawl.
+    _PLATFORM_HEADER_SIGNALS = (
+        # (header, substring to match or None for "present at all", token)
+        ("link", "api.w.org", "wp-rest-api-link"),
+        ("x-pingback", None, "x-pingback"),
+        ("x-generator", None, "x-generator"),
+        ("x-powered-by", None, "x-powered-by"),
+        ("x-drupal-cache", None, "x-drupal-cache"),
+        ("x-drupal-dynamic-cache", None, "x-drupal-cache"),
+        ("x-shopify-stage", None, "x-shopify"),
+    )
+    # Cap on how much header/meta text we keep per signal: enough to identify a platform and
+    # its version, short enough that a hostile or verbose header can't bloat the status file.
+    _PLATFORM_VALUE_MAXLEN = 120
+
+    def _record_platform_signals(self, response) -> None:
+        """Record CMS fingerprints from the first successful HTML response (corpus #112).
+
+        Only the first: the platform is a property of the SITE, so one good observation is
+        the whole answer and re-deriving it per page would be waste. Best-effort throughout
+        -- a platform hint is a nice-to-have and must never cost a crawl."""
+        if self._platform_recorded:
+            return
+        stats = getattr(getattr(self, "crawler", None), "stats", None)
+        if stats is None or response.status != 200 or not isinstance(response, TextResponse):
+            return
+        try:
+            signals = {}
+            for header, needle, token in self._PLATFORM_HEADER_SIGNALS:
+                raw = response.headers.getlist(header.encode())
+                if not raw:
+                    continue
+                value = b" ".join(raw).decode("latin-1")
+                if needle and needle not in value.lower():
+                    continue
+                signals[token] = value[: self._PLATFORM_VALUE_MAXLEN]
+            # <meta name="generator" content="WordPress 6.9.4"> and the spec'd WP REST
+            # discovery link, both in the head of the very page we just fetched.
+            gen = response.css('meta[name="generator"]::attr(content)').get()
+            if gen:
+                signals["generator"] = gen.strip()[: self._PLATFORM_VALUE_MAXLEN]
+            if response.css('link[rel="https://api.w.org/"]'):
+                signals["wp-rest-api-link"] = "https://api.w.org/"
+            if not signals:
+                # Nothing identifying on this page -- a later one may carry a generator, so
+                # don't latch. A site that never identifies itself stays unrecorded, which
+                # the corpus reads as "no signal", not as "not WordPress".
+                return
+            self._platform_recorded = True
+            stats.set_value("platform_signals", signals)
+            self.logger.info("Platform signals for %s: %s", self.base_domain, sorted(signals))
+        except Exception:
+            self.logger.debug("could not record platform signals", exc_info=True)
 
     def _record_robots_scope(self) -> None:
         """Record whether robots.txt disallows the SITE ROOT for our user-agent group
@@ -880,6 +951,8 @@ class WebsiteSpider(scrapy.Spider):
     def parse(self, response):
         # Emit the fetched page once (using emit-mode normalization)
         yield from self._emit_row(response)
+
+        self._record_platform_signals(response)
 
         # A bot-wall challenge/block page (Cloudflare/WAF): the row is emitted (its 403/429
         # is the signal the corpus reads), but we do NOT follow its links -- they are the

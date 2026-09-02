@@ -590,6 +590,10 @@ class JobManager:
                 "origin_forbidden_count": 0,
                 "status_counts": {},
             },
+            # Platform fingerprints from the first HTML response (corpus #112). Empty dict
+            # default, same reason as `blocking`/`restrictions`: one stable shape for the
+            # consumer whether mid-crawl or against an older crawler.
+            "platform_signals": status_data.get("platform_signals") or {},
             # Restriction observability (issue #74): the URL classes we deliberately did not
             # fetch, and any robots.txt Crawl-delay we paced at. Zeroed default for the same
             # reason as `blocking` -- a consumer always sees the same shape, mid-crawl or
