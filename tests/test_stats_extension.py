@@ -384,7 +384,12 @@ class TestRestrictionsBlock:
             reason="finished",
         )
         assert set(data["restrictions"]) == {
-            "skipped", "crawl_delay", "robots_root_disallowed"}
+            "skipped", "crawl_delay", "robots_root_disallowed", "robots_readability"}
+        # A crawl where robots.txt never resolved must read as "unknown", NOT as `absent` or
+        # `parsed` -- #97's whole point is that "we did not read the rules" and "there are no
+        # rules" are different facts, and the default must not quietly assert the safe one.
+        assert data["restrictions"]["robots_readability"] == {
+            "outcome": "unknown", "final_status": None, "waf_wall": False}
         # Never parsed -> None, NOT False: "we could not read the rules" must stay
         # distinct from "the rules allow us".
         assert data["restrictions"]["robots_root_disallowed"] is None

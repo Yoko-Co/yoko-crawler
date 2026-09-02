@@ -3429,3 +3429,115 @@ class TestRobotsTimeoutOverride:
         s = self._spider()
         assert s.max_robots_crawl_delay == 20.0
         assert s.robots_download_timeout == 120
+
+
+class TestRobotsReadability:
+    """#97: "we did not READ the rules" and "there are no rules" are different facts, and
+    until now only the second one was ever recorded. A 403 or 503 robots.txt produces an
+    ordinary response whose body the `status == 200` gate discards -- rules stay unset
+    (allow-all) and `seeding/robots_failed` never fires, because nothing failed in transport.
+    Cloudflare 403s robots.txt routinely, so the one tripwire we had was blind on the most
+    common route to an unjustified allow-all."""
+
+    def _spider(self):
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _robots_response(self, status=200, body=b"User-agent: *\nDisallow: /private/\n",
+                         headers=None):
+        return Response(
+            url="https://example.com/robots.txt", status=status, body=body,
+            headers=headers or {}, request=Request("https://example.com/robots.txt"),
+        ) if status // 100 != 2 or body is None else TextResponse(
+            url="https://example.com/robots.txt", status=status, body=body,
+            headers=headers or {}, encoding="utf-8",
+            request=Request("https://example.com/robots.txt"),
+        )
+
+    def _drive(self, response):
+        s = self._spider()
+        list(s._robots_outputs(response))
+        return s
+
+    def test_a_readable_robots_txt_is_recorded_as_parsed(self):
+        s = self._drive(self._robots_response())
+        assert s.crawler.stats.values["robots_readability_outcome"] == "parsed"
+        assert s.crawler.stats.values["robots_readability_status"] == 200
+        assert s.crawler.stats.values.get("seeding/robots_parsed") == 1
+        assert "seeding/robots_unreadable" not in s.crawler.stats.values
+
+    def test_a_404_is_absent_not_unreadable(self):
+        """The ONE status class from which allow-all is a justified inference. It must not be
+        lumped in with the refusals, or the #97 count is useless for the posture call."""
+        for status in (404, 410):
+            s = self._drive(self._robots_response(status=status, body=b"nope"))
+            assert s.crawler.stats.values["robots_readability_outcome"] == "absent", status
+            assert s.crawler.stats.values.get("seeding/robots_absent") == 1, status
+            assert "seeding/robots_unreadable" not in s.crawler.stats.values, status
+
+    def test_a_403_is_unreadable_and_loud(self, caplog):
+        """THE hole this issue exists for. Before #97 this produced an allow-all crawl with
+        no stat and no log line anywhere."""
+        import logging
+        with caplog.at_level(logging.WARNING):
+            s = self._drive(self._robots_response(status=403, body=b"Forbidden"))
+        v = s.crawler.stats.values
+        assert v["robots_readability_outcome"] == "unreadable"
+        assert v["robots_readability_status"] == 403
+        assert v.get("seeding/robots_unreadable") == 1
+        assert "NOT READ" in caplog.text
+        assert "not the same as a site with no robots.txt" in caplog.text, \
+            "the log must say WHY this differs from a 404, not just that it happened"
+
+    def test_5xx_and_429_are_unreadable_too(self):
+        for status in (429, 500, 503):
+            s = self._drive(self._robots_response(status=status, body=b"busy"))
+            assert s.crawler.stats.values["robots_readability_outcome"] == "unreadable", status
+
+    def test_a_cloudflare_wall_is_separated_from_an_origin_refusal(self):
+        """The distinction #97's posture call turns on: "a WAF would not let us ask" is not
+        "the site said no". Reuses the spider's existing `_is_waf_challenge`."""
+        wall = self._drive(self._robots_response(
+            status=403, body=b"blocked", headers={"cf-mitigated": "challenge"}))
+        assert wall.crawler.stats.values["robots_readability_waf"] is True
+        assert wall.crawler.stats.values.get("seeding/robots_unreadable_waf") == 1
+
+        origin = self._drive(self._robots_response(status=403, body=b"Forbidden"))
+        assert origin.crawler.stats.values["robots_readability_waf"] is False
+        assert origin.crawler.stats.values.get("seeding/robots_unreadable_origin") == 1
+
+    def test_a_200_we_could_not_parse_is_unreadable_not_parsed(self):
+        """`parsed` must mean rules we HOLD, not merely a 200. A binary body reaches the
+        parse branch, fails the TextResponse guard, and leaves us with nothing."""
+        s = self._drive(self._robots_response(status=200, body=None))
+        assert s._robots is None
+        assert s.crawler.stats.values["robots_readability_outcome"] == "unreadable"
+        assert s.crawler.stats.values["robots_readability_status"] == 200
+
+    def test_a_transport_failure_records_the_same_outcome(self):
+        """ONE signal regardless of route. `robots_failed` covered only this path, which is
+        why the response-borne routes above went uncounted for so long."""
+        import types as _t
+        s = self._spider()
+        failure = _t.SimpleNamespace(
+            value=OSError("boom"), request=Request("https://example.com/robots.txt"))
+        list(s.robots_failed(failure))
+        v = s.crawler.stats.values
+        assert v["robots_readability_outcome"] == "unreadable"
+        assert v["robots_readability_status"] is None, "no response means no status to report"
+        assert v.get("seeding/robots_failed") == 1
+        assert v.get("seeding/robots_unreadable") == 1
+
+    def test_a_dead_ended_redirect_is_unreadable_not_unknown(self):
+        """This branch returns BEFORE the body handler, so it needs its own record or a real
+        "never read the rules" outcome is filed as `unknown`."""
+        s = self._spider()
+        resp = Response(
+            url="https://example.com/robots.txt", status=301,
+            headers={"Location": "https://elsewhere.example.net/robots.txt"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        list(s._robots_outputs(resp))
+        assert s.crawler.stats.values["robots_readability_outcome"] == "unreadable"

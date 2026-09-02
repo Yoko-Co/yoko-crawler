@@ -1129,6 +1129,10 @@ class WebsiteSpider(scrapy.Spider):
         produce a ZERO-page crawl. Allow-all is the same posture as a site with no
         robots.txt: we could not read a "no", so we do not invent one."""
         self._stat("seeding/robots_failed")
+        # ONE signal regardless of route (#97): `robots_failed` covers transport failures
+        # only, so a 403/503 -- the cheaper and more common way to end up without rules --
+        # left no trace at all. Both routes now record the same readability outcome.
+        self._record_robots_readability(None)
         # Log the exception TYPE, not just its str() (#82 review). Scrapy 2.18 wraps every
         # download exception in its own class, and those wrappers carry NO message:
         # str(DownloadTimeoutError()), str(CannotResolveHostError()) and
@@ -1236,6 +1240,11 @@ class WebsiteSpider(scrapy.Spider):
             # No Location, an off-domain target, a malformed one, or the hop cap: the robots
             # chain ends here, so this call has to seed or the crawl fetches nothing. A
             # robots.txt we could not READ named no sitemap by definition, so probe (#77).
+            #
+            # This branch RETURNS before `_robots_body_outputs`, so it needs its own
+            # readability record or a dead-ended redirect -- a real "we never read the
+            # rules" outcome -- would be filed as `unknown` rather than `unreadable` (#97).
+            self._record_robots_readability(response)
             try:
                 outputs.extend(self._sitemap_probe_requests())
             except Exception:
@@ -1301,6 +1310,62 @@ class WebsiteSpider(scrapy.Spider):
             },
         )
 
+    # robots.txt statuses that genuinely mean "this site has no rules" (issue #97).
+    #
+    # This is the ONLY response class from which allow-all is an inference we are entitled to
+    # make. RFC 9309 reads an unavailable status the same way. Everything else -- a 403, a
+    # 429, a 5xx, a 200 we could not decode -- means we did not READ the rules, which is a
+    # different fact and must not be recorded as the same one.
+    ROBOTS_ABSENT_STATUSES = frozenset({404, 410})
+
+    def _record_robots_readability(self, response=None):
+        """Record WHY this crawl does or does not hold robots.txt rules (issue #97).
+
+        Until now the only signal that a crawl proceeded without rules was
+        `seeding/robots_failed`, which fires on TRANSPORT failure alone. A site that answers
+        with a 403 or a 503 produces a perfectly ordinary response, so the body is discarded
+        by the `status == 200` gate above, the rules stay unset (allow-all) and NOTHING is
+        counted -- the tripwire is silently incomplete on the cheaper route. Cloudflare 403s
+        a robots.txt routinely, so this is not a corner case.
+
+        `outcome` is per-crawl, not a counter: robots.txt is fetched once (modulo redirect
+        hops, where the LAST hop is the one that decided the outcome). Deliberately an
+        observation, not a verdict -- it changes no crawl behaviour. Whether `unreadable`
+        should stop a crawl instead of proceeding allow-all is the posture question in #97,
+        and it is Sarah's to answer with these counts in hand rather than mine to infer."""
+        if response is None:                      # transport failure -- robots_failed
+            outcome, status, waf = "unreadable", None, False
+        elif self._robots is not None:            # rules actually parsed
+            outcome, status, waf = "parsed", int(response.status), False
+        elif int(response.status) in self.ROBOTS_ABSENT_STATUSES:
+            outcome, status, waf = "absent", int(response.status), False
+        else:
+            # Non-200, an undecodable 200, or a body Protego refused. `_is_waf_challenge`
+            # already separates a real Cloudflare wall from a proxied ORIGIN 403 (it checks
+            # cf-mitigated / cf-ray + Server, then the origin fingerprint), which is the
+            # distinction the posture call in #97 turns on: "the site said no" and "a WAF
+            # would not let us ask" are not the same fact.
+            outcome, status = "unreadable", int(response.status)
+            try:
+                waf = self._is_waf_challenge(response)
+            except Exception:
+                waf = False
+        self._stat(f"seeding/robots_{outcome}")
+        if outcome == "unreadable":
+            self._stat("seeding/robots_unreadable_waf" if waf else "seeding/robots_unreadable_origin")
+            self.logger.warning(
+                "robots.txt was NOT READ (HTTP %s%s) -- proceeding allow-all. This is not "
+                "the same as a site with no robots.txt: rules may exist and we could not "
+                "see them. Crawl-delay and Disallow are unknown for this crawl. (issue #97)",
+                status if status is not None else "-", ", WAF wall" if waf else "",
+            )
+        crawler = getattr(self, "crawler", None)
+        stats = getattr(crawler, "stats", None) if crawler else None
+        if stats is not None:
+            stats.set_value("robots_readability_outcome", outcome)
+            stats.set_value("robots_readability_status", status)
+            stats.set_value("robots_readability_waf", waf)
+
     def _robots_body_outputs(self, response, outputs):
         """Parse the rules and discover sitemaps. Best-effort in both halves."""
         # Parse robots.txt rules from the real body (issues #57/#59): Disallow gates scheduling
@@ -1317,6 +1382,9 @@ class WebsiteSpider(scrapy.Spider):
                     self._apply_crawl_delay(float(delay))
             except Exception:
                 self.logger.debug("robots.txt parse failed for %s", response.url, exc_info=True)
+        # AFTER the parse attempt, so `parsed` means rules we actually hold -- not merely a
+        # 200, which a malformed body can accompany while leaving us with nothing (#97).
+        self._record_robots_readability(response)
 
         # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
         # Guarded on TextResponse: a binary body has no `.text`. Each line is guarded on its
