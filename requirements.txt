@@ -1,8 +1,15 @@
-fastapi>=0.100
-uvicorn[standard]>=0.27
+# Capped (crawler #55). These are EXTENSION-POINT frameworks: our code hangs off their
+# decorators, dependencies and lifespan, so a major bump can stop calling it with no error
+# and no failing test -- which is exactly how #52 lost robots.txt and sitemap seeding for
+# MONTHS when Scrapy renamed its seeding entry point. Plain libraries (httpx, structlog,
+# aiofiles, the google clients) stay unbounded deliberately: they have no hooks for our
+# code to fall off. A cap is one of the three conditions that bug needs; the registration
+# tripwire in the tests removes another.
+fastapi>=0.100,<1
+uvicorn[standard]>=0.27,<1
 scrapy>=2.18,<3  # >=2.13 for the `async def start()` seed entry point (2.17 removed start_requests and its call sites, silently killing cookie injection + robots/sitemap seeding); raised to >=2.18 for the `depth_reset` meta key, without which the start URL sits at depth 1 and every page below it is off by one (#81) -- an older Scrapy ignores the key in silence, so the floor is the fix and website_spider's feature check is only the net; cap major since spider/scheduler APIs move between majors
 scrapy-impersonate>=1.7,<2  # browser TLS-fingerprint impersonation (curl_cffi); cap major since the handler is referenced by import path
-protego  # robots.txt parsing (Disallow + Crawl-delay, #57/#59); ships with scrapy, declared explicitly since website_spider imports it directly
+protego>=0.3,<1  # robots.txt parsing (Disallow + Crawl-delay, #57/#59); ships with scrapy, declared explicitly since website_spider imports it directly
 trafilatura==2.1.0  # main-content extraction; pinned exactly because extraction heuristics change content_hash between versions (a deliberate upgrade is a hash-epoch change)
 aiofiles
 structlog
