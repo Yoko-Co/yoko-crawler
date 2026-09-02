@@ -2303,3 +2303,87 @@ class TestSitemapProbeHardening:
     def test_a_namespace_prefixed_root_is_accepted(self):
         """The xpath this feeds uses local-name() and would have parsed it."""
         assert WebsiteSpider._looks_like_sitemap('<sm:urlset xmlns:sm="http://x">')
+
+
+class TestTransportFailures:
+    """Issue #73: a URL whose request never produced a response vanished from the crawl.
+    Scrapy tallied `downloader/exception_count`, but with no errback the URL and the reason
+    were lost, so "we tried to reach N pages and couldn't" was invisible per-URL."""
+
+    def _spider(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _failure(self, exc, url="https://example.com/gone"):
+        return types.SimpleNamespace(value=exc, request=Request(url))
+
+    def test_each_transport_failure_kind_is_classified(self):
+        s = self._spider()
+        cases = {
+            "DNSLookupError": "dns",
+            "TCPTimedOutError": "timeout",
+            "ConnectionRefusedError": "connection",
+            "ResponseNeverReceived": "connection",
+            "SSLError": "tls",
+            "SomeNovelTwistedError": "other",
+        }
+        for name, kind in cases.items():
+            assert WebsiteSpider._classify_transport_failure(name) == kind, name
+
+    def test_a_dns_failure_emits_an_unreachable_skip_row(self):
+        s = self._spider()
+        exc = type("DNSLookupError", (Exception,), {})("no such host")
+        rows = list(s.page_failed(self._failure(exc)))
+        assert len(rows) == 1
+        assert rows[0]["skip_reason"] == "unreachable_dns"
+        assert rows[0]["url"] == "https://example.com/gone"
+        assert rows[0]["status"] == 0, "never fetched, so never a status"
+        assert s.crawler.stats.values.get("transport_failures") == 1
+        assert s.crawler.stats.values.get("transport_failures/dns") == 1
+
+    def test_our_own_ssrf_refusal_is_not_reported_as_a_site_failure(self):
+        """IgnoreRequest is OUR middleware declining the request. Reporting it as "we
+        couldn't reach this page" blames the site for our decision."""
+        s = self._spider()
+        exc = type("IgnoreRequest", (Exception,), {})("ssrf")
+        assert list(s.page_failed(self._failure(exc))) == []
+        assert s.crawler.stats.values.get("transport_failures") is None
+        assert s.crawler.stats.values.get("transport_failures_not_reported") == 1
+
+    def test_a_cancelled_request_is_not_reported(self):
+        """THE REVERSAL THIS COULD HAVE SHIPPED. When a crawl closes on
+        CLOSESPIDER_TIMEOUT every in-flight download is cancelled at once. Without this
+        guard, a routine timeout-close would emit a burst of phantom "host unreachable"
+        rows — inventing an outage on a healthy site, which is the opposite of the bug."""
+        s = self._spider()
+        exc = type("CancelledError", (Exception,), {})()
+        assert list(s.page_failed(self._failure(exc))) == []
+        assert s.crawler.stats.values.get("transport_failures") is None
+
+    def test_the_referrer_is_carried_through(self):
+        """Which page linked to the unreachable URL is the actionable half of the signal."""
+        s = self._spider()
+        key = s.facet_dedup_key(s.normalize_url("https://example.com/gone",
+                                                exclude_params=s.exclude_params_schedule))
+        s.first_referrer[key] = "https://example.com/sponsors"
+        exc = type("DNSLookupError", (Exception,), {})()
+        rows = list(s.page_failed(self._failure(exc)))
+        assert rows[0]["referrer"] == "https://example.com/sponsors"
+
+    def test_scheduled_requests_carry_the_errback(self):
+        """Without it the failure never reaches page_failed at all."""
+        s = self._spider()
+        reqs = list(s._schedule("https://example.com/about"))
+        assert reqs and all(r.errback == s.page_failed for r in reqs)
+
+    def test_asset_head_requests_carry_the_errback(self):
+        s = self._spider()
+        reqs = list(s._schedule("https://example.com/brochure.pdf"))
+        assert reqs and all(r.errback == s.page_failed for r in reqs)
+
+    def test_a_failure_with_no_request_does_not_raise(self):
+        s = self._spider()
+        exc = type("DNSLookupError", (Exception,), {})()
+        assert list(s.page_failed(types.SimpleNamespace(value=exc))) == []
+        assert s.crawler.stats.values.get("transport_failures") == 1
