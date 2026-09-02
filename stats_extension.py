@@ -188,6 +188,13 @@ class ProgressWriter:
                 # never told us about -- coverage we would previously have lost in silence.
                 "sitemap_probes_sent": self.stats.get_value("seeding/sitemap_probes_sent", 0),
                 "sitemap_probes_found": self.stats.get_value("seeding/sitemap_probes_found", 0),
+                # Non-zero means robots.txt DISALLOWED the conventional locations, so we
+                # never looked. Without this, `sitemap_probes_sent: 0` conflates "robots
+                # named a sitemap, nothing lost" with "we were refused, coverage lost" --
+                # exactly the ambiguous zero `robots_failed` exists to prevent.
+                "sitemap_probes_disallowed": self.stats.get_value(
+                    "seeding/sitemap_probes_disallowed", 0
+                ),
                 # Seeding is two-phase since #76 (robots.txt, THEN the start URLs from its
                 # callback). A crawl with seeds_emitted > 0 but start_urls_emitted == 0
                 # fetched robots.txt and nothing else -- see the tripwire below.

@@ -887,8 +887,9 @@ class TestInfraRedirectsStayOnDomain:
         reqs = _requests(spider.parse_robots(resp))
         # The off-domain robots.txt is not fetched. The start URL IS emitted here (issue
         # #76): this redirect ends the robots chain, and seeding now hangs off parse_robots,
-        # so returning nothing would leave the crawl with no pages at all.
-        assert [r.url for r in reqs] == ["https://example.com/"]
+        # so returning nothing would leave the crawl with no pages at all. Sitemap probes
+        # also fire, because a robots.txt we couldn't read named no sitemap (#77).
+        assert "https://example.com/" in [r.url for r in reqs]
         assert not any("evil.cdn.net" in r.url for r in reqs)
 
     def test_robots_redirect_on_domain_followed(self):
@@ -1752,12 +1753,14 @@ class TestRobotsSeedRace:
         out = list(s.parse_robots(self._resp(
             body=b"", status=301, headers={"Location": b"https://elsewhere.example/robots.txt"},
         )))
-        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+        urls = [r.url for r in out if isinstance(r, Request)]
+        assert "https://gastro.org/" in urls
+        assert not any("elsewhere.example" in u for u in urls)
 
     def test_redirect_without_location_still_seeds(self):
         s = self._spider()
         out = list(s.parse_robots(self._resp(body=b"", status=301)))
-        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+        assert "https://gastro.org/" in [r.url for r in out if isinstance(r, Request)]
 
     def test_missing_robots_txt_seeds_allow_all(self):
         """A 404 is the common case (no robots.txt at all): crawl normally."""
@@ -1786,7 +1789,7 @@ class TestRobotsSeedRace:
         s = self._spider()
         failure = types.SimpleNamespace(value=OSError("dns failure"))
         out = list(s.robots_failed(failure))
-        assert [r.url for r in out] == ["https://gastro.org/"]
+        assert "https://gastro.org/" in [r.url for r in out]
         assert s.crawler.stats.values.get("seeding/robots_failed") == 1
         assert not s.is_robots_disallowed("https://gastro.org/anything/")
 
@@ -1842,8 +1845,8 @@ class TestRobotsSeedRaceHardening:
             if not out:
                 break
             nxt = out[0]
-            if nxt.url != url:      # the start URL -> the chain resolved
-                seeded.append(nxt.url)
+            if nxt.url != url:      # the chain resolved -> start URL + sitemap probes
+                seeded.extend(r.url for r in out if r.url == "https://example.com/")
                 break
             hops += 1
             resp = self._redirect(url, url, hops=nxt.meta.get("robots_hops"))
@@ -1863,7 +1866,7 @@ class TestRobotsSeedRaceHardening:
                 break
             r = out[0]
             if not r.url.endswith("robots.txt"):
-                seeded.append(r.url)
+                seeded.extend(x.url for x in out if x.url == "https://example.com/")
                 break
             hops += 1
             meta_hops = r.meta.get("robots_hops")
@@ -1889,7 +1892,7 @@ class TestRobotsSeedRaceHardening:
         s = self._spider()
         resp = self._redirect("https://example.com/robots.txt", "http://[::1")
         urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
-        assert urls == ["https://example.com/"]
+        assert "https://example.com/" in urls
 
     def test_start_url_carries_no_referrer(self):
         """The site root has no referrer. Yielding it from a callback would otherwise let
@@ -2155,3 +2158,123 @@ class TestSitemapProbe:
         """Without one a refused probe would be an unhandled failure in the crawl log."""
         s = self._spider()
         assert all(r.errback is not None for r in s._sitemap_probe_requests())
+
+
+class TestSitemapProbeHardening:
+    """Findings from the #77 review. The first cut closed the phantom-404 risk at the probe
+    RESPONSE and left it open one hop downstream, where it is unbounded."""
+
+    SITEMAP = (b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+               b'<url><loc>https://example.com/gone</loc></url></urlset>')
+
+    def _spider(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _probe_resp(self, body=None, status=200, headers=None, meta=None,
+                    url="https://example.com/sitemap.xml"):
+        req = Request(url)
+        req.meta.update(meta or {"guessed_source": True, "probe_hops": 0})
+        h = {"Content-Type": "application/xml"}
+        h.update(headers or {})
+        return TextResponse(url=url, body=self.SITEMAP if body is None else body,
+                            headers=h, request=req, status=status)
+
+    def test_a_dead_url_from_a_guessed_sitemap_is_not_a_site_defect(self):
+        """THE REVERSAL THIS COULD HAVE SHIPPED. A stale /sitemap.xml left over from a
+        previous platform lists 400 pre-migration URLs. As normal rows those 400 404s make
+        blocked_fraction 0.93 and flip the report to `wholesale_blocked` — telling the
+        client "we couldn't read this site" about a site we read perfectly."""
+        s = self._spider()
+        req = Request("https://example.com/gone")
+        req.meta["guessed_source"] = True
+        dead = TextResponse(url="https://example.com/gone", body=b"<html>404</html>",
+                            headers={"Content-Type": "text/html"}, request=req, status=404)
+        out = list(s.parse(dead))
+        assert len(out) == 1
+        row = out[0]
+        assert row["skip_reason"] == "guessed_sitemap_dead"
+        assert row["status"] == 0, "a skip row is never a fetched page"
+        assert s.crawler.stats.values.get("guessed_sitemap_dead_urls") == 1
+
+    def test_a_live_url_from_a_guessed_sitemap_is_a_normal_page(self):
+        """Only the DEAD ones are diverted — a guessed sitemap that is current is exactly
+        the coverage this feature exists to recover."""
+        s = self._spider()
+        req = Request("https://example.com/real")
+        req.meta["guessed_source"] = True
+        live = TextResponse(url="https://example.com/real",
+                            body=b"<html><body><h1>Real</h1></body></html>",
+                            headers={"Content-Type": "text/html"}, request=req, status=200)
+        rows = [o for o in s.parse(live) if isinstance(o, dict)]
+        assert rows and rows[0]["skip_reason"] == ""
+        assert rows[0]["status"] == 200
+
+    def test_a_dead_url_from_a_LINKED_sitemap_is_still_a_normal_404(self):
+        """A sitemap the site ADVERTISED is a positive assertion of currency, so a dead URL
+        in it really is a broken link worth reporting. Only guesses are discounted."""
+        s = self._spider()
+        dead = TextResponse(url="https://example.com/gone", body=b"<html>404</html>",
+                            headers={"Content-Type": "text/html"},
+                            request=Request("https://example.com/gone"), status=404)
+        rows = [o for o in s.parse(dead) if isinstance(o, dict)]
+        assert rows and rows[0]["skip_reason"] == ""
+
+    def test_provenance_reaches_the_scheduled_urls(self):
+        s = self._spider()
+        out = list(s.parse_sitemap_probe(self._probe_resp()))
+        reqs = [r for r in out if isinstance(r, Request)]
+        assert reqs and all(r.meta.get("guessed_source") for r in reqs)
+
+    def test_a_linked_sitemap_marks_nothing_as_guessed(self):
+        s = self._spider()
+        resp = TextResponse(url="https://example.com/sitemap.xml", body=self.SITEMAP,
+                            headers={"Content-Type": "application/xml"},
+                            request=Request("https://example.com/sitemap.xml"), status=200)
+        reqs = [r for r in s.parse_sitemap(resp) if isinstance(r, Request)]
+        assert reqs and not any(r.meta.get("guessed_source") for r in reqs)
+
+    def test_a_probe_redirect_is_followed_once(self):
+        """A 301 is the strongest evidence a sitemap exists; dropping it lost the discovery
+        for any site redirecting to a path we don't guess."""
+        s = self._spider()
+        out = list(s.parse_sitemap_probe(self._probe_resp(
+            body=b"", status=301, headers={"Location": b"https://example.com/sitemaps/s.xml"})))
+        assert [r.url for r in out] == ["https://example.com/sitemaps/s.xml"]
+        assert out[0].meta["probe_hops"] == 1
+
+    def test_a_probe_redirect_chain_is_bounded(self):
+        s = self._spider()
+        out = list(s.parse_sitemap_probe(self._probe_resp(
+            body=b"", status=301, headers={"Location": b"https://example.com/again.xml"},
+            meta={"guessed_source": True, "probe_hops": 1})))
+        assert out == []
+
+    def test_an_offdomain_probe_redirect_is_not_followed(self):
+        s = self._spider()
+        out = list(s.parse_sitemap_probe(self._probe_resp(
+            body=b"", status=301, headers={"Location": b"https://evil.example/s.xml"})))
+        assert out == []
+
+    def test_probes_suppress_the_referer(self):
+        """Otherwise the row asserts robots.txt linked to the sitemap — false in the only
+        situation this code can run."""
+        s = self._spider()
+        assert all(r.headers.get("Referer") is None for r in s._sitemap_probe_requests())
+
+    def test_root_element_is_anchored_not_merely_present(self):
+        assert not WebsiteSpider._looks_like_sitemap(
+            "<html><body>we support &lt;urlset&gt; sitemaps</body></html>")
+        assert not WebsiteSpider._looks_like_sitemap("<html><urlset-ish></html>")
+
+    def test_a_prologue_before_the_root_is_tolerated(self):
+        """gastro.org's real sitemap opens with an <?xml-stylesheet?> PI."""
+        assert WebsiteSpider._looks_like_sitemap(
+            '<?xml version="1.0"?><?xml-stylesheet type="text/xsl" href="/main.xsl"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">')
+        assert WebsiteSpider._looks_like_sitemap("﻿<!-- built by a plugin -->\n<urlset>")
+
+    def test_a_namespace_prefixed_root_is_accepted(self):
+        """The xpath this feeds uses local-name() and would have parsed it."""
+        assert WebsiteSpider._looks_like_sitemap('<sm:urlset xmlns:sm="http://x">')
