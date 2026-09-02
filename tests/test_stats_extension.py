@@ -322,3 +322,94 @@ class TestSeedingTripwire:
             reason="finished",
         )
         assert data["status"] == "completed"
+
+
+class TestRestrictionsBlock:
+    """Issue #74: the URL classes we deliberately don't fetch, and any Crawl-delay we paced
+    at, have to leave Scrapy's stats. Until they did, a crawl the site itself had walled off
+    was indistinguishable from a crawl of a genuinely small site."""
+
+    def test_restrictions_are_reported(self, tmp_path):
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 2, "seeding/seeds_emitted": 2,
+             "seeding/start_urls_emitted": 1,
+             "robots_disallowed_skipped": 2345, "login_urls_skipped": 7,
+             "infra_urls_skipped": 3, "facet_urls_skipped": 12,
+             "nofollow_links_skipped": 4, "meta_nofollow_pages": 1,
+             "robots_crawl_delay_applied": 1,
+             "robots_crawl_delay_honored": 10.0,
+             "robots_crawl_delay_requested": 15.0},
+            reason="finished",
+        )
+        assert data["restrictions"]["skipped"] == {
+            "robots_disallowed": 2345, "robots_disallowed_assets": 0, "login_gated": 7,
+            "infra": 3, "facet_capped": 12, "nofollow_links": 4, "meta_nofollow_pages": 1,
+        }
+        assert data["restrictions"]["crawl_delay"] == {
+            "applied": 1, "honored_seconds": 10.0, "requested_seconds": 15.0,
+        }
+
+    def test_the_gastro_shape_is_legible(self, tmp_path):
+        """The case that motivated #74: a blanket `Disallow: /`. The crawl closes `finished`
+        with a clean status histogram, so `restrictions` is the ONLY thing that can tell a
+        consumer this is not an inventory."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 2, "seeding/seeds_emitted": 2,
+             "seeding/robots_fetched": 1, "seeding/start_urls_emitted": 1,
+             "downloader/response_status_count/200": 2,
+             "robots_disallowed_skipped": 2345},
+            reason="finished",
+        )
+        assert data["status"] == "completed"
+        assert data["blocking"]["waf_challenge_count"] == 0
+        assert data["blocking"]["origin_forbidden_count"] == 0
+        skipped = data["restrictions"]["skipped"]["robots_disallowed"]
+        assert skipped == 2345
+        assert skipped > data["urls_crawled"] * 100, (
+            "a consumer must be able to see the crawl covered a trivial fraction of the site"
+        )
+
+    def test_absent_stats_default_to_zero(self, tmp_path):
+        """An unrestricted crawl reports a fully zeroed shape, never missing keys, so a
+        consumer can read it without defensive lookups."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "seeding/seeds_emitted": 2,
+             "seeding/start_urls_emitted": 1},
+            reason="finished",
+        )
+        assert set(data["restrictions"]) == {
+            "skipped", "crawl_delay", "robots_root_disallowed"}
+        # Never parsed -> None, NOT False: "we could not read the rules" must stay
+        # distinct from "the rules allow us".
+        assert data["restrictions"]["robots_root_disallowed"] is None
+        assert all(v == 0 for v in data["restrictions"]["skipped"].values())
+        assert all(v == 0 for v in data["restrictions"]["crawl_delay"].values())
+
+    def test_robots_root_disallowed_is_reported(self, tmp_path):
+        """The discovery-independent signal. A `Disallow: /` site with a thin homepage and
+        no sitemap withholds everything while skipping almost nothing -- the counter can't
+        see that, this can."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 2, "robots_root_disallowed": 1,
+             "robots_disallowed_skipped": 4},
+            reason="finished",
+        )
+        assert data["restrictions"]["robots_root_disallowed"] is True
+
+    def test_assets_are_counted_apart_from_pages(self, tmp_path):
+        """A `Disallow: /wp-content/uploads/` site with 600 linked PDFs is fully
+        inventoried; those files must never read as withheld pages."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "robots_root_disallowed": 0,
+             "robots_disallowed_skipped": 0,
+             "robots_disallowed_assets_skipped": 600},
+            reason="finished",
+        )
+        assert data["restrictions"]["skipped"]["robots_disallowed"] == 0
+        assert data["restrictions"]["skipped"]["robots_disallowed_assets"] == 600
+        assert data["restrictions"]["robots_root_disallowed"] is False

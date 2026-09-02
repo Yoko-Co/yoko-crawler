@@ -636,6 +636,14 @@ class _FakeStats:
     def inc_value(self, key, count=1, start=0):
         self.values[key] = self.values.get(key, start) + count
 
+    # Scrapy's real StatsCollector has this; the fake needs it too or a set_value the code
+    # under test makes is swallowed by a defensive except and the test passes on a no-op.
+    def set_value(self, key, value):
+        self.values[key] = value
+
+    def get_value(self, key, default=None):
+        return self.values.get(key, default)
+
 
 def _challenge_response(status=403, url="https://example.com/",
                         body=ARTICLE_PAGE, cloudflare=True, cf_mitigated=False):
@@ -1172,6 +1180,10 @@ class TestRobotsCrawlDelay:
         assert slot.delay == 10.0
         assert throttle.mindelay == 10.0
         assert s.crawler.stats.values.get("robots_crawl_delay_applied") == 1
+        # Issue #74: the SECONDS matter, not just that it happened -- "we paced at 10s
+        # because the site asked 10s" is what an operator needs to read a partial crawl.
+        assert s.crawler.stats.values.get("robots_crawl_delay_honored") == 10.0
+        assert s.crawler.stats.values.get("robots_crawl_delay_requested") == 10.0
 
     def test_apply_clamps_to_cap(self):
         s = WebsiteSpider(domain="example.com")
@@ -1180,6 +1192,10 @@ class TestRobotsCrawlDelay:
         s.crawler = self._crawler(1.0, slot=slot)
         s._apply_crawl_delay(3600.0)  # pathological
         assert slot.delay == 10.0  # clamped to the cap, not 3600
+        # The clamp is the case an operator most needs surfaced (issue #74): the crawl will
+        # finalize partial, and honored-vs-requested is the only record of why.
+        assert s.crawler.stats.values.get("robots_crawl_delay_honored") == 10.0
+        assert s.crawler.stats.values.get("robots_crawl_delay_requested") == 3600.0
 
     def test_apply_noop_when_asked_below_our_floor(self):
         s = WebsiteSpider(domain="example.com")

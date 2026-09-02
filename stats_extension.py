@@ -138,6 +138,13 @@ class ProgressWriter:
             status, error=error, final=True, close_reason=reason, failure_reason=failure_reason
         )
 
+    def _robots_root_disallowed(self):
+        """True/False once robots.txt has been parsed, None when it never was (no
+        robots.txt, a transport failure, or a crawl that ended first). None matters: it
+        keeps "we could not read the rules" distinct from "the rules allow us"."""
+        raw = self.stats.get_value("robots_root_disallowed", None)
+        return None if raw is None else bool(raw)
+
     def _status_counts(self):
         """HTTP status histogram ({"200": n, "403": n, ...}) from Scrapy's built-in
         `downloader/response_status_count/<code>` stats, so the operator can see the response
@@ -201,6 +208,47 @@ class ProgressWriter:
                 "waf_challenge_count": self.stats.get_value("waf_challenge_count", 0),
                 "origin_forbidden_count": self.stats.get_value("origin_forbidden_count", 0),
                 "status_counts": self._status_counts(),
+            },
+            # Restriction observability (issue #74). The crawler deliberately does not fetch
+            # several classes of URL, and until now NONE of those counts left Scrapy's stats
+            # -- so a crawl the site itself had walled off was indistinguishable from a crawl
+            # of a small site. gastro.org made that concrete: `User-agent: * / Disallow: /`
+            # reduced a 2,347-URL site to a 1-page inventory that still reported "completed",
+            # and the report called it "a Simple site".
+            #
+            # Like `blocking`, these are OBSERVED counts, not a verdict -- the consumer
+            # decides what they mean. `robots_disallowed` is the load-bearing one: large
+            # relative to the pages actually crawled, the crawl is not an inventory.
+            "restrictions": {
+                # Deterministic, discovery-independent: does robots.txt disallow the site
+                # ROOT for our UA group? The skip counts below only see URLs we found a
+                # link or sitemap entry for, so a `Disallow: /` site with no sitemap and a
+                # thin homepage withholds everything while counting almost nothing. This
+                # answers the question directly and needs no threshold. None (not False)
+                # when robots.txt was never parsed, so "unknown" stays distinct from "no".
+                "robots_root_disallowed": self._robots_root_disallowed(),
+                "skipped": {
+                    "robots_disallowed": self.stats.get_value("robots_disallowed_skipped", 0),
+                    # Assets (PDFs, images) under a disallowed path are FILES, not withheld
+                    # pages -- kept separate so they never inflate the withheld signal.
+                    "robots_disallowed_assets": self.stats.get_value(
+                        "robots_disallowed_assets_skipped", 0
+                    ),
+                    "login_gated": self.stats.get_value("login_urls_skipped", 0),
+                    "infra": self.stats.get_value("infra_urls_skipped", 0),
+                    "facet_capped": self.stats.get_value("facet_urls_skipped", 0),
+                    "nofollow_links": self.stats.get_value("nofollow_links_skipped", 0),
+                    "meta_nofollow_pages": self.stats.get_value("meta_nofollow_pages", 0),
+                },
+                # robots.txt Crawl-delay. `honored_seconds` is what we actually paced at;
+                # `requested_seconds` is what the site asked for. They differ when the ask
+                # exceeded YOKO_CRAWL_MAX_ROBOTS_DELAY and we clamped -- which is the case
+                # where a crawl finalizes partial and the operator needs to know why.
+                "crawl_delay": {
+                    "applied": self.stats.get_value("robots_crawl_delay_applied", 0),
+                    "honored_seconds": self.stats.get_value("robots_crawl_delay_honored", 0),
+                    "requested_seconds": self.stats.get_value("robots_crawl_delay_requested", 0),
+                },
             },
         }
         if final:

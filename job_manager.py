@@ -590,6 +590,27 @@ class JobManager:
                 "origin_forbidden_count": 0,
                 "status_counts": {},
             },
+            # Restriction observability (issue #74): the URL classes we deliberately did not
+            # fetch, and any robots.txt Crawl-delay we paced at. Zeroed default for the same
+            # reason as `blocking` -- a consumer always sees the same shape, mid-crawl or
+            # against an older crawler whose status file predates the field.
+            "restrictions": status_data.get("restrictions") or {
+                "robots_root_disallowed": None,
+                "skipped": {
+                    "robots_disallowed": 0,
+                    "robots_disallowed_assets": 0,
+                    "login_gated": 0,
+                    "infra": 0,
+                    "facet_capped": 0,
+                    "nofollow_links": 0,
+                    "meta_nofollow_pages": 0,
+                },
+                "crawl_delay": {
+                    "applied": 0,
+                    "honored_seconds": 0,
+                    "requested_seconds": 0,
+                },
+            },
             "started_at": (
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(job.started_at))
             ),
