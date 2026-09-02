@@ -183,6 +183,11 @@ class ProgressWriter:
                 "seeds_emitted": self.stats.get_value("seeding/seeds_emitted", 0),
                 "robots_fetched": self.stats.get_value("seeding/robots_fetched", 0),
                 "sitemaps_fetched": self.stats.get_value("seeding/sitemaps_fetched", 0),
+                # Conventional-location sitemap probes (issue #77), sent only when
+                # robots.txt named no sitemap. `found` > 0 means the site HAS a sitemap it
+                # never told us about -- coverage we would previously have lost in silence.
+                "sitemap_probes_sent": self.stats.get_value("seeding/sitemap_probes_sent", 0),
+                "sitemap_probes_found": self.stats.get_value("seeding/sitemap_probes_found", 0),
                 # Seeding is two-phase since #76 (robots.txt, THEN the start URLs from its
                 # callback). A crawl with seeds_emitted > 0 but start_urls_emitted == 0
                 # fetched robots.txt and nothing else -- see the tripwire below.

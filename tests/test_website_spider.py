@@ -1763,7 +1763,11 @@ class TestRobotsSeedRace:
         """A 404 is the common case (no robots.txt at all): crawl normally."""
         s = self._spider()
         out = list(s.parse_robots(self._resp(body=b"<html>404</html>", status=404)))
-        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+        urls = [r.url for r in out if isinstance(r, Request)]
+        assert "https://gastro.org/" in urls
+        # No robots.txt named a sitemap, so the conventional locations are probed (#77).
+        assert urls == ["https://gastro.org" + p for p in WebsiteSpider.SITEMAP_PROBE_PATHS] \
+            + ["https://gastro.org/"]
         assert s._robots is None
         assert not s.is_robots_disallowed("https://gastro.org/anything/")
 
@@ -1774,7 +1778,7 @@ class TestRobotsSeedRace:
         resp = Response(url="https://gastro.org/robots.txt", body=b"\x00\x01\x02",
                         request=Request("https://gastro.org/robots.txt"), status=200)
         out = list(s.parse_robots(resp))
-        assert [r.url for r in out if isinstance(r, Request)] == ["https://gastro.org/"]
+        assert "https://gastro.org/" in [r.url for r in out if isinstance(r, Request)]
 
     def test_transport_failure_seeds_allow_all(self):
         """Issue #76's regression guard: a DNS/connection failure on robots.txt must not
@@ -1943,7 +1947,7 @@ class TestRobotsSeedRaceHardening:
                             headers={"Content-Type": "text/plain"},
                             request=Request("https://example.com/robots.txt"), status=200)
         urls = [r.url for r in s.parse_robots(resp) if isinstance(r, Request)]
-        assert urls == ["https://example.com/"]
+        assert "https://example.com/" in urls
         assert s.is_robots_disallowed("https://example.com/private/x")
 
 
@@ -2043,3 +2047,111 @@ class TestPlatformSignals:
         s = self._spider()
         s.crawler = types.SimpleNamespace(stats=None)
         s._record_platform_signals(self._page())  # no stats -> no-op, no exception
+
+
+class TestSitemapProbe:
+    """Issue #77: sitemap discovery was single-source. A site whose robots.txt omits the
+    `Sitemap:` line got NO sitemap seeding and silently degraded to link-following only.
+    gastro.org serves a complete 12-file Yoast index at /sitemap_index.xml (2,347 URLs) and
+    names none of it in robots.txt."""
+
+    SITEMAP = (b'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+               b'<url><loc>https://example.com/a</loc></url>'
+               b'<url><loc>https://example.com/b</loc></url></urlset>')
+
+    def _spider(self, robots=None):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        if robots is not None:
+            from protego import Protego
+            s._robots = Protego.parse(robots)
+        return s
+
+    def _robots(self, s, body):
+        return list(s.parse_robots(TextResponse(
+            url="https://example.com/robots.txt", body=body,
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"), status=200)))
+
+    def _probe_resp(self, body=None, status=200, ctype="application/xml"):
+        return TextResponse(
+            url="https://example.com/sitemap_index.xml",
+            body=self.SITEMAP if body is None else body,
+            headers={"Content-Type": ctype},
+            request=Request("https://example.com/sitemap_index.xml"), status=status)
+
+    def test_probes_fire_when_robots_names_no_sitemap(self):
+        s = self._spider()
+        urls = [r.url for r in self._robots(s, b"User-agent: *\nAllow: /\n")
+                if isinstance(r, Request)]
+        for path in WebsiteSpider.SITEMAP_PROBE_PATHS:
+            assert f"https://example.com{path}" in urls
+        assert s.crawler.stats.values.get("seeding/sitemap_probes_sent") == 4
+
+    def test_probes_do_not_fire_when_robots_names_one(self):
+        """A site that points us at its sitemap gets no speculative traffic at all."""
+        s = self._spider()
+        urls = [r.url for r in self._robots(
+            s, b"User-agent: *\nSitemap: https://example.com/custom-sitemap.xml\n")
+            if isinstance(r, Request)]
+        assert "https://example.com/custom-sitemap.xml" in urls
+        assert not any("sitemap_index.xml" in u for u in urls)
+        assert s.crawler.stats.values.get("seeding/sitemap_probes_sent") is None
+
+    def test_a_404_probe_emits_no_row(self):
+        """THE RISK THIS CHANGE COULD HAVE SHIPPED. `parse_sitemap` emits a row for every
+        response, and most sites 404 three of the four guesses. Emitting those would put
+        phantom broken links in the crawl -- and the report presents 404s as "broken links
+        on the site" with a referrer. We would invent defects in a client's site and report
+        them back."""
+        s = self._spider()
+        out = list(s.parse_sitemap_probe(self._probe_resp(body=b"<html>Not found</html>",
+                                                          status=404, ctype="text/html")))
+        assert out == []
+        assert s.crawler.stats.values.get("seeding/sitemap_probes_missed") == 1
+
+    def test_a_soft_404_html_page_is_not_treated_as_a_sitemap(self):
+        """A catch-all route returning 200 with an HTML body is common; taking it for a
+        sitemap would be worse than missing one."""
+        s = self._spider()
+        out = list(s.parse_sitemap_probe(self._probe_resp(
+            body=b"<html><body>Page not found</body></html>", ctype="text/html")))
+        assert out == []
+        assert s.crawler.stats.values.get("seeding/sitemap_probes_not_a_sitemap") == 1
+
+    def test_a_real_sitemap_is_followed(self):
+        s = self._spider()
+        out = list(s.parse_sitemap_probe(self._probe_resp()))
+        urls = [r.url for r in out if isinstance(r, Request)]
+        assert "https://example.com/a" in urls and "https://example.com/b" in urls
+        assert s.crawler.stats.values.get("seeding/sitemap_probes_found") == 1
+
+    def test_a_sitemap_index_is_followed(self):
+        s = self._spider()
+        body = (b'<?xml version="1.0"?><sitemapindex '
+                b'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                b'<sitemap><loc>https://example.com/post-sitemap.xml</loc></sitemap>'
+                b'</sitemapindex>')
+        out = list(s.parse_sitemap_probe(self._probe_resp(body=body)))
+        # The nested sitemap is followed. (parse_sitemap's generic <loc> scan also schedules
+        # it, which is pre-existing behavior and out of scope here.)
+        assert "https://example.com/post-sitemap.xml" in [
+            r.url for r in out if isinstance(r, Request)]
+
+    def test_a_robots_disallowed_probe_path_is_not_fetched(self):
+        """A probe is still a fetch. Guessing a URL is not a reason to stop obeying."""
+        s = self._spider(robots="User-agent: *\nDisallow: /sitemap_index.xml\n")
+        urls = [r.url for r in s._sitemap_probe_requests()]
+        assert "https://example.com/sitemap_index.xml" not in urls
+        assert "https://example.com/sitemap.xml" in urls
+        assert s.crawler.stats.values.get("seeding/sitemap_probes_disallowed") == 1
+
+    def test_a_failed_probe_is_counted_and_dropped(self):
+        s = self._spider()
+        s.sitemap_probe_failed(types.SimpleNamespace(value=OSError("refused")))
+        assert s.crawler.stats.values.get("seeding/sitemap_probes_missed") == 1
+
+    def test_probes_carry_an_errback(self):
+        """Without one a refused probe would be an unhandled failure in the crawl log."""
+        s = self._spider()
+        assert all(r.errback is not None for r in s._sitemap_probe_requests())

@@ -911,6 +911,7 @@ class WebsiteSpider(scrapy.Spider):
         # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
         # Guarded on TextResponse: a binary body has no `.text`. Each line is guarded on its
         # own so ONE malformed `Sitemap:` URL cannot cost the others, or the seed.
+        listed_a_sitemap = False
         if isinstance(response, TextResponse):
             try:
                 lines = response.text.splitlines()
@@ -922,6 +923,7 @@ class WebsiteSpider(scrapy.Spider):
                 try:
                     sm_url = line.split(":", 1)[1].strip()
                     if sm_url and self.is_internal(sm_url):
+                        listed_a_sitemap = True
                         outputs.append(scrapy.Request(
                             sm_url, callback=self.parse_sitemap, dont_filter=True,
                         ))
@@ -931,7 +933,76 @@ class WebsiteSpider(scrapy.Spider):
                         "Skipping an unparseable Sitemap: line in %s", response.url,
                         exc_info=True,
                     )
+        # Sitemap discovery was single-source (issue #77): a site whose robots.txt omits the
+        # `Sitemap:` line got NO sitemap seeding and silently degraded to link-following
+        # only -- the same class of silent degradation as #52, reached a different way.
+        # gastro.org serves a complete 12-file Yoast index at /sitemap_index.xml and names
+        # none of it in robots.txt.
+        if not listed_a_sitemap:
+            outputs.extend(self._sitemap_probe_requests())
         return outputs
+
+    # Conventional sitemap locations, probed only when robots.txt names none (issue #77).
+    # Ordered most-likely-first so the common case is found on the first hit; every one is
+    # tried regardless (a site can serve several), but a hit on any is enough to recover the
+    # coverage. `/sitemap_index.xml` leads because Yoast is the most common WP setup and is
+    # exactly what gastro.org serves -- 2,347 URLs we never looked for, because its
+    # robots.txt has no `Sitemap:` line.
+    SITEMAP_PROBE_PATHS = (
+        "/sitemap_index.xml",   # Yoast
+        "/sitemap.xml",         # the de facto standard
+        "/wp-sitemap.xml",      # WordPress core >= 5.5
+        "/sitemap-index.xml",
+    )
+
+    def _sitemap_probe_requests(self):
+        """Speculative fetches of the conventional sitemap locations.
+
+        Only reached when robots.txt listed no on-domain `Sitemap:`, so this costs a handful
+        of requests on the miss path and nothing at all on a site that points us at its own.
+        Robots-disallowed paths are skipped -- a probe is still a fetch, and guessing a URL
+        is not a reason to stop obeying the site."""
+        for path in self.SITEMAP_PROBE_PATHS:
+            url = urljoin(self.start_urls[0], path)
+            if self.is_robots_disallowed(url):
+                self._stat("seeding/sitemap_probes_disallowed")
+                continue
+            self._stat("seeding/sitemap_probes_sent")
+            yield scrapy.Request(
+                url, callback=self.parse_sitemap_probe, errback=self.sitemap_probe_failed,
+                dont_filter=True,
+            )
+
+    def parse_sitemap_probe(self, response):
+        """A GUESSED sitemap URL coming back. Unlike `parse_sitemap` this emits NOTHING
+        unless the guess was right.
+
+        That distinction is the whole point. `parse_sitemap` emits a row for every response
+        it sees, which is correct for a URL the site told us about -- but these are URLs we
+        invented, and most sites will 404 three of the four. Emitting those would put
+        phantom broken links in the crawl, and the report presents 404s as "broken links on
+        the site" with a referrer. We would be inventing defects in a client's site and then
+        reporting them back."""
+        if response.status != 200 or not isinstance(response, TextResponse):
+            self._stat("seeding/sitemap_probes_missed")
+            return
+        body = response.text.lstrip()[:512].lower()
+        if "<urlset" not in body and "<sitemapindex" not in body:
+            # A 200 that isn't a sitemap: a soft-404 HTML page, or a catch-all route. Common
+            # enough that treating it as a sitemap would be worse than missing one.
+            self._stat("seeding/sitemap_probes_not_a_sitemap")
+            return
+        self._stat("seeding/sitemap_probes_found")
+        self.logger.info(
+            "Found a sitemap at %s -- robots.txt listed none (issue #77)", response.url
+        )
+        yield from self.parse_sitemap(response)
+
+    def sitemap_probe_failed(self, failure):
+        """A probe that never landed (DNS/refused/timeout). Speculative, so it is counted
+        and dropped -- it must never touch the crawl's outcome."""
+        self._stat("seeding/sitemap_probes_missed")
+        self.logger.debug("sitemap probe failed: %s", failure)
 
     def parse_sitemap(self, response):
         # Record sitemap fetch. `sitemaps_fetched` vs `seeding/robots_fetched` distinguishes

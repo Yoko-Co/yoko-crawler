@@ -242,7 +242,8 @@ class TestSeedingTripwire:
         )
         assert data["seeding"] == {"seeds_emitted": 2, "robots_fetched": 1,
                                    "sitemaps_fetched": 3, "start_urls_emitted": 1,
-                                   "robots_failed": 0}
+                                   "robots_failed": 0, "sitemap_probes_sent": 0,
+                                   "sitemap_probes_found": 0}
 
     def test_status_file_reports_robots_failed(self, tmp_path):
         """A crawl that ran allow-all because robots.txt was UNREACHABLE must be
@@ -413,3 +414,17 @@ class TestRestrictionsBlock:
         assert data["restrictions"]["skipped"]["robots_disallowed"] == 0
         assert data["restrictions"]["skipped"]["robots_disallowed_assets"] == 600
         assert data["restrictions"]["robots_root_disallowed"] is False
+
+    def test_sitemap_probe_discovery_is_reported(self, tmp_path):
+        """Issue #77: `found` > 0 means the site has a sitemap its robots.txt never named --
+        coverage the crawl would previously have lost in silence."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 2400, "seeding/seeds_emitted": 2,
+             "seeding/start_urls_emitted": 1, "seeding/robots_fetched": 1,
+             "seeding/sitemaps_fetched": 12,
+             "seeding/sitemap_probes_sent": 4, "seeding/sitemap_probes_found": 1},
+            reason="finished",
+        )
+        assert data["seeding"]["sitemap_probes_sent"] == 4
+        assert data["seeding"]["sitemap_probes_found"] == 1
