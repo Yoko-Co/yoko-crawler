@@ -523,6 +523,38 @@ class TestSpiderNeverStarted:
         )
         assert job.status == "completed"
 
+    async def test_a_crawl_that_wrote_ROWS_is_never_called_never_started(self):
+        """THE false positive, reproduced by review end-to-end: `ProgressWriter._write_status`
+        swallows OSError by design, so a read-only or full status path lets a crawl fetch
+        thousands of pages, write every feed row, exit 0 -- and leave the status at the stub.
+        Calling that "never started" fails a client's crawl that WORKED and hides a real
+        inventory behind a 409. Worse per occurrence than the empty success it replaces.
+
+        The feed is the corroborating evidence: a spider that never constructed cannot have
+        emitted a row."""
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process(returncode=0)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("example.com", resumable=False)
+        job.status_file.write_text(json.dumps({"status": "queued", "urls_crawled": 0}))
+        job.result_file.write_text('{"url": "https://example.com/", "status": 200}\n')
+        await jm._monitor(job.job_id)
+        assert job.status == "completed", (
+            "rows on disk prove the spider opened, whatever the status file says"
+        )
+
+    async def test_an_empty_output_file_is_not_evidence_of_a_crawl(self):
+        """The boundary: the feed being CREATED is not the signal -- Scrapy opens it early.
+        Only content proves a row was emitted."""
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process(returncode=0)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("example.com", resumable=False)
+        job.status_file.write_text(json.dumps({"status": "queued"}))
+        job.result_file.write_text("")
+        await jm._monitor(job.job_id)
+        assert job.status == "failed"
+
     async def test_a_nonzero_exit_keeps_its_own_message(self):
         jm = JobManager(max_concurrent=3)
         job = await self._monitor_with(jm, returncode=3, status_payload=None)

@@ -261,10 +261,9 @@ class TestSpiderStartupFailure:
     running the real `run_spider.py`: before the fix, exit 0 and no status file written; after,
     exit 1 and a `failed` status carrying `failure_reason: spider_init_error`."""
 
-    def _run_main(self, tmp_path, spider_exc):
+    def _run_main(self, tmp_path, spider_exc, status_file=None):
         """Drive the real `main()` with a CrawlerProcess whose spider blows up on construct."""
-        import runpy
-        status_file = tmp_path / "status.json"
+        status_file = status_file or (tmp_path / "status.json")
         argv = ["run_spider.py", "--domain", "example.com",
                 "--status-file", str(status_file), "--output", str(tmp_path / "o.jsonl")]
 
@@ -313,8 +312,122 @@ class TestSpiderStartupFailure:
         assert "construction exploded" in data["error"], \
             "the operator needs the actual cause, not just that something failed"
 
+    def test_it_refuses_to_clobber_a_status_the_spider_already_wrote(self, tmp_path):
+        """Defence in depth, and deliberately unreachable today: measured on Scrapy 2.18 this
+        Deferred errbacks only at or before `spider_opened`, so a post-open failure never gets
+        here (a `start()` raise and a callback raise were both confirmed NOT to fire it). But
+        that is a property of Scrapy internals, not a contract -- two reviewers independently
+        worried about the coupling. If a future version routed a post-open failure here, the
+        unguarded code would overwrite a real `completed` status with `urls_crawled: 0` and
+        mislabel it `spider_init_error`. One stat removes the whole class."""
+        import json
+        status_file = tmp_path / "status.json"
+        status_file.write_text(json.dumps({"status": "completed", "urls_crawled": 6}))
+        code, _ = self._run_main(
+            tmp_path, ValueError("late failure"), status_file=status_file)
+        assert code == 1, "it must still fail loudly"
+        data = json.loads(status_file.read_text())
+        assert data["status"] == "completed" and data["urls_crawled"] == 6, (
+            "the spider's own report of what it actually did outranks a late handler's guess"
+        )
+        assert "failure_reason" not in data
+
     def test_a_healthy_start_neither_exits_nor_writes_a_failure(self, tmp_path):
         """The guard must not fire on the ordinary path."""
         code, status_file = self._run_main(tmp_path, None)
         assert code == 0
         assert not status_file.exists(), "no failure status should be written on a clean run"
+
+
+class TestStartupFailureIntegration:
+    """The mocked tests above stub `CrawlerProcess`, so they pin our own handling but say
+    nothing about WHERE Scrapy actually routes a construction failure -- the exact thing the
+    fix depends on, and the exact thing a Scrapy upgrade could move (#98 review). These run
+    the real `run_spider.py` in a subprocess against a real spider that raises."""
+
+    def _run(self, tmp_path, *, in_init="", in_class=""):
+        """Copy the tree, inject into WebsiteSpider, run the real run_spider.py."""
+        import shutil
+        tree = tmp_path / "tree"
+        shutil.copytree(_REPO_ROOT, tree, ignore=shutil.ignore_patterns(
+            ".git", "__pycache__", ".venv", "*.pyc", "tests"))
+        spider = tree / "website_spider.py"
+        src = spider.read_text()
+        if in_init:
+            anchor = "        self.robots_download_timeout = self._resolve_robots_timeout()"
+            assert src.count(anchor) == 1, "init anchor moved -- re-point this test"
+            src = src.replace(anchor, anchor + "\n" + in_init, 1)
+        if in_class:
+            anchor = "class WebsiteSpider(scrapy.Spider):\n"
+            assert src.count(anchor) == 1, "class anchor moved -- re-point this test"
+            src = src.replace(anchor, anchor + in_class + "\n", 1)
+        spider.write_text(src)
+
+        status_file = tmp_path / "status.json"
+        proc = subprocess.run(
+            [sys.executable, "run_spider.py", "--domain", "example.com",
+             "--status-file", str(status_file), "--output", str(tmp_path / "o.jsonl")],
+            cwd=tree, capture_output=True, text=True, timeout=180,
+        )
+        return proc, status_file
+
+    def test_a_real_construction_failure_exits_1_and_classifies(self, tmp_path):
+        """Guard 1 against the REAL Scrapy call path, not a stubbed CrawlerProcess."""
+        import json
+        proc, status_file = self._run(
+            tmp_path, in_init='        raise ValueError("injected construction failure")')
+        assert proc.returncode == 1, (
+            f"exit 0 is the #98 bug -- job_manager reads it as a completed crawl. "
+            f"stderr: {proc.stderr[-600:]}"
+        )
+        assert status_file.exists(), "no status file means job_manager falls back to its stub"
+        data = json.loads(status_file.read_text())
+        assert data["status"] == "failed"
+        assert data["failure_reason"] == "spider_init_error"
+        assert "injected construction failure" in data["error"]
+
+    def test_a_synchronous_raise_before_the_deferred_is_also_classified(self, tmp_path):
+        """`update_settings` is called from `Crawler.__init__`, so it raises straight out of
+        `process.crawl()` -- BEFORE any Deferred exists to attach an errback to. This exited 1
+        with NO classified status, reproducing #98's shape through a different door (#98
+        review). The whole point of the fix is that a failure to start cannot look like
+        anything else, so a second door had to be closed too."""
+        import json
+        proc, status_file = self._run(tmp_path, in_class=(
+            "    @classmethod\n"
+            "    def update_settings(cls, settings):\n"
+            '        raise RuntimeError("injected settings failure")\n'
+        ))
+        assert proc.returncode == 1, f"stderr: {proc.stderr[-600:]}"
+        assert status_file.exists(), (
+            "a synchronous raise wrote no status at all, so job_manager saw only its own "
+            "queued stub -- exactly the state #98 is about"
+        )
+        data = json.loads(status_file.read_text())
+        assert data["status"] == "failed"
+        assert data["failure_reason"] == "spider_init_error"
+        assert "injected settings failure" in data["error"]
+
+
+class TestStatusAlreadyAdvanced:
+    """Pins `_status_already_advanced`, the one-stat check that stops a late failure handler
+    overwriting the spider's own account of what it did (#98 review)."""
+
+    def _check(self, tmp_path, content):
+        from run_spider import _status_already_advanced
+        f = tmp_path / "s.json"
+        if content is not None:
+            f.write_text(content)
+        return _status_already_advanced(f)
+
+    def test_the_pre_spawn_stub_is_not_advanced(self, tmp_path):
+        assert self._check(tmp_path, '{"status": "queued"}') is False
+
+    def test_a_missing_or_corrupt_file_is_not_advanced(self, tmp_path):
+        assert self._check(tmp_path, None) is False
+        assert self._check(tmp_path, "not json{{") is False
+        assert self._check(tmp_path, '["a", "list"]') is False
+
+    def test_any_status_the_spider_wrote_counts_as_advanced(self, tmp_path):
+        for status in ("running", "completed", "failed"):
+            assert self._check(tmp_path, '{"status": "%s"}' % status) is True, status
