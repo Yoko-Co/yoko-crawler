@@ -104,6 +104,7 @@ Returns job status, including `impersonate`, `delay`, `profile`, and `emit_conte
 - `unreachable` — the crawl fetched **nothing** and every request errored at the transport layer (DNS / connection / TLS); almost always a wrong or mistyped address. Reported as `failed` (previously a misleading `completed` with 0 pages).
 - `ssrf_blocked` — every candidate host resolved to a private/reserved range and was dropped by the SSRF guard (nothing fetched); `failed` with an explanatory `error`.
 - `crawl_error` — an abnormal Scrapy close (e.g. `memusage_exceeded`).
+- `seeding_incomplete` — robots.txt was fetched but the start URL was never emitted (issue #102), so no page of the site was reached. Any row in the crawl is robots.txt itself. Distinct from `unreachable`: the host answered, seeding just stopped half way. Does **not** fire for a robots-restricted site — a `Disallow: /` site still emits its start URL and stays `completed`.
 - `spider_init_error` — the spider never CONSTRUCTED, so the crawl never opened (issue #98). The only token not written by the progress extension, which attaches on `spider_opened` and so never runs in this case; `run_spider` writes it instead. Previously this exited 0 with no status of its own and was reported as a `completed` crawl with zero pages.
 
 Only a **wholly empty** crawl is reclassified: any crawl that fetched even one page is left `completed` with `failure_reason: null`.

@@ -536,3 +536,84 @@ def test_job_manager_restrictions_default_matches_the_status_file_shape(tmp_path
         )
     for key in data["restrictions"]["robots_readability"]:
         assert f'"{key}"' in src, f"readability sub-key {key!r} missing from the fallback"
+
+
+class TestSeedingIncomplete:
+    """Issue #102: seeding is two-phase, and a crawl that completed phase one and never
+    reached phase two reported `completed` with a one-row "inventory" that is robots.txt
+    itself. The empty-crawl guards structurally cannot see it -- they require
+    `response_received_count == 0`, and robots.txt responding makes that 1."""
+
+    def _closed(self, tmp_path, stats, reason="finished"):
+        return _write_and_read(tmp_path, stats, reason=reason)
+
+    def test_robots_fetched_but_no_start_url_is_failed(self, tmp_path):
+        data = self._closed(tmp_path, {
+            "response_received_count": 1,
+            "seeding/seeds_emitted": 1,
+            "seeding/start_urls_emitted": 0,
+            "robots_readability_outcome": "parsed",
+        })
+        assert data["status"] == "failed", (
+            "reporting this completed hands the corpus a one-row crawl that looks like a "
+            "real one-page site"
+        )
+        assert data["failure_reason"] == "seeding_incomplete"
+        assert "not an inventory" in (data["error"] or "")
+
+    def test_a_robots_restricted_site_is_still_completed(self, tmp_path):
+        """THE false positive to avoid. `_start_url_requests` is deliberately not routed
+        through `_schedule`, so a `Disallow: /` site DOES emit and count its start URL --
+        gastro.org's legitimate one-page crawl must stay completed."""
+        data = self._closed(tmp_path, {
+            "response_received_count": 2,
+            "seeding/seeds_emitted": 1,
+            "seeding/start_urls_emitted": 1,
+            "robots_disallowed_skipped": 2345,
+            "robots_root_disallowed": True,
+            "robots_readability_outcome": "parsed",
+        })
+        assert data["status"] == "completed"
+        assert data["failure_reason"] is None
+
+    def test_a_more_specific_empty_crawl_cause_still_wins(self, tmp_path):
+        """An unreachable crawl reaches the same condition -- its robots seed was emitted and
+        never came back -- but `unreachable` names the cause where this names the symptom."""
+        data = self._closed(tmp_path, {
+            "response_received_count": 0,
+            "seeding/seeds_emitted": 1,
+            "seeding/start_urls_emitted": 0,
+            "downloader/exception_count": 3,
+        })
+        assert data["failure_reason"] == "unreachable"
+
+    def test_ssrf_blocked_still_wins_too(self, tmp_path):
+        data = self._closed(tmp_path, {
+            "response_received_count": 0,
+            "seeding/seeds_emitted": 1,
+            "seeding/start_urls_emitted": 0,
+            "ssrf_guard/blocked": 1,
+            "downloader/exception_count": 1,
+        })
+        assert data["failure_reason"] == "ssrf_blocked"
+
+    def test_an_already_failed_crawl_keeps_its_own_reason(self, tmp_path):
+        """A hard close (`shutdown`, `memusage_exceeded`) is already failed; this must not
+        relabel it, since the abnormal close is the more useful fact."""
+        data = self._closed(tmp_path, {
+            "response_received_count": 1,
+            "seeding/seeds_emitted": 1,
+            "seeding/start_urls_emitted": 0,
+        }, reason="memusage_exceeded")
+        assert data["status"] == "failed"
+        assert data["failure_reason"] == "crawl_error"
+
+    def test_a_normal_crawl_is_untouched(self, tmp_path):
+        data = self._closed(tmp_path, {
+            "response_received_count": 40,
+            "seeding/seeds_emitted": 1,
+            "seeding/start_urls_emitted": 1,
+            "robots_readability_outcome": "parsed",
+        })
+        assert data["status"] == "completed"
+        assert data["failure_reason"] is None

@@ -139,6 +139,33 @@ class ProgressWriter:
                 "Usually an unterminated robots.txt redirect chain or an error in "
                 "parse_robots; re-run and check the robots.txt of the target."
             )
+            # ...and FAIL it, not just log it (issue #102).
+            #
+            # The empty-crawl guards above cannot reach this shape: they require
+            # `response_received_count == 0`, and here robots.txt itself responded, so the
+            # count is 1 and the crawl sails through as `completed` with a one-row
+            # "inventory" that is robots.txt rather than the site. Logging alone put the
+            # only evidence in the Scrapy log of a hand-managed droplet, where nothing reads
+            # it -- the same silent-orphaning failure this tripwire was written to catch, one
+            # level up. A consumer keys on `status`/`failure_reason`; give it something to
+            # key on.
+            #
+            # Gated on `status == "completed"` so the more specific classifications above
+            # win: an all-SSRF-blocked or unreachable crawl reaches this same condition (its
+            # robots seed was emitted and never came back), and `ssrf_blocked`/`unreachable`
+            # name the actual cause where this would only name the symptom.
+            #
+            # Does NOT fire for a robots-restricted site, which is the false positive worth
+            # naming explicitly: `_start_url_requests` is deliberately not routed through
+            # `_schedule`, so a `Disallow: /` site still emits its start URL and counts it.
+            # gastro.org's legitimate one-page crawl stays `completed`.
+            if status == "completed":
+                status, failure_reason = "failed", "seeding_incomplete"
+                error = (
+                    "seeding stopped after robots.txt: the start URL was never emitted, so "
+                    "no page of the site was fetched. Any row in this crawl is robots.txt "
+                    "itself -- it is not an inventory"
+                )
 
         self._write_status(
             status, error=error, final=True, close_reason=reason, failure_reason=failure_reason
