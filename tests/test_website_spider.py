@@ -2764,3 +2764,533 @@ class TestRemoteRedirectsCannotSmuggleAScheme:
         s = self._spider()
         assert s.is_navigational_href("s3://example.com/x") is False
         assert s.is_internal("s3://example.com/x") is False
+
+
+class TestRobotsFetchBudget:
+    """Issue #82: since #76 robots.txt is the crawl's ONLY seed, so nothing else is in
+    flight while it retries. A black-holed host now stalls the whole crawl.
+
+    Every bound here is asserted against the REAL middleware/parser that consumes it, not
+    against the meta dict we wrote -- the two download paths read different keys, and
+    scrapy-impersonate reads neither `download_timeout` nor DOWNLOAD_TIMEOUT. A test that
+    only checked our own meta would pass while the impersonate path stayed unbounded."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _seed(self, spider):
+        return next(iter(spider._seed_requests()))
+
+    def test_the_stall_being_fixed_is_real_arithmetic(self):
+        """Pin the numbers the fix is sized against, from Scrapy's own defaults."""
+        from scrapy.settings import default_settings as d
+        from scrapy.exceptions import DownloadTimeoutError
+        # A timeout IS retried, so the stall is (RETRY_TIMES + 1) whole timeouts.
+        assert "scrapy.exceptions.DownloadTimeoutError" in d.RETRY_EXCEPTIONS
+        assert DownloadTimeoutError  # imported: the name in RETRY_EXCEPTIONS resolves
+        assert (d.RETRY_TIMES + 1) * d.DOWNLOAD_TIMEOUT == 540
+        # ... against a 7200s session budget. The bound has to be a real fraction of that.
+        assert (d.RETRY_TIMES + 1) * WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT == 180
+
+    def test_default_path_honours_our_bound_over_the_setting(self):
+        """DownloadTimeoutMiddleware uses `setdefault`, so ours must survive it. If that
+        ever became a plain assignment the crawl would silently go back to 180s."""
+        from scrapy.downloadermiddlewares.downloadtimeout import DownloadTimeoutMiddleware
+        req = self._seed(self._spider())
+        DownloadTimeoutMiddleware(180).process_request(req)
+        assert req.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+
+    def test_impersonate_path_is_bounded_too(self):
+        """scrapy-impersonate hands curl_cffi whatever RequestParser produces and adds no
+        timeout of its own, so an unbounded robots fetch there inherits curl_cffi's 30s
+        session default -- a bound we never chose and cannot see."""
+        from scrapy_impersonate.parser import RequestParser
+        req = self._seed(self._spider())
+        args = RequestParser(req).as_dict()
+        assert args["timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+
+    def test_impersonate_ignores_the_key_the_default_path_uses(self):
+        """The reason `impersonate_args` is needed at all. Guards the day scrapy-impersonate
+        starts honouring `download_timeout`: this test failing means the second key is now
+        redundant, not that something broke."""
+        from scrapy_impersonate.parser import RequestParser
+        req = Request("https://example.com/", meta={"download_timeout": 5})
+        assert "timeout" not in RequestParser(req).as_dict()
+
+    def test_every_robots_hop_carries_the_bound(self):
+        """MAX_ROBOTS_REDIRECTS means up to four fetches, each of them the crawl's only
+        request. Bounding only the first leaves three unbounded stalls behind it."""
+        from scrapy_impersonate.parser import RequestParser
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/robots.txt", body=b"", status=301,
+            headers={"Location": b"https://example.com/robots.txt?x=1"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        hop = s._robots_redirect_request(resp)
+        assert hop.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert RequestParser(hop).as_dict()["timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        # ... without losing the hop counter that bounds the chain in the first place.
+        assert hop.meta["robots_hops"] == 1
+
+    def test_pages_keep_the_full_timeout(self):
+        """The bound is sized for 1KB of text and must not leak onto real pages, which are
+        the thing DOWNLOAD_TIMEOUT is actually sized for."""
+        from scrapy.downloadermiddlewares.downloadtimeout import DownloadTimeoutMiddleware
+        s = self._spider()
+        list(s.parse_robots(TextResponse(
+            url="https://example.com/robots.txt", body=b"User-agent: *\nAllow: /\n",
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"),
+        )))
+        page = next(iter(s._schedule("https://example.com/a-page/")))
+        DownloadTimeoutMiddleware(180).process_request(page)
+        assert page.meta["download_timeout"] == 180
+
+    def test_a_slow_but_real_robots_txt_is_not_treated_as_absent(self):
+        """The asymmetry that sets the number. Timing out routes to `robots_failed`, which
+        proceeds ALLOW-ALL -- so too short a bound silently converts "slow site" into "no
+        robots.txt" and crawls a site that said Disallow, which is #76's harm by another
+        door. 60s for 1KB is unreachable by any host that could serve a crawl at all."""
+        assert WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT >= 60, (
+            "below 60s a slow-but-real robots.txt times out into robots_failed, which "
+            "proceeds ALLOW-ALL -- _robots_budget_meta explicitly calls 30s inside the "
+            "range a real site can take"
+        )
+        s = self._spider("gastro.org")
+        failure = types.SimpleNamespace(value=OSError("timed out"))
+        list(s.robots_failed(failure))
+        assert not s.is_robots_disallowed("https://gastro.org/anything/")
+
+
+class TestStartUrlDepth:
+    """Issue #81: since #76 the start URL is yielded from `parse_robots`, so DepthMiddleware
+    reads it as a child of the robots.txt response and stamps depth=1.
+
+    Asserted by running the REAL DepthMiddleware over real spider output. Reading
+    `request.meta["depth"]` off our own request proves nothing -- the middleware is what
+    assigns it, and it assigns unconditionally."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _mw(self):
+        from scrapy.spidermiddlewares.depth import DepthMiddleware
+        return DepthMiddleware(0, self._stats(), False, 1)
+
+    @staticmethod
+    def _stats():
+        """DepthMiddleware calls `max_value`, which _FakeStats does not carry."""
+        class _S(_FakeStats):
+            def max_value(self, key, value):
+                self.values[key] = max(self.values.get(key, value), value)
+        return _S()
+
+    def _robots_response(self, body=b"User-agent: *\nAllow: /\n"):
+        resp = TextResponse(
+            url="https://example.com/robots.txt", body=body,
+            headers={"Content-Type": "text/plain"},
+            request=Request("https://example.com/robots.txt"),
+        )
+        resp.meta["depth"] = 0  # what DepthMiddleware assigns to the seed
+        return resp
+
+    def _depths(self, body=b"User-agent: *\nAllow: /\n"):
+        s = self._spider()
+        resp = self._robots_response(body)
+        mw = self._mw()
+        out = {}
+        for req in s.parse_robots(resp):
+            if isinstance(req, Request):
+                processed = mw.get_processed_request(req, resp)
+                out[processed.url] = (processed.meta["depth"], processed.priority)
+        return out
+
+    def test_start_url_is_back_at_depth_zero(self):
+        assert self._depths()["https://example.com/"][0] == 0
+
+    def test_meta_depth_zero_would_not_have_worked(self):
+        """The shape #81 suggested. DepthMiddleware ASSIGNS meta["depth"], so a pre-set
+        value is overwritten -- the fix would have read as applied and changed nothing.
+        This is the test that says why `depth_reset` is the key."""
+        resp = self._robots_response()
+        naive = Request("https://example.com/", meta={"depth": 0})
+        assert self._mw().get_processed_request(naive, resp).meta["depth"] == 1
+
+    def test_a_future_depth_limit_now_means_what_it_says(self):
+        """The whole point: DEPTH_LIMIT=1 must reach the homepage's links, not stop at the
+        homepage. Before the fix the homepage itself consumed the only level."""
+        from scrapy.spidermiddlewares.depth import DepthMiddleware
+        s = self._spider()
+        robots = self._robots_response()
+        mw = DepthMiddleware(1, self._stats(), False, 1)
+        home = next(r for r in s.parse_robots(robots)
+                    if isinstance(r, Request) and r.url == "https://example.com/")
+        home = mw.get_processed_request(home, robots)
+        assert home is not None and home.meta["depth"] == 0
+        home_resp = TextResponse(url="https://example.com/", body=b"<html></html>",
+                                 request=home, status=200)
+        home_resp.meta.update(home.meta)
+        link = mw.get_processed_request(Request("https://example.com/about/"), home_resp)
+        assert link is not None, "DEPTH_LIMIT=1 must still reach the homepage's own links"
+        assert link.meta["depth"] == 1
+
+    def test_redirected_robots_does_not_push_the_start_url_deeper(self):
+        """The two-off case: each redirect hop was another level of drift."""
+        s = self._spider()
+        mw = self._mw()
+        first = self._robots_response()
+        hop = next(r for r in s.parse_robots(TextResponse(
+            url="https://example.com/robots.txt", body=b"", status=301,
+            headers={"Location": b"https://example.com/robots.txt?x=1"},
+            request=Request("https://example.com/robots.txt"),
+        )) if isinstance(r, Request))
+        hop = mw.get_processed_request(hop, first)
+        # The hop is depth 0, not 1: it carries `depth_reset` too (#82/#81 review). Without
+        # that, a DEPTH_LIMIT of 1 makes DepthMiddleware return None for the SECOND hop --
+        # dropping the request seeding was deferred to, for a zero-page crawl that closes
+        # `finished`. Reproduced on a real engine before this was added.
+        assert hop.meta["depth"] == 0
+        hop_resp = self._robots_response()
+        hop_resp.meta["depth"] = hop.meta["depth"]
+        start = next(r for r in s.parse_robots(hop_resp)
+                     if isinstance(r, Request) and r.url == "https://example.com/")
+        assert mw.get_processed_request(start, hop_resp).meta["depth"] == 0
+
+    def test_homepage_links_outrank_sitemap_urls_again(self):
+        """DEPTH_PRIORITY=1 makes depth the BFO tiebreak. With the start URL at depth 1 its
+        links landed at depth 2, TYING with sitemap-listed URLs instead of outranking them;
+        #54 is about ordering, so this is not cosmetic."""
+        depths = self._depths(
+            b"User-agent: *\nAllow: /\nSitemap: https://example.com/sitemap.xml\n")
+        home_depth, home_prio = depths["https://example.com/"]
+        sm_depth, sm_prio = depths["https://example.com/sitemap.xml"]
+        assert (home_depth, sm_depth) == (0, 1)
+        # A homepage link is depth 1; a sitemap-listed URL is depth 2. Lower depth wins.
+        assert home_depth + 1 < sm_depth + 1
+        assert home_prio > sm_prio
+
+    def test_the_transport_failure_path_lands_at_depth_zero_by_a_DIFFERENT_mechanism(self):
+        """The errback path gets the right depth, but NOT from `depth_reset`.
+
+        The first version of this test asserted `start.meta["depth_reset"] is True` -- our
+        own dict, which this class's own docstring says proves nothing, and on the one path
+        where the key is consumed by nobody. Scrapy runs NO spider middleware on errback
+        output (`Scraper._scrape` wraps only the Response branch in `spidermw`), so
+        DepthMiddleware never sees these requests. Depth 0 comes from `_init_depth`'s base
+        case instead: no `depth` in the response meta means the response IS depth 0.
+
+        So both seeding paths reach depth 0 by two different mechanisms, and this asserts the
+        outcome on the path the middleware never touches."""
+        from scrapy.spidermiddlewares.depth import DepthMiddleware
+        s = self._spider()
+        out = list(s.robots_failed(types.SimpleNamespace(value=OSError("dns"))))
+        start = next(r for r in out if r.url == "https://example.com/")
+        # The engine hands the errback's requests straight to the scheduler; nothing
+        # consumes depth_reset, so the response arrives with no `depth` at all.
+        assert "depth" not in start.meta
+        home = TextResponse(url="https://example.com/", body=b"<html></html>",
+                            request=start, status=200)
+        home.meta.update(start.meta)
+        mw = DepthMiddleware(0, self._stats(), False, 1)
+        list(mw.process_spider_output(home, iter([])))
+        assert home.meta["depth"] == 0, "_init_depth's base case is what saves this path"
+        link = mw.get_processed_request(Request("https://example.com/about/"), home)
+        assert link.meta["depth"] == 1
+
+    def test_sitemap_probes_get_the_same_depth_on_both_seeding_paths(self):
+        """Same site, same probes, different depth depending on whether robots.txt answered
+        -- because one path runs DepthMiddleware and the other does not. Pinned explicitly
+        so a future DEPTH_LIMIT cannot bound sitemap discovery differently by transport luck."""
+        s = self._spider()
+        failed = [r for r in s.robots_failed(types.SimpleNamespace(value=OSError("dns")))
+                  if r.url.endswith(".xml")]
+        assert failed and all(r.meta["depth"] == 1 for r in failed)
+
+        s2 = self._spider()
+        resp = self._robots_response(b"User-agent: *\nAllow: /\n")
+        mw = self._mw()
+        probed = [r for r in s2.parse_robots(resp)
+                  if isinstance(r, Request) and r.url.endswith(".xml")]
+        assert probed
+        for r in probed:
+            assert mw.get_processed_request(r, resp).meta["depth"] == 1
+
+    def test_the_installed_scrapy_actually_supports_depth_reset(self):
+        """`depth_reset` landed in Scrapy 2.18 and is an unrecognised key before that --
+        ignored in SILENCE, which is exactly the failure #81 is about. requirements.txt
+        floors Scrapy at 2.18; this asserts the floor is doing its job here."""
+        from website_spider import _DEPTH_RESET_SUPPORTED, _depth_reset_supported
+        assert _DEPTH_RESET_SUPPORTED is True
+        assert _depth_reset_supported() is True
+
+    def test_the_detector_reports_unsupported_rather_than_raising(self, monkeypatch):
+        """It runs at import time, so a Scrapy that moved DepthMiddleware must degrade to a
+        warning, never take the module down.
+
+        monkeypatch, not a manual save/restore: this mutates a process-global that every
+        other test in the session shares, and a failure between the assignment and the
+        `finally` would leave the module broken for them (and it is outright unsafe under
+        pytest-xdist)."""
+        import website_spider as ws
+        import scrapy.spidermiddlewares.depth as depth_mod
+        monkeypatch.setattr(depth_mod, "DepthMiddleware", None)
+        assert ws._depth_reset_supported() is False
+
+    def test_the_detector_rejects_a_scrapy_that_ACCEPTS_the_key_but_ignores_it(self,
+                                                                               monkeypatch):
+        """The branch that matters, and the one the first cut left untested.
+
+        Mutation-testing the probe showed that neutering the correctness half of
+        `return out is not None and out.meta.get("depth") == 0` -- leaving `out is not None`
+        -- kept all 15 tests green. The suite could tell "raised" from "real Scrapy 2.18",
+        but not "ran fine and got the depth WRONG", which is precisely the silent no-op #81
+        is about: a guard against silent failure that could itself fail silently."""
+        import website_spider as ws
+        import scrapy.spidermiddlewares.depth as depth_mod
+
+        class _IgnoresDepthReset:
+            """A pre-2.18 DepthMiddleware: the key is unknown, so depth is still parent+1."""
+            def __init__(self, *a, **k): pass
+
+            def get_processed_request(self, request, response):
+                request.meta["depth"] = response.meta["depth"] + 1
+                return request
+
+        monkeypatch.setattr(depth_mod, "DepthMiddleware", _IgnoresDepthReset)
+        assert ws._depth_reset_supported() is False
+
+    def test_the_unsupported_case_is_counted_not_just_logged(self):
+        """The house convention for this failure class
+        (docs/solutions/conventions/silent-orphaning-framework-extension-points.md) is a
+        stat surfaced in the status file, not a log line on a hand-managed droplet."""
+        import website_spider as ws
+        s = self._spider()
+        list(s._start_url_requests())
+        assert s.crawler.stats.values.get("seeding/depth_reset_unsupported") == 0
+
+        s2 = self._spider()
+        ws_flag = ws._DEPTH_RESET_SUPPORTED
+        try:
+            ws._DEPTH_RESET_SUPPORTED = False
+            out = list(s2._start_url_requests())
+        finally:
+            ws._DEPTH_RESET_SUPPORTED = ws_flag
+        assert s2.crawler.stats.values.get("seeding/depth_reset_unsupported") == 1
+        # ... and seeding still happens. A loud warning that also stops the crawl would be
+        # a worse bug than the off-by-one it reports.
+        assert [r.url for r in out] == ["https://example.com/"]
+
+
+class TestSeedingSurvivesADepthBound:
+    """#82/#81 review: the combination that turns the #81 fix into a zero-page crawl.
+
+    `test_a_future_depth_limit_now_means_what_it_says` certifies DEPTH_LIMIT against the
+    homepage, which has no redirect hop -- so it certified a property the robots.txt path
+    did not have. Seeding is deferred to a callback now, so ANY seeding request dropped by a
+    depth bound is a crawl with nothing to do."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    @staticmethod
+    def _stats():
+        class _S(_FakeStats):
+            def max_value(self, key, value):
+                self.values[key] = max(self.values.get(key, value), value)
+        return _S()
+
+    def _mw(self, maxdepth):
+        from scrapy.spidermiddlewares.depth import DepthMiddleware
+        return DepthMiddleware(maxdepth, self._stats(), False, 1)
+
+    def _redirect(self, url, location):
+        return TextResponse(url=url, body=b"", status=301,
+                            headers={"Location": location.encode()},
+                            request=Request(url))
+
+    def test_a_two_hop_robots_redirect_still_seeds_under_a_depth_limit(self):
+        """The reproduced failure: at DEPTH_LIMIT=1 the second hop was dropped by
+        DepthMiddleware, so `parse_robots` never ran again and the start URL was never
+        emitted -- 2 rows, both robots.txt, closing `finished`."""
+        s = self._spider()
+        mw = self._mw(1)
+        parent = self._redirect("https://example.com/robots.txt",
+                                "https://example.com/robots2.txt")
+        parent.meta["depth"] = 0
+
+        hop1 = next(r for r in s.parse_robots(parent) if isinstance(r, Request))
+        hop1 = mw.get_processed_request(hop1, parent)
+        assert hop1 is not None, "hop 1 dropped by DEPTH_LIMIT"
+        r1 = self._redirect(hop1.url, "https://example.com/robots3.txt")
+        r1.meta.update(hop1.meta)
+
+        hop2 = next(r for r in s.parse_robots(r1) if isinstance(r, Request))
+        hop2 = mw.get_processed_request(hop2, r1)
+        assert hop2 is not None, "hop 2 dropped by DEPTH_LIMIT -- seeding never resumes"
+
+        final = TextResponse(url=hop2.url, body=b"User-agent: *\nAllow: /\n",
+                             headers={"Content-Type": "text/plain"},
+                             request=Request(hop2.url))
+        final.meta.update(hop2.meta)
+        seeded = [r for r in s.parse_robots(final) if isinstance(r, Request)]
+        start = [r for r in seeded if r.url == "https://example.com/"]
+        assert start, "the start URL was never emitted -- zero-page crawl"
+        assert mw.get_processed_request(start[0], final) is not None
+        assert s.crawler.stats.values.get("seeding/start_urls_emitted") == 1
+
+    def test_sitemap_probes_survive_a_depth_limit_of_one(self):
+        """Probes sit at depth 1, so DEPTH_LIMIT=1 must still admit them -- otherwise a
+        depth bound silently disables sitemap discovery rather than bounding the crawl."""
+        s = self._spider()
+        mw = self._mw(1)
+        resp = TextResponse(url="https://example.com/robots.txt",
+                            body=b"User-agent: *\nAllow: /\n",
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"))
+        resp.meta["depth"] = 0
+        probes = [r for r in s.parse_robots(resp)
+                  if isinstance(r, Request) and r.url.endswith(".xml")]
+        assert probes
+        assert all(mw.get_processed_request(r, resp) is not None for r in probes)
+
+
+class TestRobotsBudgetCoverage:
+    """#82 review: the budget has to reach every request on the seeding path, survive the
+    machinery between us and the downloader, and stay off everything else."""
+
+    def _spider(self, domain="example.com"):
+        s = WebsiteSpider(domain=domain)
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def _robots(self, body=b"User-agent: *\nAllow: /\n"):
+        return TextResponse(url="https://example.com/robots.txt", body=body,
+                            headers={"Content-Type": "text/plain"},
+                            request=Request("https://example.com/robots.txt"))
+
+    def test_sitemap_probes_carry_the_budget(self):
+        """Same seeding path, same stall class. Under `--profile presale`
+        (CONCURRENT_REQUESTS 1) four unbounded probes are 4 x 540s = 2160s."""
+        from scrapy_impersonate.parser import RequestParser
+        s = self._spider()
+        probes = [r for r in s.parse_robots(self._robots())
+                  if isinstance(r, Request) and r.url.endswith(".xml")]
+        assert probes
+        for r in probes:
+            assert r.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+            assert RequestParser(r).as_dict()["timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+
+    def test_the_probe_redirect_follow_carries_the_budget(self):
+        s = self._spider()
+        resp = TextResponse(
+            url="https://example.com/sitemap.xml", body=b"", status=301,
+            headers={"Location": b"https://example.com/sitemaps/sitemap.xml"},
+            request=Request("https://example.com/sitemap.xml"),
+        )
+        resp.meta.update({"guessed_source": True, "probe_hops": 0})
+        hop = next(r for r in s.parse_sitemap_probe(resp) if isinstance(r, Request))
+        assert hop.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert hop.meta["probe_hops"] == 1
+
+    def test_the_retry_margin_is_pinned_not_inherited(self):
+        """`--impersonate` sets RETRY_TIMES: 1, so the gate's margin used to depend on a CLI
+        flag. RetryMiddleware prefers the meta key, so robots keeps 3 attempts either way."""
+        s = self._spider()
+        seed = next(iter(s._seed_requests()))
+        assert seed.meta["max_retry_times"] == WebsiteSpider.ROBOTS_MAX_RETRY_TIMES
+        from scrapy.downloadermiddlewares.retry import get_retry_request
+        assert WebsiteSpider.ROBOTS_MAX_RETRY_TIMES == 2  # 3 attempts total
+        assert get_retry_request  # imported: the meta key this relies on is a real API
+
+    def test_pages_get_none_of_it(self):
+        """The budget is sized for 1KB of text and must not leak onto real pages."""
+        from scrapy.downloadermiddlewares.downloadtimeout import DownloadTimeoutMiddleware
+        s = self._spider()
+        list(s.parse_robots(self._robots()))
+        page = next(iter(s._schedule("https://example.com/a-page/")))
+        assert "max_retry_times" not in page.meta
+        assert "impersonate_args" not in page.meta
+        DownloadTimeoutMiddleware(180).process_request(page)
+        assert page.meta["download_timeout"] == 180
+
+    def test_the_budget_survives_a_jobdir_pickle_round_trip(self):
+        """The robots request is re-seeded every session, but a redirect hop can be sitting
+        in the frontier at interrupt time and IS persisted. Round-tripped through Scrapy's
+        real serialization, not a hand-rolled copy."""
+        import pickle
+        s = self._spider()
+        seed = next(iter(s._seed_requests()))
+        restored = pickle.loads(pickle.dumps(seed.to_dict(spider=s)))
+        assert restored["meta"]["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert restored["meta"]["impersonate_args"] == {
+            "timeout": WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT}
+        assert restored["meta"]["max_retry_times"] == WebsiteSpider.ROBOTS_MAX_RETRY_TIMES
+
+    def test_the_budget_survives_a_retry(self):
+        """RetryMiddleware rebuilds the request with `.copy()`; if the meta did not survive
+        that, attempts 2 and 3 would silently go back to 180s with a green suite."""
+        s = self._spider()
+        seed = next(iter(s._seed_requests()))
+        again = seed.copy()
+        assert again.meta["download_timeout"] == WebsiteSpider.ROBOTS_DOWNLOAD_TIMEOUT
+        assert again.meta["max_retry_times"] == WebsiteSpider.ROBOTS_MAX_RETRY_TIMES
+
+    def test_impersonate_args_is_inert_when_not_impersonating(self):
+        """It rides along on every robots request regardless of `--impersonate`, so it has to
+        be a no-op on the default path. scrapy-impersonate's handler only consults it when
+        `meta['impersonate']` is set, which the middleware does not do when off."""
+        from scrapy_impersonate.handler import ImpersonateDownloadHandler
+        import inspect
+        src = inspect.getsource(ImpersonateDownloadHandler.download_request)
+        assert 'request.meta.get("impersonate")' in src, (
+            "the impersonate handler no longer gates on meta['impersonate']; "
+            "impersonate_args may no longer be inert on the default path"
+        )
+        s = self._spider()
+        seed = next(iter(s._seed_requests()))
+        assert "impersonate" not in seed.meta
+
+
+class TestAllowAllIsVisible:
+    """#82 review: proceeding allow-all is the highest-stakes thing this crawler does
+    silently, so the one line that reports it must actually say something."""
+
+    def _spider(self):
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_scrapys_wrapped_exceptions_carry_no_message(self):
+        """The reason the log needed fixing, pinned against the real classes. Every wrapper
+        stringifies EMPTY, so the warning rendered as `could not be fetched ()`. It went
+        unnoticed because the existing test passes an OSError, which renders fine."""
+        from scrapy.exceptions import (CannotResolveHostError, DownloadTimeoutError,
+                                       DownloadConnectionRefusedError)
+        for cls in (DownloadTimeoutError, CannotResolveHostError,
+                    DownloadConnectionRefusedError):
+            assert str(cls()) == "", cls.__name__
+        assert str(OSError("boom")) == "boom"
+
+    def test_the_warning_names_the_exception_type(self, caplog):
+        import logging
+        from scrapy.exceptions import DownloadTimeoutError
+        s = self._spider()
+        with caplog.at_level(logging.WARNING):
+            list(s.robots_failed(types.SimpleNamespace(value=DownloadTimeoutError())))
+        assert "DownloadTimeoutError" in caplog.text
+        assert "could not be fetched ()" not in caplog.text
+
+    def test_a_message_bearing_exception_keeps_its_message(self, caplog):
+        import logging
+        s = self._spider()
+        with caplog.at_level(logging.WARNING):
+            list(s.robots_failed(types.SimpleNamespace(value=OSError("dns is down"))))
+        assert "dns is down" in caplog.text
+        assert "OSError" in caplog.text
