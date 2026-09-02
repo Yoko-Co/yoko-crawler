@@ -1994,6 +1994,31 @@ class TestPlatformSignals:
                  b'</head></html>'))
         assert self._signals(s)["wp-rest-api-link"] == "https://api.w.org/"
 
+    def test_every_generator_meta_is_captured(self):
+        """Plugins APPEND a generator; they do not overwrite WordPress core's. Taking only
+        the first meant that on a site stripping `wp_generator` we kept whichever plugin was
+        first and threw the rest away -- so identifying the platform came down to plugin
+        load order (corpus #115)."""
+        s = self._spider()
+        s._record_platform_signals(self._page(
+            body=b'<html><head>'
+                 b'<meta name="generator" content="WordPress 6.9.4">'
+                 b'<meta name="generator" content="Elementor 4.2.3">'
+                 b'<meta name="generator" content="WooCommerce 8.4.0">'
+                 b'</head></html>'))
+        gen = self._signals(s)["generator"]
+        assert "WordPress 6.9.4" in gen
+        assert "Elementor 4.2.3" in gen
+        assert "WooCommerce 8.4.0" in gen
+
+    def test_generator_capture_is_bounded(self):
+        s = self._spider()
+        metas = b"".join(
+            b'<meta name="generator" content="Plugin %d">' % i for i in range(20))
+        s._record_platform_signals(self._page(body=b"<html><head>" + metas + b"</head></html>"))
+        gen = self._signals(s)["generator"]
+        assert gen.count(";") == WebsiteSpider._PLATFORM_MAX_GENERATORS - 1
+
     def test_generator_is_matched_case_insensitively(self):
         """Drupal core emits `name="Generator"` with a capital G, and CSS attribute-VALUE
         matching is case-sensitive — a [name="generator"] selector is blind to it."""

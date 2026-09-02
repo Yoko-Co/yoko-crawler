@@ -312,6 +312,9 @@ class WebsiteSpider(scrapy.Spider):
     # Cap on how much header/meta text we keep per signal: enough to identify a platform and
     # its version, short enough that a hostile or verbose header can't bloat the status file.
     _PLATFORM_VALUE_MAXLEN = 120
+    # How many generator metas to keep. Enough to see core plus the plugins that matter,
+    # bounded so a page emitting dozens can't bloat the status file.
+    _PLATFORM_MAX_GENERATORS = 5
 
     def _record_platform_signals(self, response) -> None:
         """Record CMS fingerprints from the first successful HTML response (corpus #112).
@@ -342,11 +345,25 @@ class WebsiteSpider(scrapy.Spider):
             # translate because CSS attribute-VALUE matching is case-sensitive in cssselect
             # and Drupal core emits `name="Generator"` -- a `[name="generator"]` selector is
             # silently blind to it.
-            gen = response.xpath(
+            # ALL generator metas, not just the first (corpus #115). A page carries several:
+            # WordPress core emits one and plugins APPEND their own -- Elementor, WooCommerce,
+            # WP Rocket, WPML, AIOSEO. They do not overwrite core's. Taking only the first
+            # meant that on a site which strips `wp_generator` (a common hardening/SEO
+            # `remove_action('wp_head','wp_generator')`) we captured whichever plugin
+            # happened to be first and threw the rest away -- so whether the platform was
+            # identifiable came down to plugin load order.
+            gens = response.xpath(
                 "//meta[translate(@name, 'GENRATO', 'genrato')='generator']/@content"
-            ).get()
-            if gen and gen.strip():
-                signals["generator"] = gen.strip()[: self._PLATFORM_VALUE_MAXLEN]
+            ).getall()
+            values = []
+            for gen in gens:
+                gen = (gen or "").strip()
+                if gen:
+                    values.append(gen[: self._PLATFORM_VALUE_MAXLEN])
+                if len(values) >= self._PLATFORM_MAX_GENERATORS:
+                    break
+            if values:
+                signals["generator"] = "; ".join(values)
                 identifying = True
             # `rel` is a space-separated TOKEN list, so `~=` not `=`:
             # rel="https://api.w.org/ alternate" is valid and must still match.
