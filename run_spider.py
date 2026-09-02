@@ -277,6 +277,36 @@ def build_settings(args):
             # Cap retries at 1: enough to recover a genuinely transient blip without
             # tripling outbound load on a site that errors broadly.
             "RETRY_TIMES": 1,
+            # Per-request timeout for impersonated crawls, declared HERE rather than
+            # inherited (issue #88). scrapy-impersonate forwarded no timeout to curl_cffi at
+            # all, so this path silently ran on curl_cffi's session default -- measured at
+            # 30.0s -- a bound nobody chose, invisible in this file, and free to move when
+            # curl_cffi changes it. `ImpersonateMiddleware` now forwards `download_timeout`,
+            # so this setting is what actually applies.
+            #
+            # 60s is a JUDGEMENT CALL, and the honest version of the reasoning is that it
+            # has no measured backing. There is no WAF page-latency data anywhere in this
+            # repo; 60s is curl_cffi's 30s doubled, and it matches ROBOTS_DOWNLOAD_TIMEOUT,
+            # which was itself sized for a 1KB text file rather than a page. #82 deferred
+            # this exact call to #88 and #88 is answering it by analogy. Revisit it the first
+            # time a real crawl produces `unreachable.timeout` rows for pages that later
+            # fetch fine -- that is the evidence nobody has yet.
+            #
+            # The two neighbours it sits between:
+            #  - NOT Scrapy's 180s. `RETRY_TIMES: 1` above means the real cost of a hung URL
+            #    is (retries + 1) x timeout, so 180s is 360s per URL -- 5% of a 7200s session
+            #    -- against 120s (1.7%) at 60s. That bites hardest at CONCURRENT_REQUESTS 1,
+            #    where one hung request stalls the whole crawl. (An earlier version of this
+            #    comment quoted 2.5%/0.8% by forgetting the retry, understating both by half.)
+            #  - NOT the old 30s: inside the range a slow-but-real page can take, so the
+            #    undeclared bound was recording real pages as transport failures.
+            #
+            # One caveat on the first bullet: `--impersonate` and `--profile presale` are
+            # INDEPENDENT flags, in argparse and in the API, so the CONCURRENT_REQUESTS 1
+            # case is a convention rather than a guarantee -- `{"impersonate": "chrome"}`
+            # with no profile runs 16-wide, where a hung slot costs far less. The pairing is
+            # the common case and the worst case, which is what a bound should be sized for.
+            "DOWNLOAD_TIMEOUT": 60,
         }
     )
     # Let ImpersonateMiddleware set a per-request UA matching each fingerprint
