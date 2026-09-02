@@ -17,6 +17,22 @@ from twisted.internet.task import LoopingCall
 logger = logging.getLogger(__name__)
 
 
+def _fail_on_seeding_incomplete() -> bool:
+    """Whether a seeding-incomplete crawl is FAILED or merely logged (issue #102).
+
+    A kill switch, defaulting to on, and the honest reason for it is that this converts a log
+    line that has existed since #76 into a client-visible failure with NO production evidence
+    of how often the condition fires -- that log has only ever gone to the Scrapy log of a
+    hand-managed droplet, where nothing reads it. If the answer turns out to be "more often
+    than expected", rollback is `YOKO_CRAWL_FAIL_SEEDING_INCOMPLETE=0` plus a restart, rather
+    than redeploying a hand-managed venv.
+
+    The LOG is unconditional either way, so turning this off still leaves the evidence."""
+    return os.environ.get("YOKO_CRAWL_FAIL_SEEDING_INCOMPLETE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 class ProgressWriter:
     """Scrapy extension that writes progress to an atomic JSON status file."""
 
@@ -101,8 +117,9 @@ class ProgressWriter:
                         "(DNS or connection) and no pages were fetched -- check the address"
                     )
                 # else: 0 responses, no SSRF drops, no transport errors -> a genuinely
-                # empty finish (e.g. everything robots-disallowed). Left "completed" as
-                # before -- not a new failure mode, so behavior is unchanged.
+                # empty finish (e.g. everything robots-disallowed). Left "completed" here --
+                # though since #102 the phase-two tripwire below can still reclassify it when
+                # robots.txt responded and the start URL was never emitted.
 
         # Seeding tripwire (issue #52). Our own seeding method counts every seed it emits,
         # so a crawl that fetched pages while reporting ZERO seeds was seeded by something
@@ -122,7 +139,12 @@ class ProgressWriter:
                 "installed Scrapy against the pin in requirements.txt."
             )
 
-        # Phase-two seeding tripwire (issue #76). Seeding is no longer one atomic event:
+        # Phase-two seeding tripwire (issue #76), and unlike its sibling above this one can
+        # FAIL the crawl (#102). The asymmetry is deliberate: the #52 case leaves a crawl that
+        # fetched REAL PAGES, just fewer, and failing it would discard genuine work over a
+        # defect an operator can fix and re-run. This case leaves no page of the site at all --
+        # nothing to preserve, and calling it `completed` hands the corpus an "inventory" of
+        # robots.txt. Seeding is no longer one atomic event:
         # the spider seeds robots.txt, and the START URLS are emitted from its callback once
         # the Disallow rules are final. So "seeding ran" is no longer proved by a non-zero
         # seeds_emitted -- phase one can succeed while phase two never happens (an unbounded
@@ -139,32 +161,71 @@ class ProgressWriter:
                 "Usually an unterminated robots.txt redirect chain or an error in "
                 "parse_robots; re-run and check the robots.txt of the target."
             )
-            # ...and FAIL it, not just log it (issue #102).
+            # ...and FAIL it, when -- and only when -- this crawl inventoried NOTHING (#102).
             #
-            # The empty-crawl guards above cannot reach this shape: they require
-            # `response_received_count == 0`, and here robots.txt itself responded, so the
-            # count is 1 and the crawl sails through as `completed` with a one-row
-            # "inventory" that is robots.txt rather than the site. Logging alone put the
-            # only evidence in the Scrapy log of a hand-managed droplet, where nothing reads
-            # it -- the same silent-orphaning failure this tripwire was written to catch, one
-            # level up. A consumer keys on `status`/`failure_reason`; give it something to
-            # key on.
+            # The condition above is a LOG predicate, and has been since #76. It was never
+            # sized to carry a status flip, which is the mistake review caught: driving the
+            # real ProgressWriter, a session reporting FOUR THOUSAND pages came back
+            # `failed / seeding_incomplete`, writing `urls_crawled: 4000` beside an error
+            # reading "no page of the site was fetched".
             #
-            # Gated on `status == "completed"` so the more specific classifications above
-            # win: an all-SSRF-blocked or unreachable crawl reaches this same condition (its
-            # robots seed was emitted and never came back), and `ssrf_blocked`/`unreachable`
-            # name the actual cause where this would only name the symptom.
+            # The route is the production one. yoko-corpus runs one logical crawl as N
+            # sessions against a JOBDIR, so session 2+ restores a full frontier and fetches
+            # from it. If phase two does not run in THAT session, the counter is 0 while the
+            # session crawls the site perfectly well. And the `completed` gate does not help:
+            # `closespider_timeout`/`closespider_itemcount` are COMPLETED reasons, and they
+            # are how every session of that path ends.
             #
-            # Does NOT fire for a robots-restricted site, which is the false positive worth
-            # naming explicitly: `_start_url_requests` is deliberately not routed through
-            # `_schedule`, so a `Disallow: /` site still emits its start URL and counts it.
-            # gastro.org's legitimate one-page crawl stays `completed`.
-            if status == "completed":
+            # So the flip has to prove its own claim. It fires only when every response this
+            # session received was seeding traffic -- robots.txt, sitemaps, sitemap probes --
+            # meaning no page of the site was reached. Deliberately UNDER-counts seeding
+            # responses if a category is ever added and not listed here: the guard then goes
+            # SILENT rather than wrong, which is the correct direction for a check that turns
+            # a client's crawl red.
+            #
+            # The log keeps the wider condition on purpose. The two answer different
+            # questions: the log says "phase two did not run" (diagnostic, always worth
+            # knowing), the flip says "and therefore this crawl inventoried nothing"
+            # (a verdict, which needs the stronger evidence).
+            seeding_responses = sum(self.stats.get_value(k, 0) for k in (
+                "seeding/robots_fetched",
+                "seeding/sitemaps_fetched",
+                "seeding/sitemap_probes_found",
+                "seeding/sitemap_probes_missed",
+                "seeding/sitemap_probes_not_a_sitemap",
+            ))
+            responses = self.stats.get_value("response_received_count", 0)
+            # Keyed on robots.txt having RESPONDED, not on the seed having been emitted
+            # (`seeds_emitted` is bumped before the request is even scheduled), so the error
+            # text below is provably true when it is written.
+            robots_responded = self.stats.get_value("seeding/robots_fetched", 0) > 0
+            # Gated on `completed` so an abnormal close keeps `crawl_error`, which names a
+            # cause where this names only a symptom. NOT, as an earlier draft claimed,
+            # because an SSRF-blocked or unreachable crawl "reaches this same condition": it
+            # does not. An IgnoreRequest or a transport failure on the robots seed routes to
+            # the `robots_failed` errback, whose last act is `_start_url_requests()`, so those
+            # crawls always have `start_urls_emitted == 1` and never arrive here. The
+            # precedence tests stay as ordering pins, but they stage a shape production does
+            # not produce.
+            #
+            # It does NOT fire for a robots-restricted site either -- the false positive worth
+            # naming, since that was the design question. `_start_url_requests` is deliberately
+            # not routed through `_schedule`, so a `Disallow: /` site still emits and counts
+            # its start URL, and that start-URL response is not seeding traffic.
+            #
+            # (An earlier draft called gastro.org "a one-page crawl". It is not: robots.txt is
+            # unconditionally emitted as its own row, so the floor for any crawl that reads
+            # robots.txt is TWO rows -- the AGENTS.md line this borrowed from has the same
+            # undercount. Corrected because the number is load-bearing: a guard keyed on "one
+            # row" would have been wrong.)
+            if (status == "completed" and robots_responded
+                    and responses <= seeding_responses
+                    and _fail_on_seeding_incomplete()):
                 status, failure_reason = "failed", "seeding_incomplete"
                 error = (
                     "seeding stopped after robots.txt: the start URL was never emitted, so "
                     "no page of the site was fetched. Any row in this crawl is robots.txt "
-                    "itself -- it is not an inventory"
+                    "or a sitemap -- it is not an inventory"
                 )
 
         self._write_status(
@@ -245,7 +306,8 @@ class ProgressWriter:
             # partial results. None while the crawl is still running.
             "close_reason": close_reason,
             # Structured failure token (issue #44): None unless the crawl failed with a
-            # classified cause (unreachable / ssrf_blocked / crawl_error).
+            # classified cause (unreachable / ssrf_blocked / crawl_error /
+        # spider_init_error / seeding_incomplete).
             "failure_reason": failure_reason,
             # Seeding observability (issue #52). `seeds_emitted` is the tripwire for a whole
             # bug CLASS: a framework rename made the spider's seeding method unreachable and

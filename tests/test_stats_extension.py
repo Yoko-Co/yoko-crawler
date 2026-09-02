@@ -540,34 +540,74 @@ def test_job_manager_restrictions_default_matches_the_status_file_shape(tmp_path
 
 class TestSeedingIncomplete:
     """Issue #102: seeding is two-phase, and a crawl that completed phase one and never
-    reached phase two reported `completed` with a one-row "inventory" that is robots.txt
-    itself. The empty-crawl guards structurally cannot see it -- they require
-    `response_received_count == 0`, and robots.txt responding makes that 1."""
+    reached phase two fetched robots.txt and NO page of the site, yet reported `completed`.
+    Every existing empty-crawl guard sits inside `if response_received_count == 0`, and
+    robots.txt answering makes that 1, so none of them can see this shape.
+
+    The flip must PROVE its own claim, which the first cut did not: review drove the real
+    ProgressWriter and got a session reporting 4,000 pages back as failed."""
 
     def _closed(self, tmp_path, stats, reason="finished"):
         return _write_and_read(tmp_path, stats, reason=reason)
 
-    def test_robots_fetched_but_no_start_url_is_failed(self, tmp_path):
-        data = self._closed(tmp_path, {
-            "response_received_count": 1,
-            "seeding/seeds_emitted": 1,
-            "seeding/start_urls_emitted": 0,
-            "robots_readability_outcome": "parsed",
-        })
-        assert data["status"] == "failed", (
-            "reporting this completed hands the corpus a one-row crawl that looks like a "
-            "real one-page site"
-        )
+    # A crawl that read robots.txt, probed for sitemaps, and never reached a page.
+    _SEEDING_ONLY = {
+        "response_received_count": 3,
+        "seeding/seeds_emitted": 1,
+        "seeding/robots_fetched": 1,
+        "seeding/sitemap_probes_missed": 2,
+        "seeding/start_urls_emitted": 0,
+        "robots_readability_outcome": "parsed",
+    }
+
+    def test_seeding_only_traffic_is_failed(self, tmp_path):
+        data = self._closed(tmp_path, dict(self._SEEDING_ONLY))
+        assert data["status"] == "failed"
         assert data["failure_reason"] == "seeding_incomplete"
         assert "not an inventory" in (data["error"] or "")
 
+    def test_a_session_that_fetched_pages_is_never_failed(self, tmp_path):
+        """THE false positive, reproduced by review at 4,000 pages. yoko-corpus runs one
+        logical crawl as N sessions, so session 2+ restores a full frontier and fetches from
+        it -- with `start_urls_emitted == 0` if phase two did not run THIS session. And the
+        `completed` gate does not help, because `closespider_timeout`/`closespider_itemcount`
+        are COMPLETED reasons and are how every session of that path ends."""
+        for reason in ("finished", "closespider_timeout", "closespider_itemcount"):
+            data = self._closed(tmp_path, {
+                **self._SEEDING_ONLY, "response_received_count": 4000,
+            }, reason=reason)
+            assert data["status"] == "completed", reason
+            assert data["failure_reason"] is None, reason
+
+    def test_one_page_beyond_seeding_is_enough_to_spare_it(self, tmp_path):
+        """The boundary: seeding traffic + a single real page. Failing this would call a
+        crawl that reached the site "no page of the site was fetched"."""
+        data = self._closed(tmp_path, {
+            **self._SEEDING_ONLY, "response_received_count": 4})
+        assert data["status"] == "completed"
+
+    def test_robots_that_never_responded_does_not_fire_it(self, tmp_path):
+        """The error text says robots.txt was fetched, so the condition must check that.
+        `seeds_emitted` is bumped before the request is even scheduled and proves nothing."""
+        data = self._closed(tmp_path, {
+            "response_received_count": 0,
+            "seeding/seeds_emitted": 1,
+            "seeding/robots_fetched": 0,
+            "seeding/start_urls_emitted": 0,
+        })
+        assert data["failure_reason"] != "seeding_incomplete"
+
     def test_a_robots_restricted_site_is_still_completed(self, tmp_path):
-        """THE false positive to avoid. `_start_url_requests` is deliberately not routed
-        through `_schedule`, so a `Disallow: /` site DOES emit and count its start URL --
-        gastro.org's legitimate one-page crawl must stay completed."""
+        """The design question. `_start_url_requests` is deliberately not routed through
+        `_schedule`, so a `Disallow: /` site DOES emit and count its start URL.
+
+        Note the row count: robots.txt is emitted as its own row too, so gastro.org's
+        restricted crawl is TWO rows, not one. An earlier comment of mine said one, and a
+        guard keyed on that number would have been wrong."""
         data = self._closed(tmp_path, {
             "response_received_count": 2,
             "seeding/seeds_emitted": 1,
+            "seeding/robots_fetched": 1,
             "seeding/start_urls_emitted": 1,
             "robots_disallowed_skipped": 2345,
             "robots_root_disallowed": True,
@@ -576,12 +616,27 @@ class TestSeedingIncomplete:
         assert data["status"] == "completed"
         assert data["failure_reason"] is None
 
+    def test_the_kill_switch_leaves_the_log_but_not_the_failure(self, tmp_path, monkeypatch,
+                                                               caplog):
+        """Converting a #76-era log line into a client-visible failure with no production
+        data on its frequency; rollback must not require redeploying a hand-managed venv."""
+        import logging
+        monkeypatch.setenv("YOKO_CRAWL_FAIL_SEEDING_INCOMPLETE", "0")
+        with caplog.at_level(logging.ERROR):
+            data = self._closed(tmp_path, dict(self._SEEDING_ONLY))
+        assert data["status"] == "completed"
+        assert data["failure_reason"] is None
+        assert "SEEDING STOPPED AFTER ROBOTS.TXT" in caplog.text, \
+            "the evidence must survive the switch being off"
+
     def test_a_more_specific_empty_crawl_cause_still_wins(self, tmp_path):
-        """An unreachable crawl reaches the same condition -- its robots seed was emitted and
-        never came back -- but `unreachable` names the cause where this names the symptom."""
+        """Ordering pin. Production does not actually produce this shape -- an SSRF-dropped
+        or transport-failed robots seed errbacks to `robots_failed`, which emits the start
+        URL -- but the precedence must hold regardless."""
         data = self._closed(tmp_path, {
             "response_received_count": 0,
             "seeding/seeds_emitted": 1,
+            "seeding/robots_fetched": 1,
             "seeding/start_urls_emitted": 0,
             "downloader/exception_count": 3,
         })
@@ -591,6 +646,7 @@ class TestSeedingIncomplete:
         data = self._closed(tmp_path, {
             "response_received_count": 0,
             "seeding/seeds_emitted": 1,
+            "seeding/robots_fetched": 1,
             "seeding/start_urls_emitted": 0,
             "ssrf_guard/blocked": 1,
             "downloader/exception_count": 1,
@@ -598,13 +654,7 @@ class TestSeedingIncomplete:
         assert data["failure_reason"] == "ssrf_blocked"
 
     def test_an_already_failed_crawl_keeps_its_own_reason(self, tmp_path):
-        """A hard close (`shutdown`, `memusage_exceeded`) is already failed; this must not
-        relabel it, since the abnormal close is the more useful fact."""
-        data = self._closed(tmp_path, {
-            "response_received_count": 1,
-            "seeding/seeds_emitted": 1,
-            "seeding/start_urls_emitted": 0,
-        }, reason="memusage_exceeded")
+        data = self._closed(tmp_path, dict(self._SEEDING_ONLY), reason="memusage_exceeded")
         assert data["status"] == "failed"
         assert data["failure_reason"] == "crawl_error"
 
@@ -612,6 +662,7 @@ class TestSeedingIncomplete:
         data = self._closed(tmp_path, {
             "response_received_count": 40,
             "seeding/seeds_emitted": 1,
+            "seeding/robots_fetched": 1,
             "seeding/start_urls_emitted": 1,
             "robots_readability_outcome": "parsed",
         })
