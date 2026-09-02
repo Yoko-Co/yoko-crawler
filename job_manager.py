@@ -600,6 +600,16 @@ class JobManager:
             # against an older crawler whose status file predates the field.
             "restrictions": status_data.get("restrictions") or {
                 "robots_root_disallowed": None,
+                # Kept in lockstep with ProgressWriter._robots_readability's default (#97
+                # review): this literal is the OTHER producer of the same contract, and the
+                # comment above promises one stable shape. A test pins the two key sets
+                # together so they can only drift as a pair.
+                "robots_readability": {
+                    "outcome": "unknown",
+                    "final_status": None,
+                    "cf_wall": False,
+                    "rules_from_state": False,
+                },
                 "skipped": {
                     "robots_disallowed": 0,
                     "robots_disallowed_assets": 0,

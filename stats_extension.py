@@ -166,11 +166,32 @@ class ProgressWriter:
         spider's existing `_is_waf_challenge`; only meaningful when outcome is `unreadable`."""
         outcome = self.stats.get_value("robots_readability_outcome", None)
         status = self.stats.get_value("robots_readability_status", None)
+        if not outcome:
+            # Tripwire, same reasoning as the two seeding tripwires above (#52/#76): the
+            # recorder runs on every route out of `parse_robots`, so start URLs emitted with
+            # no outcome recorded means the recorder itself stopped being reached. Reported
+            # as its own value rather than `unknown`, because `unknown` legitimately means
+            # "the crawl ended before robots resolved" and a broken instrument must not hide
+            # inside a legitimate outcome -- that is how #52 went unnoticed for months.
+            emitted = self.stats.get_value("seeding/start_urls_emitted", 0)
+            if emitted:
+                logger.error(
+                    "ROBOTS READABILITY NOT RECORDED: the crawl emitted start URLs but "
+                    "logged no robots.txt readability outcome, so `_record_robots_readability` "
+                    "was not reached on any route out of parse_robots. The allow-all signal "
+                    "for this crawl is missing, not clean -- do not read it as `parsed`. "
+                    "(issue #97)"
+                )
+            outcome = "not_recorded" if emitted else "unknown"
         return {
-            "outcome": outcome if outcome else "unknown",
+            "outcome": outcome,
             # None on a transport failure -- there was no response to have a status.
             "final_status": None if status is None else int(status),
-            "waf_wall": bool(self.stats.get_value("robots_readability_waf", False)),
+            # Cloudflare-specific by construction; see `_record_robots_readability`.
+            "cf_wall": bool(self.stats.get_value("robots_readability_cf_wall", False)),
+            # We hold rules from an earlier session even though THIS fetch was refused.
+            "rules_from_state": bool(
+                self.stats.get_value("robots_readability_rules_from_state", False)),
         }
 
     def _status_counts(self):

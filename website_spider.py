@@ -1312,13 +1312,19 @@ class WebsiteSpider(scrapy.Spider):
 
     # robots.txt statuses that genuinely mean "this site has no rules" (issue #97).
     #
-    # This is the ONLY response class from which allow-all is an inference we are entitled to
-    # make. RFC 9309 reads an unavailable status the same way. Everything else -- a 403, a
-    # 429, a 5xx, a 200 we could not decode -- means we did not READ the rules, which is a
-    # different fact and must not be recorded as the same one.
+    # The only response class from which allow-all is an inference we are entitled to make.
+    # Everything else -- a 403, a 429, a 5xx, a 200 we could not decode -- means we did not
+    # READ the rules, a different fact that must not be recorded as the same one.
+    #
+    # NOTE this is STRICTER than RFC 9309, and an earlier version of this comment wrongly
+    # claimed the RFC's backing for it. The RFC treats most 4xx as "unavailable" and lets a
+    # crawler assume no restrictions on a 403 (it treats 5xx the other way). We put 403 in
+    # `unreadable` because in OUR population a 403 on robots.txt is usually an edge WAF
+    # refusing us rather than an origin saying it has no rules -- that is our reasoning and
+    # it should be defended on its own terms, not by borrowing the RFC's authority.
     ROBOTS_ABSENT_STATUSES = frozenset({404, 410})
 
-    def _record_robots_readability(self, response=None):
+    def _record_robots_readability(self, response=None, parsed_now=False):
         """Record WHY this crawl does or does not hold robots.txt rules (issue #97).
 
         Until now the only signal that a crawl proceeded without rules was
@@ -1328,53 +1334,79 @@ class WebsiteSpider(scrapy.Spider):
         counted -- the tripwire is silently incomplete on the cheaper route. Cloudflare 403s
         a robots.txt routinely, so this is not a corner case.
 
-        `outcome` is per-crawl, not a counter: robots.txt is fetched once (modulo redirect
-        hops, where the LAST hop is the one that decided the outcome). Deliberately an
-        observation, not a verdict -- it changes no crawl behaviour. Whether `unreadable`
-        should stop a crawl instead of proceeding allow-all is the posture question in #97,
-        and it is Sarah's to answer with these counts in hand rather than mine to infer."""
-        if response is None:                      # transport failure -- robots_failed
-            outcome, status, waf = "unreadable", None, False
-        elif self._robots is not None:            # rules actually parsed
-            outcome, status, waf = "parsed", int(response.status), False
-        elif int(response.status) in self.ROBOTS_ABSENT_STATUSES:
-            outcome, status, waf = "absent", int(response.status), False
-        else:
-            # Non-200, an undecodable 200, or a body Protego refused. `_is_waf_challenge`
-            # already separates a real Cloudflare wall from a proxied ORIGIN 403 (it checks
-            # cf-mitigated / cf-ray + Server, then the origin fingerprint), which is the
-            # distinction the posture call in #97 turns on: "the site said no" and "a WAF
-            # would not let us ask" are not the same fact.
-            outcome, status = "unreadable", int(response.status)
-            try:
-                waf = self._is_waf_challenge(response)
-            except Exception:
-                waf = False
-        self._stat(f"seeding/robots_{outcome}")
-        if outcome == "unreadable":
-            self._stat("seeding/robots_unreadable_waf" if waf else "seeding/robots_unreadable_origin")
-            self.logger.warning(
-                "robots.txt was NOT READ (HTTP %s%s) -- proceeding allow-all. This is not "
-                "the same as a site with no robots.txt: rules may exist and we could not "
-                "see them. Crawl-delay and Disallow are unknown for this crawl. (issue #97)",
-                status if status is not None else "-", ", WAF wall" if waf else "",
-            )
-        crawler = getattr(self, "crawler", None)
-        stats = getattr(crawler, "stats", None) if crawler else None
-        if stats is not None:
-            stats.set_value("robots_readability_outcome", outcome)
-            stats.set_value("robots_readability_status", status)
-            stats.set_value("robots_readability_waf", waf)
+        `outcome` describes THIS SESSION'S FETCH, not the crawl's accumulated knowledge, and
+        that distinction is load-bearing rather than pedantic. `self._robots` is restored
+        from `self.state` on a resumed session BEFORE this runs, so classifying on "do we
+        hold rules" reported `parsed` for a session that was refused -- meaning a site that
+        blocked us for thirty-nine consecutive sessions after one good one left NO trace.
+        Under-counting refusals is the one direction that actively argues for the wrong
+        policy in #97, so the refusal is recorded and `rules_from_state` carries the other
+        fact alongside it. Both survive; neither overwrites the other.
+
+        Deliberately an observation, not a verdict -- it changes no crawl behaviour. Whether
+        `unreadable` should stop a crawl instead of proceeding allow-all is the posture
+        question in #97, and it is Sarah's to answer with these counts in hand.
+
+        MUST NOT RAISE: `_robots_outputs` contains every other stage separately because an
+        escape here skips the seed and yields a one-row crawl reporting `completed`. This is
+        a measurement; it must never be the thing that breaks the crawl it measures."""
+        try:
+            if response is None:                  # transport failure -- robots_failed
+                outcome, status, cf_wall = "unreadable", None, False
+            elif parsed_now:                      # Protego parsed THIS session's body
+                outcome, status, cf_wall = "parsed", int(response.status), False
+            elif int(response.status) in self.ROBOTS_ABSENT_STATUSES:
+                outcome, status, cf_wall = "absent", int(response.status), False
+            else:
+                # Non-200, an undecodable 200, or a body Protego refused.
+                #
+                # `cf_wall` is CLOUDFLARE-SPECIFIC and named for it deliberately (#97
+                # review). `_is_waf_challenge` keys on cf-mitigated / cf-ray + Server, so
+                # Sucuri, Akamai, AWS WAF and Imperva walls all land in the not-CF bucket.
+                # Calling the field `waf_wall` would have overclaimed exactly the split the
+                # posture call turns on -- read `cf_wall: true` as a FLOOR on edge refusals,
+                # never as the whole of them. Vendor-agnostic detection is issue #100.
+                outcome, status = "unreadable", int(response.status)
+                cf_wall = self._is_waf_challenge(response)
+            rules_from_state = self._robots is not None and not parsed_now
+
+            self._stat(f"seeding/robots_{outcome}")
+            if outcome == "unreadable":
+                self._stat("seeding/robots_unreadable_cf" if cf_wall
+                           else "seeding/robots_unreadable_not_cf")
+                self.logger.warning(
+                    "robots.txt was NOT READ (HTTP %s%s) -- proceeding allow-all%s. This is "
+                    "not the same as a site with no robots.txt: rules may exist and we could "
+                    "not see them. (issue #97)",
+                    status if status is not None else "-",
+                    ", Cloudflare wall" if cf_wall else "",
+                    " for anything not covered by rules carried over from an earlier session"
+                    if rules_from_state else
+                    "; Crawl-delay and Disallow are unknown for this crawl",
+                )
+            crawler = getattr(self, "crawler", None)
+            stats = getattr(crawler, "stats", None) if crawler else None
+            if stats is not None:
+                stats.set_value("robots_readability_outcome", outcome)
+                stats.set_value("robots_readability_status", status)
+                stats.set_value("robots_readability_cf_wall", cf_wall)
+                stats.set_value("robots_readability_rules_from_state", rules_from_state)
+        except Exception:
+            self.logger.debug("recording robots.txt readability failed", exc_info=True)
 
     def _robots_body_outputs(self, response, outputs):
         """Parse the rules and discover sitemaps. Best-effort in both halves."""
         # Parse robots.txt rules from the real body (issues #57/#59): Disallow gates scheduling
         # (is_robots_disallowed) and a Crawl-delay paces the host. Best-effort -- a malformed or
         # non-text robots.txt leaves rules unset (allow-all), never breaking the crawl.
+        parsed_now = False
         if response.status == 200 and isinstance(response, TextResponse):
             try:
                 body = response.text
                 self._robots = Protego.parse(body)
+                # Set the instant the rules exist, BEFORE the best-effort work below: a
+                # failure to persist or to apply a Crawl-delay does not un-parse them.
+                parsed_now = True
                 self._persist_robots_body(body)
                 self._record_robots_scope()
                 delay = self._robots.crawl_delay(self.ROBOTS_USER_AGENT)
@@ -1382,9 +1414,10 @@ class WebsiteSpider(scrapy.Spider):
                     self._apply_crawl_delay(float(delay))
             except Exception:
                 self.logger.debug("robots.txt parse failed for %s", response.url, exc_info=True)
-        # AFTER the parse attempt, so `parsed` means rules we actually hold -- not merely a
-        # 200, which a malformed body can accompany while leaving us with nothing (#97).
-        self._record_robots_readability(response)
+        # AFTER the parse attempt, and told explicitly whether it succeeded -- `parsed` must
+        # mean rules THIS session read, not merely a 200 (a malformed body reaches here and
+        # leaves us with nothing) and not rules a resume restored (#97 review).
+        self._record_robots_readability(response, parsed_now=parsed_now)
 
         # Discover sitemaps -- only on-domain (a robots.txt can list a third-party sitemap URL).
         # Guarded on TextResponse: a binary body has no `.text`. Each line is guarded on its

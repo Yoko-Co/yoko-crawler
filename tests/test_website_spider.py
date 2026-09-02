@@ -3501,12 +3501,12 @@ class TestRobotsReadability:
         "the site said no". Reuses the spider's existing `_is_waf_challenge`."""
         wall = self._drive(self._robots_response(
             status=403, body=b"blocked", headers={"cf-mitigated": "challenge"}))
-        assert wall.crawler.stats.values["robots_readability_waf"] is True
-        assert wall.crawler.stats.values.get("seeding/robots_unreadable_waf") == 1
+        assert wall.crawler.stats.values["robots_readability_cf_wall"] is True
+        assert wall.crawler.stats.values.get("seeding/robots_unreadable_cf") == 1
 
         origin = self._drive(self._robots_response(status=403, body=b"Forbidden"))
-        assert origin.crawler.stats.values["robots_readability_waf"] is False
-        assert origin.crawler.stats.values.get("seeding/robots_unreadable_origin") == 1
+        assert origin.crawler.stats.values["robots_readability_cf_wall"] is False
+        assert origin.crawler.stats.values.get("seeding/robots_unreadable_not_cf") == 1
 
     def test_a_200_we_could_not_parse_is_unreadable_not_parsed(self):
         """`parsed` must mean rules we HOLD, not merely a 200. A binary body reaches the
@@ -3529,6 +3529,50 @@ class TestRobotsReadability:
         assert v["robots_readability_status"] is None, "no response means no status to report"
         assert v.get("seeding/robots_failed") == 1
         assert v.get("seeding/robots_unreadable") == 1
+
+    def test_a_followed_redirect_records_nothing_and_defers_to_the_next_hop(self):
+        """A hop we ARE following has not decided anything yet. Recording here would file an
+        ordinary http->https robots redirect as a refusal, and injecting an early record was
+        a mutation the suite did not catch (#97 review)."""
+        s = self._spider()
+        resp = Response(
+            url="http://example.com/robots.txt", status=301,
+            headers={"Location": "https://example.com/robots.txt"},
+            request=Request("http://example.com/robots.txt"),
+        )
+        outputs, deferred = s._robots_outputs(resp)
+        assert deferred is True, "the followed hop seeds, so this call must defer"
+        assert "robots_readability_outcome" not in s.crawler.stats.values
+
+    def test_a_refused_resumed_session_reports_the_refusal_not_the_restored_rules(self):
+        """THE under-count this review found. `self._robots` is restored from state before
+        this runs, so classifying on "do we hold rules" reported `parsed` for a session that
+        was refused -- a site blocking us for 39 sessions after one good one left NO trace,
+        and the direction of that error argues for leaving allow-all alone."""
+        from protego import Protego
+        s = self._spider()
+        s._robots = Protego.parse("User-agent: *\nDisallow: /private/\n")   # restored
+        list(s._robots_outputs(self._robots_response(status=403, body=b"nope")))
+        v = s.crawler.stats.values
+        assert v["robots_readability_outcome"] == "unreadable", \
+            "this session was refused; holding older rules does not un-refuse it"
+        assert v["robots_readability_rules_from_state"] is True, \
+            "and the rules we DO hold must not be lost either -- both facts, not one"
+
+    def test_a_freshly_parsed_session_is_not_flagged_as_carrying_state(self):
+        s = self._drive(self._robots_response())
+        assert s.crawler.stats.values["robots_readability_outcome"] == "parsed"
+        assert s.crawler.stats.values["robots_readability_rules_from_state"] is False
+
+    def test_the_recorder_can_never_break_the_crawl_it_measures(self):
+        """`_robots_outputs` is documented MUST NOT RAISE because it is the crawl's only
+        seed. A measurement that can kill the crawl is worse than no measurement."""
+        s = self._spider()
+        s._is_waf_challenge = lambda response: 1 / 0        # detonate mid-classification
+        outputs, deferred = s._robots_outputs(
+            self._robots_response(status=403, body=b"nope"))
+        assert deferred is False
+        assert isinstance(outputs, list), "seeding must survive a broken recorder"
 
     def test_a_dead_ended_redirect_is_unreadable_not_unknown(self):
         """This branch returns BEFORE the body handler, so it needs its own record or a real

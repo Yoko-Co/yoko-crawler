@@ -380,16 +380,17 @@ class TestRestrictionsBlock:
         data = _write_and_read(
             tmp_path,
             {"response_received_count": 40, "seeding/seeds_emitted": 2,
-             "seeding/start_urls_emitted": 1},
+             "seeding/start_urls_emitted": 1,
+             # A crawl that seeded DID resolve robots.txt, so a readability outcome exists.
+             # Omitting it now trips #97's not-recorded tripwire, which is the point of it.
+             "robots_readability_outcome": "parsed", "robots_readability_status": 200},
             reason="finished",
         )
         assert set(data["restrictions"]) == {
             "skipped", "crawl_delay", "robots_root_disallowed", "robots_readability"}
-        # A crawl where robots.txt never resolved must read as "unknown", NOT as `absent` or
-        # `parsed` -- #97's whole point is that "we did not read the rules" and "there are no
-        # rules" are different facts, and the default must not quietly assert the safe one.
         assert data["restrictions"]["robots_readability"] == {
-            "outcome": "unknown", "final_status": None, "waf_wall": False}
+            "outcome": "parsed", "final_status": 200, "cf_wall": False,
+            "rules_from_state": False}
         # Never parsed -> None, NOT False: "we could not read the rules" must stay
         # distinct from "the rules allow us".
         assert data["restrictions"]["robots_root_disallowed"] is None
@@ -450,3 +451,88 @@ def test_a_scheme_refused_empty_crawl_is_not_reported_as_unreachable(tmp_path):
     )
     assert data["failure_reason"] == "ssrf_blocked"
     assert data["status"] == "failed"
+
+
+
+class TestRobotsReadabilityReporting:
+    """The status-file half of crawler #97. `test_absent_stats_default_to_zero` above pins the
+    all-defaults shape; hardcoding `_robots_readability()` to return exactly that default
+    survived the whole 717-test suite (#97 review), so these drive REAL stats through it."""
+
+    def test_a_refusal_reaches_the_status_file_intact(self, tmp_path):
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "seeding/seeds_emitted": 2,
+             "seeding/start_urls_emitted": 1,
+             "robots_readability_outcome": "unreadable",
+             "robots_readability_status": 403,
+             "robots_readability_cf_wall": True,
+             "robots_readability_rules_from_state": False},
+            reason="finished",
+        )
+        assert data["restrictions"]["robots_readability"] == {
+            "outcome": "unreadable", "final_status": 403, "cf_wall": True,
+            "rules_from_state": False}
+
+    def test_a_parsed_crawl_reaches_the_status_file_intact(self, tmp_path):
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "seeding/seeds_emitted": 2,
+             "seeding/start_urls_emitted": 1,
+             "robots_readability_outcome": "parsed",
+             "robots_readability_status": 200},
+            reason="finished",
+        )
+        assert data["restrictions"]["robots_readability"]["outcome"] == "parsed"
+        assert data["restrictions"]["robots_readability"]["final_status"] == 200
+
+    def test_a_missing_outcome_after_seeding_is_not_recorded_not_unknown(self, tmp_path, caplog):
+        """A broken instrument must not hide inside a legitimate outcome. `unknown` really
+        means "the crawl ended before robots resolved"; if start URLs went out, the recorder
+        should have run, and #52 is the standing lesson about what silence costs."""
+        import logging
+        with caplog.at_level(logging.ERROR):
+            data = _write_and_read(
+                tmp_path,
+                {"response_received_count": 40, "seeding/seeds_emitted": 2,
+                 "seeding/start_urls_emitted": 1},
+                reason="finished",
+            )
+        assert data["restrictions"]["robots_readability"]["outcome"] == "not_recorded"
+        assert "NOT RECORDED" in caplog.text
+
+    def test_no_seeding_yet_stays_unknown_and_silent(self, tmp_path, caplog):
+        """The legitimate case: robots.txt never resolved, so there is nothing to report and
+        nothing is wrong. This must NOT trip the tripwire or it cries wolf every early poll."""
+        import logging
+        with caplog.at_level(logging.ERROR):
+            data = _write_and_read(
+                tmp_path, {"response_received_count": 0}, reason="finished")
+        assert data["restrictions"]["robots_readability"]["outcome"] == "unknown"
+        assert "NOT RECORDED" not in caplog.text
+
+
+def test_job_manager_restrictions_default_matches_the_status_file_shape(tmp_path):
+    """Two producers, one contract. `job_manager.get_status_response` carries its own zeroed
+    `restrictions` literal for a crawl with no status file yet, and it silently omitted the
+    new key (#97 review) -- so a consumer saw a different shape depending on WHICH producer
+    answered, breaking the promise the code's own comment makes. Pinning both key sets
+    together is the only thing that stops them drifting again."""
+    import job_manager
+    data = _write_and_read(
+        tmp_path,
+        {"response_received_count": 1, "seeding/seeds_emitted": 1,
+         "seeding/start_urls_emitted": 1},
+        reason="finished",
+    )
+    import inspect
+    src = inspect.getsource(job_manager.JobManager.get_status_response)
+    marker = '"restrictions": status_data.get("restrictions") or {'
+    assert marker in src, "the fallback literal moved -- re-point this test"
+    for key in data["restrictions"]:
+        assert f'"{key}"' in src, (
+            f"job_manager's zeroed restrictions default is missing {key!r}, so "
+            f"GET /crawl/{{id}} returns a different shape than the status file"
+        )
+    for key in data["restrictions"]["robots_readability"]:
+        assert f'"{key}"' in src, f"readability sub-key {key!r} missing from the fallback"
