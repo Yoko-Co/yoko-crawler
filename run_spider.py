@@ -306,6 +306,22 @@ def build_settings(args):
             # case is a convention rather than a guarantee -- `{"impersonate": "chrome"}`
             # with no profile runs 16-wide, where a hung slot costs far less. The pairing is
             # the common case and the worst case, which is what a bound should be sized for.
+            #
+            # AND THE PER-PAGE COST IS NOT THE BOUND. Raising 30s -> 60s is precisely what
+            # lets a page answering in 30-60s SUCCEED, and a successful slow response feeds
+            # AUTOTHROTTLE a latency sample, which backs the slot off toward
+            # AUTOTHROTTLE_MAX_DELAY (30s above). Measured: a server answering a real 200
+            # after 40s gives download_latency 40.0 and slot.delay 30.0, so the real cost on
+            # such a site is ~90s per page, not 60s. At the old 30s bound those responses
+            # timed out, produced no latency sample, and AutoThrottle never moved.
+            #
+            # That backoff is AutoThrottle working as intended -- a server taking 40s is
+            # struggling and slowing down is the polite response, which is the whole point of
+            # the presale profile -- so it is not tuned away here. But the alternative it
+            # replaces is worse, not cheaper: at 30s those pages were recorded as
+            # `unreachable.timeout`, which is a real page reported to a client as a dead one.
+            # A slower honest crawl beats a fast wrong inventory. Noting it because the
+            # budget arithmetic above prices the bound, and the bound is not the whole cost.
             "DOWNLOAD_TIMEOUT": 60,
         }
     )

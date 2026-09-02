@@ -233,3 +233,104 @@ class TestForwardingHasNoSharedState:
         req = Request("https://example.com/", meta={"download_timeout": 0})
         self._mw().process_request(req, spider=None)
         assert "timeout" not in RequestParser(req).as_dict()
+
+
+class TestForwardingActuallyReachesCurl:
+    """#88 review: everything else here stops one layer short of the thing that consumes it.
+
+    `RequestParser(req).as_dict()["timeout"] == 60` asserts the parser EMITS the key. The
+    line that CONSUMES it is `ImpersonateDownloadHandler._download_request`'s
+    `await client.request(**request_args)` -- an undocumented internal of a dependency
+    pinned only `scrapy-impersonate>=1.7,<2`. A 1.9 that whitelists kwargs, moves timeout
+    onto the session, or drops the `request_args.update(impersonate_args)` merge would leave
+    every other test in this file green while production silently went back to curl_cffi's
+    inherited default. That is #88 recurring with no failing test -- this repo's signature
+    failure mode -- so this drives the real handler against a real socket instead.
+
+    Deliberately ~5s, not 60: the assertion is that OUR number is the one curl obeys, which a
+    small value proves faster and just as conclusively.
+    """
+
+    BOUND = 5
+
+    def _black_hole(self):
+        """A socket that accepts connections and never answers. Returns (port, close)."""
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        held = []
+
+        def accept_forever():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    held.append(conn)   # held: a dropped ref closes the socket
+                except OSError:
+                    return
+
+        threading.Thread(target=accept_forever, daemon=True).start()
+
+        def close():
+            srv.close()
+            for c in held:
+                c.close()
+
+        return srv.getsockname()[1], close
+
+    def _elapsed_against_black_hole(self, forward):
+        import asyncio
+        import time
+        from scrapy.http import Request
+        from scrapy_impersonate.parser import RequestParser
+        from curl_cffi.requests import AsyncSession
+
+        port, close = self._black_hole()
+        try:
+            req = Request(f"http://127.0.0.1:{port}/page",
+                          meta={"download_timeout": self.BOUND})
+            if forward:
+                ImpersonateMiddleware("chrome").process_request(req, spider=None)
+            args = RequestParser(req).as_dict()
+            args.pop("impersonate", None)   # no fingerprint needed against a black hole
+
+            async def go():
+                started = time.monotonic()
+                try:
+                    async with AsyncSession(max_clients=1) as client:
+                        await client.request(**args)
+                except Exception:
+                    pass
+                return time.monotonic() - started
+
+            return asyncio.run(go())
+        finally:
+            close()
+
+    def test_curl_obeys_the_forwarded_bound(self):
+        elapsed = self._elapsed_against_black_hole(forward=True)
+        assert elapsed < self.BOUND + 3, (
+            f"curl ran {elapsed:.1f}s against a {self.BOUND}s forwarded bound -- the value "
+            "reaches the parser but is not being honoured by the download path"
+        )
+
+    def test_the_bound_above_is_not_vacuous(self):
+        """The other half: the 5s assertion only means something if curl would otherwise run
+        LONGER. Asserted from curl_cffi's declared default rather than by actually waiting it
+        out -- an un-forwarded black-hole request proves the same thing but costs 30s of
+        wall-clock in a suite that otherwise runs in under three seconds, and a slow suite is
+        a suite people stop running."""
+        import inspect
+        from curl_cffi.requests.session import BaseSession
+        from scrapy.http import Request
+        from scrapy_impersonate.parser import RequestParser
+        curl_default = inspect.signature(BaseSession.__init__).parameters["timeout"].default
+        assert curl_default > self.BOUND + 3, (
+            f"curl_cffi's default ({curl_default}s) is no longer comfortably above our test "
+            f"bound ({self.BOUND}s), so the timing assertion above proves nothing"
+        )
+        # ... and un-forwarded, that default is exactly what the request would fall back to.
+        bare = Request("http://127.0.0.1:1/page", meta={"download_timeout": self.BOUND})
+        assert "timeout" not in RequestParser(bare).as_dict()
