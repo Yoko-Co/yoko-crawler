@@ -595,8 +595,10 @@ class JobManager:
             # reason as `blocking` -- a consumer always sees the same shape, mid-crawl or
             # against an older crawler whose status file predates the field.
             "restrictions": status_data.get("restrictions") or {
+                "robots_root_disallowed": None,
                 "skipped": {
                     "robots_disallowed": 0,
+                    "robots_disallowed_assets": 0,
                     "login_gated": 0,
                     "infra": 0,
                     "facet_capped": 0,

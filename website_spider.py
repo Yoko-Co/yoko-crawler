@@ -281,6 +281,31 @@ class WebsiteSpider(scrapy.Spider):
             self.exclude_params_schedule = base
             self.exclude_params_emit = base
 
+    def _record_robots_scope(self) -> None:
+        """Record whether robots.txt disallows the SITE ROOT for our user-agent group
+        (issue #74 review).
+
+        The skip COUNTER is a poor proxy for "the site withheld itself": it only counts
+        URLs that reached `_schedule`, i.e. ones we found a link to or a sitemap entry for.
+        A site with `Disallow: /` and no `Sitemap:` line yields skips equal to the
+        homepage's link count -- and one whose homepage is a JS shell or carries
+        `meta robots nofollow` yields almost none, which is the most withheld a site can be
+        and the least visible in the count.
+
+        This asks the direct question instead, answered from the rules themselves: does our
+        group's robots.txt disallow the root? It needs no threshold, cannot be fooled by
+        what we did or did not discover, and is exactly the gastro.org shape."""
+        stats = getattr(getattr(self, "crawler", None), "stats", None)
+        if stats is None or self._robots is None:
+            return
+        try:
+            root = urljoin(self.start_urls[0], "/")
+            stats.set_value(
+                "robots_root_disallowed", 1 if self.is_robots_disallowed(root) else 0
+            )
+        except Exception:
+            self.logger.debug("could not record robots scope", exc_info=True)
+
     def _persist_robots_body(self, body: str) -> None:
         """Carry robots.txt across resumable sessions (issue #76). Best-effort: a crawl with
         no JOBDIR has no state to write to, and failing to persist must never break a
@@ -787,6 +812,7 @@ class WebsiteSpider(scrapy.Spider):
                 body = response.text
                 self._robots = Protego.parse(body)
                 self._persist_robots_body(body)
+                self._record_robots_scope()
                 delay = self._robots.crawl_delay(self.ROBOTS_USER_AGENT)
                 if delay:
                     self._apply_crawl_delay(float(delay))
@@ -1207,7 +1233,15 @@ class WebsiteSpider(scrapy.Spider):
         # site marks off-limits. No-op until robots.txt is parsed / for a site without one.
         if self.is_robots_disallowed(normalized):
             self.seen.add(seen_key)
-            self.crawler.stats.inc_value("robots_disallowed_skipped")
+            # Split assets from pages (issue #74 review). A site with
+            # `Disallow: /wp-content/uploads/` and 600 linked PDFs is FULLY inventoried --
+            # counting those files as "pages the site withheld" would tell a client their
+            # complete report was partial, the same lie as gastro.org's in the opposite
+            # direction. Only the page count feeds the withheld-site signal.
+            if self.is_asset_url(normalized):
+                self.crawler.stats.inc_value("robots_disallowed_assets_skipped")
+            else:
+                self.crawler.stats.inc_value("robots_disallowed_skipped")
             self.logger.debug("Skipping robots-disallowed URL: %s", normalized)
             return
 

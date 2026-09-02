@@ -343,8 +343,8 @@ class TestRestrictionsBlock:
             reason="finished",
         )
         assert data["restrictions"]["skipped"] == {
-            "robots_disallowed": 2345, "login_gated": 7, "infra": 3,
-            "facet_capped": 12, "nofollow_links": 4, "meta_nofollow_pages": 1,
+            "robots_disallowed": 2345, "robots_disallowed_assets": 0, "login_gated": 7,
+            "infra": 3, "facet_capped": 12, "nofollow_links": 4, "meta_nofollow_pages": 1,
         }
         assert data["restrictions"]["crawl_delay"] == {
             "applied": 1, "honored_seconds": 10.0, "requested_seconds": 15.0,
@@ -380,6 +380,36 @@ class TestRestrictionsBlock:
              "seeding/start_urls_emitted": 1},
             reason="finished",
         )
-        assert set(data["restrictions"]) == {"skipped", "crawl_delay"}
+        assert set(data["restrictions"]) == {
+            "skipped", "crawl_delay", "robots_root_disallowed"}
+        # Never parsed -> None, NOT False: "we could not read the rules" must stay
+        # distinct from "the rules allow us".
+        assert data["restrictions"]["robots_root_disallowed"] is None
         assert all(v == 0 for v in data["restrictions"]["skipped"].values())
         assert all(v == 0 for v in data["restrictions"]["crawl_delay"].values())
+
+    def test_robots_root_disallowed_is_reported(self, tmp_path):
+        """The discovery-independent signal. A `Disallow: /` site with a thin homepage and
+        no sitemap withholds everything while skipping almost nothing -- the counter can't
+        see that, this can."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 2, "robots_root_disallowed": 1,
+             "robots_disallowed_skipped": 4},
+            reason="finished",
+        )
+        assert data["restrictions"]["robots_root_disallowed"] is True
+
+    def test_assets_are_counted_apart_from_pages(self, tmp_path):
+        """A `Disallow: /wp-content/uploads/` site with 600 linked PDFs is fully
+        inventoried; those files must never read as withheld pages."""
+        data = _write_and_read(
+            tmp_path,
+            {"response_received_count": 40, "robots_root_disallowed": 0,
+             "robots_disallowed_skipped": 0,
+             "robots_disallowed_assets_skipped": 600},
+            reason="finished",
+        )
+        assert data["restrictions"]["skipped"]["robots_disallowed"] == 0
+        assert data["restrictions"]["skipped"]["robots_disallowed_assets"] == 600
+        assert data["restrictions"]["robots_root_disallowed"] is False
