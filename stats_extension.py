@@ -151,6 +151,49 @@ class ProgressWriter:
         raw = self.stats.get_value("robots_root_disallowed", None)
         return None if raw is None else bool(raw)
 
+    def _robots_readability(self):
+        """`{outcome, final_status, waf_wall}` for the robots.txt fetch (issue #97).
+
+        `outcome` is one of:
+          `parsed`     -- we hold rules for this crawl (this session or restored from state)
+          `absent`     -- 404/410, the one status class that genuinely means "no rules"
+          `unreadable` -- a transport failure, a non-200, or a body we could not parse: rules
+                          may exist and we did not see them. THIS is the allow-all we cannot
+                          justify, and the count #97 needs to settle its posture question.
+          `unknown`    -- robots.txt never resolved (the crawl ended first)
+
+        `waf_wall` separates "a WAF would not let us ask" from "the origin said no" via the
+        spider's existing `_is_waf_challenge`; only meaningful when outcome is `unreadable`."""
+        outcome = self.stats.get_value("robots_readability_outcome", None)
+        status = self.stats.get_value("robots_readability_status", None)
+        if not outcome:
+            # Tripwire, same reasoning as the two seeding tripwires above (#52/#76): the
+            # recorder runs on every route out of `parse_robots`, so start URLs emitted with
+            # no outcome recorded means the recorder itself stopped being reached. Reported
+            # as its own value rather than `unknown`, because `unknown` legitimately means
+            # "the crawl ended before robots resolved" and a broken instrument must not hide
+            # inside a legitimate outcome -- that is how #52 went unnoticed for months.
+            emitted = self.stats.get_value("seeding/start_urls_emitted", 0)
+            if emitted:
+                logger.error(
+                    "ROBOTS READABILITY NOT RECORDED: the crawl emitted start URLs but "
+                    "logged no robots.txt readability outcome, so `_record_robots_readability` "
+                    "was not reached on any route out of parse_robots. The allow-all signal "
+                    "for this crawl is missing, not clean -- do not read it as `parsed`. "
+                    "(issue #97)"
+                )
+            outcome = "not_recorded" if emitted else "unknown"
+        return {
+            "outcome": outcome,
+            # None on a transport failure -- there was no response to have a status.
+            "final_status": None if status is None else int(status),
+            # Cloudflare-specific by construction; see `_record_robots_readability`.
+            "cf_wall": bool(self.stats.get_value("robots_readability_cf_wall", False)),
+            # We hold rules from an earlier session even though THIS fetch was refused.
+            "rules_from_state": bool(
+                self.stats.get_value("robots_readability_rules_from_state", False)),
+        }
+
     def _status_counts(self):
         """HTTP status histogram ({"200": n, "403": n, ...}) from Scrapy's built-in
         `downloader/response_status_count/<code>` stats, so the operator can see the response
@@ -279,6 +322,20 @@ class ProgressWriter:
                 # answers the question directly and needs no threshold. None (not False)
                 # when robots.txt was never parsed, so "unknown" stays distinct from "no".
                 "robots_root_disallowed": self._robots_root_disallowed(),
+                # WHY this crawl does or does not hold robots.txt rules (issue #97).
+                #
+                # `robots_root_disallowed` above answers "did the rules say no". This answers
+                # the prior question -- "did we ever READ the rules" -- which had no signal at
+                # all on the most common route. `seeding/robots_failed` only ever fired on a
+                # transport failure; a site that answers 403 or 503 returns an ordinary
+                # response whose body the parser discards, leaving rules unset (allow-all)
+                # and nothing counted. Cloudflare 403s robots.txt routinely, so the existing
+                # tripwire was silently incomplete exactly where it mattered most.
+                #
+                # OBSERVED, not a verdict, per this section's rule -- it changes no crawl
+                # behaviour. Whether `unreadable` should stop a crawl rather than proceed
+                # allow-all is the open posture question in #97.
+                "robots_readability": self._robots_readability(),
                 "skipped": {
                     "robots_disallowed": self.stats.get_value("robots_disallowed_skipped", 0),
                     # Assets (PDFs, images) under a disallowed path are FILES, not withheld
