@@ -2,6 +2,16 @@ import pytest
 from website_spider import WebsiteSpider
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_robots_knobs(monkeypatch):
+    """Both robots knobs are read from the environment at spider construction, so an operator
+    who exports either one turns this file's default-pinning assertions red on their machine
+    (or on the droplet) for reasons that have nothing to do with the code (#92 review). Tests
+    that WANT an override still setenv it explicitly -- this only clears the ambient shell."""
+    monkeypatch.delenv("YOKO_CRAWL_ROBOTS_TIMEOUT", raising=False)
+    monkeypatch.delenv("YOKO_CRAWL_MAX_ROBOTS_DELAY", raising=False)
+
+
 @pytest.fixture
 def spider():
     return WebsiteSpider(domain="example.com")
@@ -3338,6 +3348,8 @@ class TestRobotsTimeoutOverride:
         assert s.robots_download_timeout == WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT
         assert "IGNORED" in caplog.text
         assert "allow-all" in caplog.text, "the log must say WHY, not just that it clamped"
+        assert "'5'" in caplog.text, \
+            "the log must echo what the operator SET, not just the parsed value"
 
     def test_zero_and_negative_cannot_disable_the_bound(self, monkeypatch):
         """`0` reads as "no timeout" in several libraries; here it must not disable the gate."""
@@ -3347,13 +3359,60 @@ class TestRobotsTimeoutOverride:
                 WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT, raw
 
     def test_junk_falls_back_loudly_rather_than_crashing_the_crawl(self, monkeypatch, caplog):
+        """LOUDLY is half the contract, and the half a mutation proved untested: deleting the
+        warning entirely left this green (#92 review). The non-finite spellings are the other
+        half -- `int(float("inf"))` raises OverflowError, NOT ValueError, so it escaped the
+        original except clause and killed spider construction. `nan` was the one non-finite
+        value here that happens to raise ValueError, which is exactly why its presence gave
+        false confidence that this class was covered."""
         import logging
-        for raw in ("", "  ", "abc", "60s", "nan"):
+        for raw in ("", "  ", "abc", "60s", "nan", "inf", "-inf", "Infinity", "1e400"):
             monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", raw)
+            caplog.clear()
             with caplog.at_level(logging.WARNING):
                 s = self._spider()
             assert s.robots_download_timeout == \
                 WebsiteSpider.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT, raw
+            assert "not a usable number" in caplog.text, raw
+            assert repr(raw) in caplog.text, \
+                f"the operator must see what they actually set, not a parsed value: {raw!r}"
+
+    def test_exactly_the_floor_passes_silently(self, monkeypatch, caplog):
+        """The floor's own boundary. `<` vs `<=` here survived mutation (#92 review): 60 is a
+        legitimate value, not a refusal, and it must not warn about being clamped."""
+        import logging
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "60")
+        with caplog.at_level(logging.WARNING):
+            s = self._spider()
+        assert s.robots_download_timeout == 60
+        assert "IGNORED" not in caplog.text
+        assert "CLAMPED" not in caplog.text
+
+    def test_an_unbounded_raise_is_clamped_at_the_ceiling(self, monkeypatch, caplog):
+        """The raise direction needs a bound too. robots.txt is the crawl's only seed, so a
+        fat-fingered value (ms instead of s) stalls seeding past job_manager's 7500s watchdog,
+        which SIGKILLs into `failed` with a null failure_reason -- worse than the allow-all the
+        floor prevents. Two reviewers reached this independently (#92 review)."""
+        import logging
+        from website_spider import _ROBOTS_TIMEOUT_CEILING
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "60000")
+        with caplog.at_level(logging.WARNING):
+            s = self._spider()
+        assert s.robots_download_timeout == _ROBOTS_TIMEOUT_CEILING
+        assert "CLAMPED" in caplog.text
+        assert "watchdog" in caplog.text, "the log must say what the ceiling protects"
+        seed = next(iter(s._seed_requests()))
+        assert seed.meta["download_timeout"] == _ROBOTS_TIMEOUT_CEILING
+
+    def test_the_floor_cannot_be_shadowed_by_a_spider_argument(self, monkeypatch):
+        """Scrapy assigns `-a` arguments into `self.__dict__`, so a floor read off the instance
+        was defeatable: `-a DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT=1` honoured a 5s budget in review.
+        The bounds are module constants for exactly this reason -- this test is the reason."""
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "5")
+        s = WebsiteSpider(domain="example.com", DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT=1)
+        assert s.DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT == 1, "the shadow itself still lands"
+        assert s.robots_download_timeout == 60, "but it must not reach the floor"
+        assert s._robots_budget_meta()["download_timeout"] == 60
 
     def test_a_float_string_is_accepted_as_a_whole_number_of_seconds(self, monkeypatch):
         monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "90.5")

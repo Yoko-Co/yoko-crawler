@@ -286,7 +286,9 @@ def build_settings(args):
             #
             # 60s is a JUDGEMENT CALL, and the honest version of the reasoning is that it
             # has no measured backing. There is no WAF page-latency data anywhere in this
-            # repo; 60s is curl_cffi's 30s doubled, and it matches ROBOTS_DOWNLOAD_TIMEOUT,
+            # repo; 60s is curl_cffi's 30s doubled, and it matches the robots budget's
+            # DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT -- a coincidence that YOKO_CRAWL_ROBOTS_TIMEOUT
+            # (#92) can now end, since it raises the robots side only,
             # which was itself sized for a 1KB text file rather than a page. #82 deferred
             # this exact call to #88 and #88 is answering it by analogy. Revisit it the first
             # time a real crawl produces `unreachable.timeout` rows for pages that later
