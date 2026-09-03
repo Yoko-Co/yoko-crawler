@@ -1455,8 +1455,12 @@ class WebsiteSpider(scrapy.Spider):
 
             self._stat(f"seeding/robots_{outcome}")
             if outcome == "unreadable":
+                # `_unattributed`, NOT `_origin`. Coverage is partial by construction, so a
+                # null vendor covers both "the origin refused us" and "an Imperva or Akamai
+                # wall we cannot yet recognise" -- counting those as origin refusals asserts
+                # exactly the fact the docstring says this field must not claim (#100 review).
                 self._stat(f"seeding/robots_unreadable_{edge_wall}" if edge_wall
-                           else "seeding/robots_unreadable_origin")
+                           else "seeding/robots_unreadable_unattributed")
                 self.logger.warning(
                     "robots.txt was NOT READ (HTTP %s%s) -- proceeding allow-all%s. This is "
                     "not the same as a site with no robots.txt: rules may exist and we could "
@@ -1926,12 +1930,25 @@ class WebsiteSpider(scrapy.Spider):
     # whole job is to say "the site refused us". Extending coverage needs REAL captured headers
     # from walled sites rather than more remembered ones (#108).
     _EDGE_GENERATED_SIGNALS = (
-        # Sucuri stamps this on its own block page; the name is the claim.
+        # Sucuri stamps this on its own block page, and the name is the claim: it appears
+        # only on blocks (its values are Sucuri reason codes like GEO02/IPB17), unlike
+        # `x-sucuri-id`/`x-sucuri-cache`, which ride ordinary 200s. Verified in review against
+        # a real header corpus rather than from memory -- which matters, because an earlier
+        # version of this list contained `x-cdn-forward-err`, a header that DOES NOT EXIST.
         ("sucuri", ("x-sucuri-block",)),
-        # AWS WAF's action header. NOT `x-amzn-errortype`, which API Gateway sets on its own
-        # application errors -- that is the origin talking, and it was being read as a wall.
-        ("aws", ("x-amzn-waf-action",)),
     )
+    # AWS is deliberately absent, and this is the more interesting omission. `x-amzn-waf-action`
+    # is real and is authorship evidence -- but AWS WAF emits it at status 202 (challenge) and
+    # 405 (captcha), neither of which is in WAF_CHALLENGE_STATUSES, so the branch could never
+    # fire. It shipped in the first cut as coverage that was actually dead, with a test asserting
+    # a 403/"block" pair AWS never sends (#100 review).
+    #
+    # Widening the status set is not the fix: WAF_CHALLENGE_STATUSES also gates
+    # `_is_waf_challenge`, and moving that changes `waf_challenge_count` and therefore the
+    # corpus retry -- the behaviour #107 exists to decide separately. So AWS waits for a real
+    # captured response to confirm the status/value pairs (#108). A vendor absent from this
+    # list reports null and is honest; a vendor present but unreachable is a lie that reads as
+    # coverage.
 
     def _edge_wall_vendor(self, response):
         """Which edge vendor refused us, or None when we cannot prove one did (issue #100).
