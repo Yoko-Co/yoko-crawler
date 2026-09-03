@@ -3853,24 +3853,37 @@ class TestEdgeWallVocabularyIsPinned:
             f"unrecognised -- add it to _EDGE_WALL_VENDORS there first"
         )
 
-    def test_documentation_names_exactly_what_can_be_emitted(self):
-        """AGENTS.md listed `aws` for one commit after the branch became unreachable."""
+    def test_both_documents_name_exactly_what_can_be_emitted(self):
+        """AGENTS.md listed `aws` for one commit after the branch became unreachable, and
+        `stats_extension`'s comment listed all SIX original vendors for two commits after the
+        code emitted three -- while a commit message claimed this test already covered both.
+        It did not. Covering one document and saying you covered two is the same defect as
+        the stale list itself."""
+        import os
         import re
         from pathlib import Path
         from website_spider import WebsiteSpider as W
         emitted = {vendor for vendor, _ in W._EDGE_GENERATED_SIGNALS} | {"cloudflare"}
-        import os
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        agents = (Path(root) / "AGENTS.md").read_text()
-        sentence = re.search(r"`edge_wall` names WHICH edge refused us[^.]*\.", agents)
-        assert sentence, "the edge_wall sentence moved -- re-point this test"
-        for vendor in emitted:
-            assert f"`{vendor}`" in sentence.group(0), f"{vendor} is emitted but undocumented"
-        for absent in ("aws", "imperva", "akamai", "fastly"):
-            if absent not in emitted:
-                assert f"`{absent}`" not in sentence.group(0), (
-                    f"AGENTS.md still lists {absent!r} as an emitted vendor; it is not"
-                )
+        root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        never = {"aws", "imperva", "akamai", "fastly"} - emitted
+
+        regions = {
+            "AGENTS.md": re.search(
+                r"`edge_wall` names WHICH edge refused us[^.]*\.",
+                (root / "AGENTS.md").read_text()),
+            "stats_extension.py": re.search(
+                r"# WHICH edge vendor refused us.*?\n(?:\s*#.*\n)*",
+                (root / "stats_extension.py").read_text()),
+        }
+        for where, found in regions.items():
+            assert found, f"the edge_wall description moved in {where} -- re-point this test"
+            text = found.group(0)
+            for vendor in emitted:
+                assert f'"{vendor}"' in text or f"`{vendor}`" in text, (
+                    f"{vendor!r} is emitted but not named in {where}")
+            for absent in never:
+                assert f'"{absent}"' not in text and f"`{absent}`" not in text, (
+                    f"{where} still lists {absent!r} as an emitted vendor; it is not")
 
     def test_a_broken_detector_degrades_to_no_wall_rather_than_raising(self):
         """`_edge_wall_vendor` wraps `_is_waf_challenge`; a raise there must not become a
