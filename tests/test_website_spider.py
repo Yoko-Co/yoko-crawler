@@ -3595,18 +3595,19 @@ class TestKnobStatsAreObservable:
     THEN `_set_crawler`, so a stat written from `__init__` is dropped in silence. Verified
     directly below, because the whole shape of this change depends on it."""
 
-    def _spider(self, **env):
-        import types
-        s = WebsiteSpider(domain="example.com")
-        s.crawler = types.SimpleNamespace(stats=_FakeStats())
-        return s
-
     def test_a_stat_written_during_init_would_be_lost(self):
-        """The premise. If this ever stops being true, `_publish_knob_stats` is redundant --
-        but while it IS true, resolving in __init__ and publishing there would be silent."""
+        """The PREMISE of publishing from the seeding funnel rather than `__init__`. Asserts
+        the consequence, not just the attribute's absence: a `_stat` call during construction
+        must actually vanish. If Scrapy ever attaches the crawler earlier, this fails and the
+        indirection becomes removable rather than mysterious."""
         s = WebsiteSpider(domain="example.com")
-        assert not hasattr(s, "crawler"), (
-            "Scrapy attaches the crawler after __init__; a stat written there goes nowhere"
+        assert not hasattr(s, "crawler")
+        s._stat("proof/it_vanishes")            # the real helper, on a real fresh spider
+        import types
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        assert "proof/it_vanishes" not in s.crawler.stats.values, (
+            "a stat written before the crawler is attached is silently dropped -- which is "
+            "why the knobs are resolved in __init__ but published from _seed_requests"
         )
 
     def _published(self, monkeypatch, **env):

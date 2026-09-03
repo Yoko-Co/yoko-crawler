@@ -1227,9 +1227,10 @@ class WebsiteSpider(scrapy.Spider):
         that definitely has a crawler and runs exactly once per session, so it is where the
         values become observable.
 
-        Until now the ONLY record of which budget was in force was a log line, in the Scrapy
-        log of a hand-managed droplet -- for the exact scenario the knob exists to serve, a
-        slow crawl an operator is debugging. The sibling crawl-delay knob has surfaced its
+        Until now the record of which budget was in force was a log line, in the Scrapy log
+        of a hand-managed droplet -- for the exact scenario the knob exists to serve, a slow
+        crawl an operator is debugging. For the delay cap's invalid case there was no record
+        at ALL: it falls back silently, so an unparseable value left no trace anywhere. The sibling crawl-delay knob has surfaced its
         applied/honored/requested values in `restrictions` since #74; this brings the pair
         into line rather than inventing a convention."""
         stats = getattr(getattr(self, "crawler", None), "stats", None)
