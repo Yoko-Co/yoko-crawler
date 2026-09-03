@@ -290,8 +290,15 @@ class ProgressWriter:
             "outcome": outcome,
             # None on a transport failure -- there was no response to have a status.
             "final_status": None if status is None else int(status),
-            # Cloudflare-specific by construction; see `_record_robots_readability`.
-            "cf_wall": bool(self.stats.get_value("robots_readability_cf_wall", False)),
+            # WHICH edge vendor refused us -- "cloudflare" or "sucuri" -- or None meaning NO
+            # PROOF an edge refused us, which is NOT the same as "the origin refused us"
+            # (#100). Coverage is partial by construction: a vendor is named only on evidence
+            # the edge AUTHORED the response, so an Imperva or Akamai wall reads as None too.
+            #
+            # This list is pinned by a test against `_EDGE_GENERATED_SIGNALS` and AGENTS.md,
+            # because it has already gone stale twice while the suite stayed green -- once
+            # listing all six of the original vendors after the code emitted three.
+            "edge_wall": self.stats.get_value("robots_readability_edge_wall", None) or None,
             # We hold rules from an earlier session even though THIS fetch was refused.
             "rules_from_state": bool(
                 self.stats.get_value("robots_readability_rules_from_state", False)),

@@ -675,7 +675,7 @@ class JobManager:
                 "robots_readability": {
                     "outcome": "unknown",
                     "final_status": None,
-                    "cf_wall": False,
+                    "edge_wall": None,
                     "rules_from_state": False,
                 },
                 # Operator knobs (#99), same lockstep rule as the block above -- a test pins

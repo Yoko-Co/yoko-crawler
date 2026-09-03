@@ -397,7 +397,7 @@ class TestRestrictionsBlock:
                 "effective": None, "requested": None, "disposition": "unknown"},
         }
         assert data["restrictions"]["robots_readability"] == {
-            "outcome": "parsed", "final_status": 200, "cf_wall": False,
+            "outcome": "parsed", "final_status": 200, "edge_wall": None,
             "rules_from_state": False}
         # Never parsed -> None, NOT False: "we could not read the rules" must stay
         # distinct from "the rules allow us".
@@ -474,12 +474,12 @@ class TestRobotsReadabilityReporting:
              "seeding/start_urls_emitted": 1,
              "robots_readability_outcome": "unreadable",
              "robots_readability_status": 403,
-             "robots_readability_cf_wall": True,
+             "robots_readability_edge_wall": "cloudflare",
              "robots_readability_rules_from_state": False},
             reason="finished",
         )
         assert data["restrictions"]["robots_readability"] == {
-            "outcome": "unreadable", "final_status": 403, "cf_wall": True,
+            "outcome": "unreadable", "final_status": 403, "edge_wall": "cloudflare",
             "rules_from_state": False}
 
     def test_a_parsed_crawl_reaches_the_status_file_intact(self, tmp_path):
@@ -561,6 +561,23 @@ def test_job_manager_restrictions_default_matches_the_status_file_shape(tmp_path
         "job_manager's zeroed restrictions default and the status file's disagree, so "
         "GET /crawl/{id} returns a different shape depending on which produced it"
     )
+
+    # ...and the VALUES must actually be zeroed. Comparing shapes alone collapses every leaf
+    # to None, so corrupting the fallback's `edge_wall` to "cloudflare" -- inventing an edge
+    # refusal for a crawl that never ran -- left the whole suite green (#100 review). A
+    # fallback that asserts a fact is worse than one that omits the key.
+    def leaves(node, path=""):
+        for key, value in node.items():
+            if isinstance(value, dict):
+                yield from leaves(value, f"{path}{key}.")
+            else:
+                yield f"{path}{key}", value
+
+    for path, value in leaves(fallback):
+        assert value in (0, 0.0, None, False, "unknown"), (
+            f"job_manager's zeroed default asserts {path}={value!r} for a crawl that has not "
+            f"reported anything -- it must be empty, not a claim"
+        )
 
 
 

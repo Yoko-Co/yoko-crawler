@@ -3496,17 +3496,116 @@ class TestRobotsReadability:
             s = self._drive(self._robots_response(status=status, body=b"busy"))
             assert s.crawler.stats.values["robots_readability_outcome"] == "unreadable", status
 
-    def test_a_cloudflare_wall_is_separated_from_an_origin_refusal(self):
-        """The distinction #97's posture call turns on: "a WAF would not let us ask" is not
-        "the site said no". Reuses the spider's existing `_is_waf_challenge`."""
+    def test_an_edge_wall_is_separated_from_an_origin_refusal(self):
+        """The distinction #97's posture call turns on: "an edge would not let us ask" is not
+        "the site said no". #97 could only recognise Cloudflare, so every other vendor's wall
+        was filed as an origin refusal -- biasing the field in the same direction as the two
+        under-counts review found there (#100)."""
         wall = self._drive(self._robots_response(
             status=403, body=b"blocked", headers={"cf-mitigated": "challenge"}))
-        assert wall.crawler.stats.values["robots_readability_cf_wall"] is True
-        assert wall.crawler.stats.values.get("seeding/robots_unreadable_cf") == 1
+        assert wall.crawler.stats.values["robots_readability_edge_wall"] == "cloudflare"
+        assert wall.crawler.stats.values.get("seeding/robots_unreadable_cloudflare") == 1
 
         origin = self._drive(self._robots_response(status=403, body=b"Forbidden"))
-        assert origin.crawler.stats.values["robots_readability_cf_wall"] is False
-        assert origin.crawler.stats.values.get("seeding/robots_unreadable_not_cf") == 1
+        assert origin.crawler.stats.values["robots_readability_edge_wall"] is None
+        assert origin.crawler.stats.values.get(
+            "seeding/robots_unreadable_unattributed") == 1
+
+    def test_the_vendors_we_can_PROVE_are_recognised(self):
+        """Only evidence that the EDGE authored the response counts. Coverage is partial by
+        construction (#100 review) -- see the negative test below for what that costs."""
+        cases = {
+            "sucuri": {"x-sucuri-block": "GEO02"},
+            "cloudflare": {"cf-mitigated": "challenge"},
+        }
+        for vendor, headers in cases.items():
+            s = self._drive(self._robots_response(
+                status=403, body=b"blocked", headers=headers))
+            assert s.crawler.stats.values["robots_readability_edge_wall"] == vendor, headers
+            assert s.crawler.stats.values.get(
+                f"seeding/robots_unreadable_{vendor}") == 1, vendor
+
+    def test_being_behind_a_cdn_is_not_evidence_that_the_cdn_refused_us(self):
+        """THE finding this was redesigned around. A FRONTING header rides on every response
+        the vendor proxies, so matching it claimed a wall on the huge population of "site
+        behind a big CDN, challenge status" -- a 503 outage behind CloudFront, API Gateway's
+        own 403, any CDN sending `x-cdn`. That inflates the bucket feeding #97's and #107's
+        decisions, in the direction that argues FOR acting.
+
+        `None` here means "no proof an edge refused us", NOT "the origin refused us"."""
+        for headers in (
+            {"Server": "awselb/2.0"},                          # ALB, no WAF action
+            {"Server": "cloudfront", "x-amzn-cf-id": "abc"},   # CloudFront outage
+            {"x-amzn-errortype": "AccessDeniedException"},     # API Gateway's OWN 403
+            {"x-cdn": "Incapsula"},                            # sent by 4+ vendors
+            {"x-amzn-waf-action": "block"},                    # real header, unreachable status
+            {"Set-Cookie": "AWSALB=abc; path=/", "cf-ray": "x"},   # stickiness, not a wall
+            {"Set-Cookie": "visid_incap_1=x; path=/", "x-iinfo": "9-1-2"},
+            {"x-sucuri-id": "17023"},                          # Sucuri FRONTING, not a block
+            {"x-sucuri-id": "17023", "Server": "Sucuri/Cloudproxy"},
+            {"x-iinfo": "9-1-2"},                              # fronting only
+            {"Server": "AkamaiGHost"},                         # fronting only
+            {"fastly-restarts": "1", "Server": "Fastly"},
+            {"cf-ray": "abc"},                                 # CF-fronted, no CF verdict
+        ):
+            for status in (403, 503):
+                s = self._drive(self._robots_response(
+                    status=status, body=b"nope", headers=headers))
+                assert s.crawler.stats.values["robots_readability_edge_wall"] is None, \
+                    (headers, status)
+
+    def test_cloudflare_delegates_rather_than_reimplementing(self):
+        """The first cut duplicated the Cloudflare check with `or` where the original uses
+        `and`, so the two disagreed about Cloudflare. One answer, one place."""
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        for headers in (
+            {"cf-mitigated": "challenge"},
+            {"cf-ray": "abc", "Server": "cloudflare"},
+            {"cf-ray": "abc", "Server": "cloudflare", "x-powered-by": "PHP/8.2"},
+            {"cf-ray": "abc"},
+            {"Server": "cloudflare"},
+        ):
+            r = Response(url="https://example.com/x", status=403, body=b"b",
+                         headers=headers, request=Request("https://example.com/x"))
+            assert (s._edge_wall_vendor(r) == "cloudflare") is s._is_waf_challenge(r), headers
+
+    def test_a_generated_signal_beats_an_origin_fingerprint(self):
+        """A header the edge stamps only on responses IT produced is decisive -- an origin
+        header alongside it is the proxied upstream's, not evidence the origin wrote THIS."""
+        s = self._drive(self._robots_response(
+            status=403, body=b"blocked",
+            headers={"x-sucuri-block": "IPB17", "x-powered-by": "PHP/8.2"}))
+        assert s.crawler.stats.values["robots_readability_edge_wall"] == "sucuri"
+
+    def test_a_non_challenge_status_is_never_a_wall(self):
+        """Uses a GENERATED header, not a Cloudflare one: the Cloudflare path delegates to
+        `_is_waf_challenge`, which re-checks the status itself, so removing this gate stayed
+        green when the test only exercised that branch (#100 review)."""
+        for status in (200, 404, 500):
+            for headers in ({"x-sucuri-block": "GEO02"}, {"cf-mitigated": "challenge"}):
+                s = self._drive(self._robots_response(
+                    status=status, body=b"x", headers=headers))
+                assert s.crawler.stats.values.get(
+                    "robots_readability_edge_wall") is None, (status, headers)
+
+    def test_the_retry_trigger_is_deliberately_untouched(self):
+        """`_is_waf_challenge` drives `waf_challenge_count`, which yoko-corpus uses to fire an
+        impersonation/proxy retry. Widening it would change client crawl BEHAVIOUR, not just a
+        measurement, so #100 leaves it Cloudflare-only on purpose. This pins that split so a
+        later edit cannot merge them without noticing."""
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        sucuri = Response(
+            url="https://example.com/x", status=403, body=b"blocked",
+            headers={"x-sucuri-block": "GEO02"},
+            request=Request("https://example.com/x"))
+        assert s._edge_wall_vendor(sucuri) == "sucuri"
+        assert s._is_waf_challenge(sucuri) is False, (
+            "widening the retry trigger is a separate, behaviour-changing decision"
+        )
 
     def test_a_200_we_could_not_parse_is_unreadable_not_parsed(self):
         """`parsed` must mean rules we HOLD, not merely a 200. A binary body reaches the
@@ -3732,3 +3831,67 @@ class TestKnobStatsAreObservable:
     def test_publishing_tolerates_a_spider_with_no_crawler(self):
         """Never the thing that breaks a crawl."""
         WebsiteSpider(domain="example.com")._publish_knob_stats()
+
+
+class TestEdgeWallVocabularyIsPinned:
+    """The vendor list shrank from six to three to two across two review rounds, and each time
+    `stats_extension`, AGENTS.md and the corpus's accepted set were left behind with the suite
+    green (#100 review). The repo already pins its other cross-service vocabularies; this is
+    the same discipline applied to a list that has now drifted twice."""
+
+    def test_the_crawler_emits_only_vendors_the_corpus_trusts(self):
+        """A crawler-side vendor the corpus does not accept reads as NO WALL there -- so
+        adding one here without the corpus is a silent loss, not an error."""
+        from website_spider import WebsiteSpider as W
+        emitted = {vendor for vendor, _ in W._EDGE_GENERATED_SIGNALS} | {"cloudflare"}
+        # Mirrors corpus `analysis/summary.py::_EDGE_WALL_VENDORS`. Kept as a literal rather
+        # than imported: two independently deployed services, so this is a WIRE contract, and
+        # a shared import would hide exactly the skew it needs to surface.
+        corpus_trusts = {"cloudflare", "sucuri", "aws"}
+        assert emitted <= corpus_trusts, (
+            f"crawler emits {sorted(emitted - corpus_trusts)}, which the corpus discards as "
+            f"unrecognised -- add it to _EDGE_WALL_VENDORS there first"
+        )
+
+    def test_both_documents_name_exactly_what_can_be_emitted(self):
+        """AGENTS.md listed `aws` for one commit after the branch became unreachable, and
+        `stats_extension`'s comment listed all SIX original vendors for two commits after the
+        code emitted three -- while a commit message claimed this test already covered both.
+        It did not. Covering one document and saying you covered two is the same defect as
+        the stale list itself."""
+        import os
+        import re
+        from pathlib import Path
+        from website_spider import WebsiteSpider as W
+        emitted = {vendor for vendor, _ in W._EDGE_GENERATED_SIGNALS} | {"cloudflare"}
+        root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        never = {"aws", "imperva", "akamai", "fastly"} - emitted
+
+        regions = {
+            "AGENTS.md": re.search(
+                r"`edge_wall` names WHICH edge refused us[^.]*\.",
+                (root / "AGENTS.md").read_text()),
+            "stats_extension.py": re.search(
+                r"# WHICH edge vendor refused us.*?\n(?:\s*#.*\n)*",
+                (root / "stats_extension.py").read_text()),
+        }
+        for where, found in regions.items():
+            assert found, f"the edge_wall description moved in {where} -- re-point this test"
+            text = found.group(0)
+            for vendor in emitted:
+                assert f'"{vendor}"' in text or f"`{vendor}`" in text, (
+                    f"{vendor!r} is emitted but not named in {where}")
+            for absent in never:
+                assert f'"{absent}"' not in text and f"`{absent}`" not in text, (
+                    f"{where} still lists {absent!r} as an emitted vendor; it is not")
+
+    def test_a_broken_detector_degrades_to_no_wall_rather_than_raising(self):
+        """`_edge_wall_vendor` wraps `_is_waf_challenge`; a raise there must not become a
+        seeding failure, and must not be mistaken for a proven origin refusal either."""
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        s._is_waf_challenge = lambda response: 1 / 0
+        r = Response(url="https://example.com/robots.txt", status=403, body=b"x",
+                     request=Request("https://example.com/robots.txt"))
+        assert s._edge_wall_vendor(r) is None
