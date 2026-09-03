@@ -15,6 +15,7 @@ from content_extractor import (
     content_hash,
     component_signals,
     count_structure,
+    nav_signals,
     embed_signals,
     empty_enrichment,
     extract_content,
@@ -1047,6 +1048,11 @@ class WebsiteSpider(scrapy.Spider):
             else "honoured"
         return requested
 
+    def _emit_normalize(self, url: str) -> str:
+        """The row's own URL form, for edge endpoints (#111 review). One definition of a page
+        identity, so the graph's endpoints and the `url` column cannot drift apart."""
+        return self.normalize_url(url, exclude_params=self.exclude_params_emit)
+
     def _robots_budget_meta(self):
         """Bound the robots.txt fetch on BOTH download paths -- they honour different keys.
 
@@ -2035,11 +2041,14 @@ class WebsiteSpider(scrapy.Spider):
         if is_html_page:
             try:
                 result = extract_content(response.body)
+                # `_emit_normalize` puts every edge endpoint in the same form as the row's
+                # own `url`, so the corpus can actually join the graph (#111 review).
                 counts = count_structure(
                     result.subtree,
                     response.url,
                     is_internal=self.is_same_site,
                     asset_extensions=self.ASSET_EXTENSIONS,
+                    normalize=self._emit_normalize,
                 )
                 # Embeds are page-wide: surprising iframes live in headers,
                 # footers, and sidebars, not just the main content region.
@@ -2051,6 +2060,13 @@ class WebsiteSpider(scrapy.Spider):
                 )
                 # Interactive JS components are page-wide too (issue #12); image sliders/
                 # carousels are the slider subset of that, counted page-wide (issue #25).
+                # Nav links are page-wide AND pre-de-chrome (issue #111): the content
+                # subtree has had exactly these stripped, which is why nav membership was
+                # unanswerable. body_subtree is the full body, same as the signals above.
+                nav = nav_signals(
+                    result.body_subtree, response.url, is_internal=self.is_same_site,
+                    normalize=self._emit_normalize,
+                )
                 components = component_signals(result.body_subtree)
                 sliders = slider_signals(result.body_subtree)
                 fields = empty_enrichment()
@@ -2069,6 +2085,8 @@ class WebsiteSpider(scrapy.Spider):
                 fields["iframe_hosts"] = signals["iframe_hosts"]
                 fields["script_embed_count_nonbenign"] = scripts["script_embed_count_nonbenign"]
                 fields["script_hosts"] = scripts["script_hosts"]
+                fields["nav_link_targets"] = nav["nav_link_targets"]
+                fields["nav_link_targets_total"] = nav["nav_link_targets_total"]
                 content_text = result.normalized_text
             except Exception:
                 # Never let one bad page drop the row (and its original five
@@ -2099,6 +2117,10 @@ class WebsiteSpider(scrapy.Spider):
             fields["iframe_hosts"] = json.dumps(fields["iframe_hosts"])
             fields["script_hosts"] = json.dumps(fields["script_hosts"])
             fields["internal_link_targets"] = json.dumps(fields["internal_link_targets"])
+            # Was MISSING while all four peers had it (#111 review): in CSV output the list
+            # rendered as a Python repr, so the one format a human opens in a spreadsheet
+            # carried a different encoding from every sibling field.
+            fields["nav_link_targets"] = json.dumps(fields["nav_link_targets"])
             fields["external_link_hosts"] = json.dumps(fields["external_link_hosts"])
 
         # content_text is the one conditional field: present only with
