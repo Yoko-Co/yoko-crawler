@@ -8,6 +8,7 @@ from lxml import html as lxml_html
 
 import content_extractor as ce
 from content_extractor import (
+    nav_signals,
     ExtractionResult,
     content_hash,
     count_structure,
@@ -1554,3 +1555,130 @@ class TestExternalLinkHosts:
             "</body>"
         )
         assert set(c["external_link_hosts"]) == {"members.example.com", "www.facebook.com"}
+
+
+class TestEdgeListTruncationIsLegible:
+    """#111. The per-page cap was SILENT, and a consumer cannot recover the fact:
+    `internal_link_count` counts link INSTANCES while `internal_link_targets` holds DISTINCT
+    ones, so 250 links / 100 targets is byte-identical whether the page links to 250 distinct
+    pages (150 edges lost) or 250 times to 100 pages (complete). Inbound counts built on the
+    capped list are short by an unknown amount -- the failure corpus#45's graph inherits."""
+
+    def _counts(self, links_html):
+        subtree = lxml_html.fromstring(f"<div><p>words</p>{links_html}</div>")
+        return count_structure(
+            subtree, PAGE_URL, is_internal=_internal, asset_extensions=ASSET_EXTS
+        )
+
+    def test_an_uncapped_page_reports_a_total_matching_its_list(self):
+        c = self._counts("".join(f'<a href="/p{i}">x</a>' for i in range(5)))
+        assert len(c["internal_link_targets"]) == 5
+        assert c["internal_link_targets_total"] == 5
+
+    def test_a_capped_page_reports_the_REAL_distinct_total(self):
+        c = self._counts("".join(f'<a href="/p{i}">x</a>' for i in range(250)))
+        assert len(c["internal_link_targets"]) == 100, "the list is still capped"
+        assert c["internal_link_targets_total"] == 250, (
+            "the total must survive the cap, or the consumer cannot tell it was truncated"
+        )
+
+    def test_the_two_ambiguous_shapes_are_now_distinguishable(self):
+        """The whole point. These produced identical rows before."""
+        truncated = self._counts("".join(f'<a href="/p{i}">x</a>' for i in range(250)))
+        complete = self._counts("".join(f'<a href="/p{i % 100}">x</a>' for i in range(250)))
+        assert truncated["internal_link_count"] == complete["internal_link_count"] == 250
+        assert len(truncated["internal_link_targets"]) == \
+            len(complete["internal_link_targets"]) == 100
+        assert truncated["internal_link_targets_total"] == 250
+        assert complete["internal_link_targets_total"] == 100, (
+            "a page linking 250 times to 100 pages is COMPLETE, not truncated"
+        )
+
+    def test_repeats_do_not_inflate_the_total(self):
+        c = self._counts('<a href="/a">x</a>' * 40)
+        assert c["internal_link_targets_total"] == 1
+
+    def test_own_page_anchors_are_not_edges(self):
+        c = self._counts(f'<a href="{PAGE_URL}#sec">x</a><a href="#top">x</a>')
+        assert c["internal_link_targets_total"] == 0
+
+
+class TestNavSignals:
+    """#111. Site nav is de-chromed before the content counts by design -- otherwise every
+    page's counts are dominated by the same menu. The cost was that nav membership, one of
+    the two strongest promotion signals corpus#45 needs, became unanswerable."""
+
+    def _nav(self, body_html, page_url=PAGE_URL):
+        # The trailing <p> keeps lxml from collapsing the wrapper to its only child: with a
+        # single <nav> inside, `fromstring` returns the <nav> AS the root, and `.//nav` is a
+        # descendant axis that then matches nothing. Production always passes the real
+        # <body>, which has siblings -- this is a fixture artefact, not a shape the spider
+        # can produce, so the fixture is what gets fixed.
+        subtree = lxml_html.fromstring(f"<body>{body_html}<p>x</p></body>")
+        return nav_signals(subtree, page_url, is_internal=_internal)
+
+    def test_it_sees_what_the_content_counts_deliberately_discard(self):
+        html = '<nav><a href="/about">About</a><a href="/work">Work</a></nav><main><p>hi</p></main>'
+        nav = self._nav(html)
+        assert sorted(t.rsplit("/", 1)[-1] for t in nav["nav_link_targets"]) == ["about", "work"]
+        # And the content counts still exclude them -- this must ADD a signal, not move one.
+        counts = count_structure(
+            lxml_html.fromstring("<main><p>hi</p></main>"), PAGE_URL,
+            is_internal=_internal, asset_extensions=ASSET_EXTS,
+        )
+        assert counts["internal_link_targets"] == []
+
+    def test_role_navigation_counts_too(self):
+        nav = self._nav('<div role="navigation"><a href="/about">About</a></div>')
+        assert len(nav["nav_link_targets"]) == 1
+
+    def test_a_page_with_no_nav_reports_empty_not_missing(self):
+        nav = self._nav("<main><p>hi</p><a href='/x'>x</a></main>")
+        assert nav["nav_link_targets"] == [] and nav["nav_link_targets_total"] == 0
+
+    def test_external_nav_links_are_not_internal_edges(self):
+        nav = self._nav('<nav><a href="https://other.org/x">x</a><a href="/in">in</a></nav>')
+        assert len(nav["nav_link_targets"]) == 1
+
+    def test_the_page_itself_is_not_its_own_nav_edge(self):
+        nav = self._nav(f'<nav><a href="{PAGE_URL}">self</a><a href="/o">o</a></nav>')
+        assert len(nav["nav_link_targets"]) == 1
+
+    def test_it_carries_the_same_truncation_discipline(self):
+        links = "".join(f'<a href="/n{i}">x</a>' for i in range(250))
+        nav = self._nav(f"<nav>{links}</nav>")
+        assert len(nav["nav_link_targets"]) == 100
+        assert nav["nav_link_targets_total"] == 250
+
+    def test_several_nav_regions_are_deduped_across_the_page(self):
+        """A primary menu and a footer menu usually share links; the same target twice is
+        one edge, and the total must not double-count it."""
+        nav = self._nav('<nav><a href="/about">a</a></nav><nav><a href="/about">a</a></nav>')
+        assert len(nav["nav_link_targets"]) == 1 and nav["nav_link_targets_total"] == 1
+
+    def test_it_does_NOT_capture_the_wider_chrome_set(self):
+        """The field is named for `<nav>` and role=navigation, and the honest naming only
+        holds if the xpath stays narrow. The de-chromer's set (`header`/`footer`/`aside`)
+        deliberately over-reaches to protect CONTENT counts, where a false positive costs a
+        little prose. Here a false positive asserts a page is promoted in the site's
+        navigation when it merely appears in a footer -- the exact claim corpus#45 wants to
+        build a promotion ranking on."""
+        nav = self._nav(
+            '<header><a href="/hdr">h</a></header>'
+            '<footer><a href="/ftr">f</a></footer>'
+            '<aside><a href="/side">s</a></aside>'
+        )
+        assert nav["nav_link_targets"] == [], (
+            "header/footer/aside are chrome but are not NAVIGATION; widening this xpath "
+            "silently changes what the field means"
+        )
+
+    def test_a_nav_INSIDE_a_footer_still_counts(self):
+        """A footer menu is real navigation and is marked up as such. The narrow xpath keys
+        on the element, not on where it sits."""
+        nav = self._nav('<footer><nav><a href="/ftr">f</a></nav></footer>')
+        assert len(nav["nav_link_targets"]) == 1
+
+    def test_a_malformed_href_does_not_cost_the_row_its_other_nav_links(self):
+        nav = self._nav('<nav><a href="http://[bad">x</a><a href="/good">g</a></nav>')
+        assert len(nav["nav_link_targets"]) == 1

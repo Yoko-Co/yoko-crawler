@@ -260,6 +260,26 @@ class TestEmitSchema:
         assert isinstance(row["redirected_to"], str)
         assert isinstance(row["referrer"], str)
 
+    def test_the_row_actually_carries_the_nav_and_edge_fields(self):
+        """The WIRING (#111). `nav_signals` is unit-tested in test_content_extractor, but
+        nothing proved its output reaches the emitted row -- deleting the merge line left the
+        whole suite green, the same gap that shipped in #97 and #99."""
+        spider = WebsiteSpider(domain="example.com")
+        html = (b"<html><body><nav><a href='/about'>About</a></nav>"
+                b"<main><p>" + b"word " * 60 + b"</p>"
+                b"<a href='/deep'>deep</a></main></body></html>")
+        row = _emit_one(spider, _html_response(body=html))
+        assert row["nav_link_targets"], "nav capture never reached the row"
+        assert row["nav_link_targets"][0].endswith("/about")
+        assert row["nav_link_targets_total"] == 1
+        # And the content edge list stays separate -- this ADDS a signal, never moves one.
+        assert any(t.endswith("/deep") for t in row["internal_link_targets"])
+        assert row["internal_link_targets_total"] >= 1
+        assert not any(t.endswith("/about") for t in row["internal_link_targets"]), (
+            "nav links must stay OUT of the content edge list; that separation is why "
+            "de-chroming exists"
+        )
+
     def test_html_row_carries_all_enrichment_fields(self):
         spider = WebsiteSpider(domain="example.com")
         row = _emit_one(spider, _html_response())

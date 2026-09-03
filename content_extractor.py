@@ -141,6 +141,17 @@ ENRICHMENT_FIELD_NAMES = (
     # pages are most linked-to = promotion) and total link volume (301/redirect + link-
     # replacement cost). Content-scoped (post de-chrome) so site-wide nav links don't dominate.
     "internal_link_targets",
+    # Distinct internal targets the page actually had, vs the capped list above (issue #111).
+    # Larger than len(internal_link_targets) means the edge list is TRUNCATED -- which a
+    # consumer cannot otherwise detect, since link_count counts instances and the list holds
+    # distinct targets. Without it, inbound counts are silently short on link-heavy pages.
+    "internal_link_targets_total",
+    # Distinct internal targets in the page's NAV regions, captured BEFORE de-chroming
+    # (issue #111). Site nav is stripped from the content counts by design, which made nav
+    # membership -- one of the two strongest promotion signals corpus#45 needs -- impossible
+    # to answer at all. ANY nav region, not specifically the primary menu; see `nav_signals`.
+    "nav_link_targets",
+    "nav_link_targets_total",
     # Distinct EXTERNAL link hostnames from the content region (issue #57): a link to a sibling
     # members./portal./login.<domain> subdomain flags a gated portal / SSO; also external systems.
     "external_link_hosts",
@@ -197,6 +208,9 @@ def empty_enrichment() -> dict:
     fields["iframe_hosts"] = []
     fields["script_hosts"] = []
     fields["internal_link_targets"] = []
+    fields["internal_link_targets_total"] = 0
+    fields["nav_link_targets"] = []
+    fields["nav_link_targets_total"] = 0
     fields["external_link_hosts"] = []
     fields["canonical"] = ""
     return fields
@@ -896,6 +910,16 @@ def count_structure(
     # graph. Fragment-stripped so /a and /a#sec are one edge; ordered-dedup via dict; capped so
     # a runaway link farm can't bloat a row. Own-page anchors are excluded (not an edge).
     internal_targets: dict[str, None] = {}
+    # Every DISTINCT internal target seen, including ones the cap dropped (issue #111).
+    #
+    # The cap alone was SILENT, and a consumer cannot recover the fact: `internal_link_count`
+    # counts link INSTANCES while `internal_link_targets` holds DISTINCT ones, so a row
+    # reading 250 links / 100 targets is identical whether the page links to 250 distinct
+    # pages (truncated, 150 edges lost) or 250 times to 100 pages (complete). Measured: the
+    # two produce byte-identical rows. Inbound counts built from the capped list are
+    # therefore short by an unknown amount, with nothing in the row saying so -- which is
+    # exactly the failure mode corpus#45's link graph would inherit.
+    internal_targets_seen: set[str] = set()
     # Distinct EXTERNAL link hostnames (issue #57): a page linking to a sibling subdomain like
     # members./portal./login.<domain> reveals a gated member portal / SSO the corpus can flag as
     # migration complexity; also surfaces external systems + sister orgs. Ordered-dedup, capped.
@@ -917,8 +941,10 @@ def count_structure(
         if is_internal(resolved):
             internal_link_count += 1
             target = resolved.partition("#")[0]
-            if target and target != page_url.partition("#")[0] and len(internal_targets) < _MAX_INTERNAL_TARGETS:
-                internal_targets[target] = None
+            if target and target != page_url.partition("#")[0]:
+                internal_targets_seen.add(target)
+                if len(internal_targets) < _MAX_INTERNAL_TARGETS:
+                    internal_targets[target] = None
         else:
             try:
                 host = (urlparse(resolved).hostname or "").lower()
@@ -953,6 +979,11 @@ def count_structure(
         "iframe_count": _count(".//iframe"),
         "heading_count": _count(".//h1|.//h2|.//h3|.//h4|.//h5|.//h6"),
         "internal_link_targets": list(internal_targets),
+        # How many distinct targets the page ACTUALLY had. Equal to the list's length on a
+        # normal page; larger when the cap bit. The consumer needs the number rather than a
+        # bare truncated flag, because "we kept 100 of 340" and "we kept 100 of 101" are very
+        # different confidences to build a link graph on (issue #111).
+        "internal_link_targets_total": len(internal_targets_seen),
         "external_link_hosts": list(external_hosts),
     }
 
@@ -980,6 +1011,62 @@ _COMPONENT_XPATH = "descendant-or-self::*[" + " or ".join(
     [f"contains(concat(' ', normalize-space(@class), ' '), ' {t} ')" for t in _COMPONENT_CLASS_TOKENS]
     + list(_COMPONENT_ATTR_PREDICATES)
 ) + "]"
+
+
+# Nav regions, page-wide (issue #111). `<nav>` and role="navigation" only -- NOT the wider
+# `_CHROME_TAGS`/`_CHROME_NAME_TOKENS` set the de-chromer uses. That set deliberately over-
+# reaches to protect the CONTENT counts, where a false positive costs a little prose; here a
+# false positive would assert a page is promoted in the site's navigation when it is not,
+# which is the claim corpus#45 wants to build a promotion ranking on.
+_NAV_XPATH = ".//nav | .//*[@role='navigation']"
+
+_MAX_NAV_TARGETS = 100  # same cap and same truncation discipline as the content edge list
+
+
+def nav_signals(subtree: etree._Element, page_url: str, *,
+                is_internal: Callable[[str], bool]) -> dict:
+    """Distinct internal link targets inside the page's NAV regions (issue #111).
+
+    Site nav is de-chromed before the content counts, deliberately -- otherwise every page's
+    counts would be dominated by the same site-wide menu. The cost is that nav membership
+    became unanswerable: "is this page promoted in the main navigation?" is one of the two
+    strongest promotion signals corpus#45 needs, and the crawler was discarding it. So this
+    runs over the FULL body, before de-chroming, alongside the other page-wide signals.
+
+    NAMED HONESTLY: these are ANY nav region -- primary menu, footer nav, breadcrumbs, a
+    sidebar menu -- not specifically the main navigation. Distinguishing primary nav from
+    footer nav reliably needs heuristics this does not have, and a field called
+    `nav_link_targets` that silently meant "and also the footer" would be the kind of
+    overclaim that is only discovered once someone builds a ranking on it. If the primary/
+    secondary split turns out to matter, it needs its own signal and its own evidence.
+
+    Same truncation discipline as `internal_link_targets`: the total is reported so a capped
+    list is legible rather than silently short."""
+    targets: dict[str, None] = {}
+    seen: set[str] = set()
+    page_base = page_url.partition("#")[0]
+    for region in subtree.xpath(_NAV_XPATH):
+        for a in region.xpath(".//a[@href]"):
+            href = a.get("href", "")
+            if not href:
+                continue
+            try:
+                resolved = urljoin(page_url, href)
+            except ValueError:
+                # A malformed href must never cost the row its other signals.
+                continue
+            if not is_internal(resolved):
+                continue
+            target = resolved.partition("#")[0]
+            if not target or target == page_base:
+                continue
+            seen.add(target)
+            if len(targets) < _MAX_NAV_TARGETS:
+                targets[target] = None
+    return {
+        "nav_link_targets": list(targets),
+        "nav_link_targets_total": len(seen),
+    }
 
 
 def component_signals(subtree: etree._Element) -> dict:

@@ -15,6 +15,7 @@ from content_extractor import (
     content_hash,
     component_signals,
     count_structure,
+    nav_signals,
     embed_signals,
     empty_enrichment,
     extract_content,
@@ -2051,6 +2052,12 @@ class WebsiteSpider(scrapy.Spider):
                 )
                 # Interactive JS components are page-wide too (issue #12); image sliders/
                 # carousels are the slider subset of that, counted page-wide (issue #25).
+                # Nav links are page-wide AND pre-de-chrome (issue #111): the content
+                # subtree has had exactly these stripped, which is why nav membership was
+                # unanswerable. body_subtree is the full body, same as the signals above.
+                nav = nav_signals(
+                    result.body_subtree, response.url, is_internal=self.is_same_site
+                )
                 components = component_signals(result.body_subtree)
                 sliders = slider_signals(result.body_subtree)
                 fields = empty_enrichment()
@@ -2069,6 +2076,8 @@ class WebsiteSpider(scrapy.Spider):
                 fields["iframe_hosts"] = signals["iframe_hosts"]
                 fields["script_embed_count_nonbenign"] = scripts["script_embed_count_nonbenign"]
                 fields["script_hosts"] = scripts["script_hosts"]
+                fields["nav_link_targets"] = nav["nav_link_targets"]
+                fields["nav_link_targets_total"] = nav["nav_link_targets_total"]
                 content_text = result.normalized_text
             except Exception:
                 # Never let one bad page drop the row (and its original five
