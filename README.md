@@ -293,6 +293,18 @@ All configuration is via environment variables and hardcoded defaults:
 | `YOKO_CRAWL_API_KEY` | Yes | Bearer token (minimum 32 characters) |
 | `YOKO_CRAWL_RESULTS_DIR` | No | Path for result files (default: `/opt/yoko-crawl/results`) |
 | `YOKO_CRAWL_BENIGN_EMBEDS` | No | Comma-separated extra hosts to treat as benign iframe embeds (added to the built-in allowlist in `embed_allowlist.py`). Matched by suffix, so a bare domain covers its subdomains. |
+| `YOKO_CRAWL_BENIGN_SCRIPTS` | No | As above, for `<script src>` hosts (`script_allowlist.py`). |
+| `YOKO_CRAWL_JOBDIR` | No | Base path for resumable-crawl JOBDIRs. A crawl is resumable only when the API asks for it. |
+| `YOKO_CRAWL_PROXY` | No | Proxy URL for the bot-block retry path (issue #22). Set by the corpus per-crawl, not usually by hand; the host is SSRF-vetted at both the API and the subprocess boundary. May carry credentials, so treat it as a secret. |
+| `YOKO_CRAWL_ROBOTS_TIMEOUT` | No | Per-attempt budget for fetching robots.txt, in seconds. Default 60, **bounded to 60–600** (issue #92). Below the floor is refused, not clamped quietly: a shorter budget does not speed a crawl up, it makes a slow site look like one with no robots.txt and the crawl then proceeds allow-all against a site that may have said `Disallow`. Above 600 is clamped, because robots.txt is the crawl's only seed and the pre-page stall is 3 × the budget (× redirect hops × sitemap probes) — past the ceiling that outruns the job manager's 7500s watchdog. **Check `restrictions.knobs` on `GET /crawl/{id}` to see whether your value was honoured**: `disposition` reads `raised`, `floored`, `clamped`, `invalid` or `default`, and a refused value produces the same effective number as an unset one. |
+| `YOKO_CRAWL_MAX_ROBOTS_DELAY` | No | Cap on the robots.txt `Crawl-delay` we will honour, in seconds (default 10). A site asking for more is paced at the cap, and the clamp is logged and surfaced in `restrictions.crawl_delay`. Unlike the knob above it falls back silently on an unparseable value — `restrictions.knobs.max_crawl_delay.disposition` reads `invalid` when that happens. |
+| `YOKO_CRAWL_FAIL_SEEDING_INCOMPLETE` | No | Set to `0` to stop failing a crawl whose seeding stopped after robots.txt (issue #102), keeping only the diagnostic log. A rollback switch for that reclassification; leave unset in normal operation. |
+
+Every one of these is read at spider construction, so a change needs a restart of the
+in-flight crawl, not just of the API. The two robots knobs report their resolved values on
+`GET /crawl/{id}` under `restrictions.knobs`, which is the only place that distinguishes "your
+value was honoured" from "your value was refused and the default is in force" — they produce
+the same number otherwise (issue #99).
 
 Spider settings are hardcoded in `run_spider.py` for the intended use case:
 - Max crawl duration: 2 hours

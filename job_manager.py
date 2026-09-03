@@ -678,6 +678,15 @@ class JobManager:
                     "cf_wall": False,
                     "rules_from_state": False,
                 },
+                # Operator knobs (#99), same lockstep rule as the block above -- a test pins
+                # this literal's key set against the status file's so the two producers can
+                # only drift as a pair. It caught this one.
+                "knobs": {
+                    "robots_fetch_budget": {
+                        "effective": None, "requested": None, "disposition": "unknown"},
+                    "max_crawl_delay": {
+                        "effective": None, "requested": None, "disposition": "unknown"},
+                },
                 "skipped": {
                     "robots_disallowed": 0,
                     "robots_disallowed_assets": 0,

@@ -3585,3 +3585,110 @@ class TestRobotsReadability:
         )
         list(s._robots_outputs(resp))
         assert s.crawler.stats.values["robots_readability_outcome"] == "unreadable"
+
+
+class TestKnobStatsAreObservable:
+    """#99: the ONLY record of which robots budget was in force was a log line -- in the
+    Scrapy log of a hand-managed droplet, for exactly the scenario the knob exists to serve.
+
+    The design constraint worth remembering: `Spider.from_crawler` calls `cls(...)` and only
+    THEN `_set_crawler`, so a stat written from `__init__` is dropped in silence. Verified
+    directly below, because the whole shape of this change depends on it."""
+
+    def _spider(self, **env):
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        return s
+
+    def test_a_stat_written_during_init_would_be_lost(self):
+        """The premise. If this ever stops being true, `_publish_knob_stats` is redundant --
+        but while it IS true, resolving in __init__ and publishing there would be silent."""
+        s = WebsiteSpider(domain="example.com")
+        assert not hasattr(s, "crawler"), (
+            "Scrapy attaches the crawler after __init__; a stat written there goes nowhere"
+        )
+
+    def _published(self, monkeypatch, **env):
+        import types
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        s._publish_knob_stats()
+        return s.crawler.stats.values
+
+    def test_defaults_are_reported_as_default(self, monkeypatch):
+        v = self._published(monkeypatch)
+        assert v["robots_timeout_effective"] == 60
+        assert v["robots_timeout_requested"] is None
+        assert v["robots_timeout_disposition"] == "default"
+
+    def test_a_refused_value_reports_floored_not_default(self, monkeypatch):
+        """THE case this exists for. A floored knob and an unset knob produce the SAME
+        effective number, so without the disposition an operator whose 5s did nothing cannot
+        tell it was refused from a log they never see."""
+        v = self._published(monkeypatch, YOKO_CRAWL_ROBOTS_TIMEOUT="5")
+        assert v["robots_timeout_effective"] == 60
+        assert v["robots_timeout_disposition"] == "floored"
+        assert v["robots_timeout_requested"] == "5", "the RAW string, not the parsed value"
+
+    def test_a_clamped_value_reports_clamped(self, monkeypatch):
+        v = self._published(monkeypatch, YOKO_CRAWL_ROBOTS_TIMEOUT="60000")
+        assert v["robots_timeout_effective"] == 600
+        assert v["robots_timeout_disposition"] == "clamped"
+
+    def test_an_honoured_raise_reports_raised(self, monkeypatch):
+        v = self._published(monkeypatch, YOKO_CRAWL_ROBOTS_TIMEOUT="180")
+        assert v["robots_timeout_effective"] == 180
+        assert v["robots_timeout_disposition"] == "raised"
+
+    def test_junk_reports_invalid(self, monkeypatch):
+        v = self._published(monkeypatch, YOKO_CRAWL_ROBOTS_TIMEOUT="soon")
+        assert v["robots_timeout_effective"] == 60
+        assert v["robots_timeout_disposition"] == "invalid"
+        assert v["robots_timeout_requested"] == "soon"
+
+    def test_the_raw_string_survives_truncation(self, monkeypatch):
+        """`int(float("59.9"))` prints as 59. Someone debugging why their setting did nothing
+        needs to see what they TYPED, not what we parsed."""
+        v = self._published(monkeypatch, YOKO_CRAWL_ROBOTS_TIMEOUT="59.9")
+        assert v["robots_timeout_requested"] == "59.9"
+        assert v["robots_timeout_disposition"] == "floored"
+
+    def test_the_sibling_knob_is_reported_too(self, monkeypatch):
+        """#99 is about BOTH knobs; the crawl-delay cap was equally invisible."""
+        v = self._published(monkeypatch, YOKO_CRAWL_MAX_ROBOTS_DELAY="20")
+        assert v["robots_max_delay_effective"] == 20.0
+        assert v["robots_max_delay_disposition"] == "set"
+
+    def test_the_sibling_knobs_silent_fallback_is_now_visible(self, monkeypatch):
+        """It falls back silently on junk, unlike its sibling. That stays (mild consequence),
+        but the disposition means an operator can at least see it happened."""
+        v = self._published(monkeypatch, YOKO_CRAWL_MAX_ROBOTS_DELAY="ten")
+        assert v["robots_max_delay_effective"] == WebsiteSpider.DEFAULT_MAX_ROBOTS_CRAWL_DELAY
+        assert v["robots_max_delay_disposition"] == "invalid"
+
+    def test_start_actually_publishes_them(self, monkeypatch):
+        """The WIRING, not the helper. Every test above calls `_publish_knob_stats()` by
+        hand, so deleting its one call site in `start()` left the suite green -- the same
+        gap that shipped in #97 and was caught by mutation there too. `start()` is the
+        crawl's real entry point, so drive it."""
+        import asyncio
+        import types
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "5")
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+
+        async def drain():
+            return [r async for r in s.start()]
+
+        asyncio.run(drain())
+        assert s.crawler.stats.values["robots_timeout_disposition"] == "floored", (
+            "start() must publish the knobs; calling the helper directly proves nothing "
+            "about whether anything calls it"
+        )
+
+    def test_publishing_tolerates_a_spider_with_no_crawler(self):
+        """Never the thing that breaks a crawl."""
+        WebsiteSpider(domain="example.com")._publish_knob_stats()

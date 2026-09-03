@@ -431,3 +431,29 @@ class TestStatusAlreadyAdvanced:
     def test_any_status_the_spider_wrote_counts_as_advanced(self, tmp_path):
         for status in ("running", "completed", "failed"):
             assert self._check(tmp_path, '{"status": "%s"}' % status) is True, status
+
+
+def test_every_env_knob_is_documented_in_the_readme():
+    """The stale-table defect, made impossible rather than fixed again (#99).
+
+    Five of nine `YOKO_*` variables were undocumented when #99 was filed, and three separate
+    reviews in this series each found a stale list somewhere. A list nothing checks goes stale
+    by default; this is the check.
+
+    Deliberately one-directional: it fails on an env var the code reads and the README does
+    not mention, not on a README row without a matching read. Documenting something the code
+    stopped reading is a much smaller problem than the reverse, and a two-way check would
+    fight legitimate prose."""
+    import re
+    from pathlib import Path
+    root = Path(_REPO_ROOT)
+    in_code = set()
+    for path in root.glob("*.py"):
+        in_code |= set(re.findall(r"YOKO_[A-Z_]+", path.read_text()))
+    documented = set(re.findall(r"YOKO_[A-Z_]+", (root / "README.md").read_text()))
+    missing = sorted(in_code - documented)
+    assert not missing, (
+        f"env variables read by the code but absent from README's Configuration table: "
+        f"{missing}. An operator has no way to discover these; add a row rather than "
+        f"deleting this assertion."
+    )

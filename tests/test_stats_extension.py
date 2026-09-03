@@ -387,7 +387,15 @@ class TestRestrictionsBlock:
             reason="finished",
         )
         assert set(data["restrictions"]) == {
-            "skipped", "crawl_delay", "robots_root_disallowed", "robots_readability"}
+            "skipped", "crawl_delay", "robots_root_disallowed", "robots_readability", "knobs"}
+        # A crawl whose spider never reached `start()` reports the knobs as unknown rather
+        # than asserting the defaults were in force (#99).
+        assert data["restrictions"]["knobs"] == {
+            "robots_fetch_budget": {
+                "effective": None, "requested": None, "disposition": "unknown"},
+            "max_crawl_delay": {
+                "effective": None, "requested": None, "disposition": "unknown"},
+        }
         assert data["restrictions"]["robots_readability"] == {
             "outcome": "parsed", "final_status": 200, "cf_wall": False,
             "rules_from_state": False}
