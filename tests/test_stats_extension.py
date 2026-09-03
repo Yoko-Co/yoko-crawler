@@ -537,13 +537,20 @@ def test_job_manager_restrictions_default_matches_the_status_file_shape(tmp_path
     src = inspect.getsource(job_manager.JobManager.get_status_response)
     marker = '"restrictions": status_data.get("restrictions") or {'
     assert marker in src, "the fallback literal moved -- re-point this test"
-    for key in data["restrictions"]:
-        assert f'"{key}"' in src, (
-            f"job_manager's zeroed restrictions default is missing {key!r}, so "
-            f"GET /crawl/{{id}} returns a different shape than the status file"
-        )
-    for key in data["restrictions"]["robots_readability"]:
-        assert f'"{key}"' in src, f"readability sub-key {key!r} missing from the fallback"
+    def pin(node, path=""):
+        """Walk the WHOLE shape, not just the top level. The two hand-written loops this
+        replaces pinned `restrictions` and one nested block, so a new nested key -- #99's
+        `knobs` sub-fields -- could drift without failing anything (#99 review)."""
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            assert f'"{key}"' in src, (
+                f"job_manager's zeroed restrictions default is missing {path}{key!r}, so "
+                f"GET /crawl/{{id}} returns a different shape than the status file"
+            )
+            pin(value, f"{path}{key}.")
+
+    pin(data["restrictions"])
 
 
 class TestSeedingIncomplete:
@@ -676,3 +683,39 @@ class TestSeedingIncomplete:
         })
         assert data["status"] == "completed"
         assert data["failure_reason"] is None
+
+
+def test_the_status_file_is_strict_json(tmp_path):
+    """`json.dump` writes bare `Infinity`/`NaN` by default, and `json.load` reads them back --
+    so a round-trip test cannot see the problem. Starlette renders GET /crawl/{id} with
+    allow_nan=False and RAISES, and yoko-corpus's poll loop calls raise_for_status() uncaught,
+    so the ingest aborts while the spider crawls on (#99 review, traced end to end).
+
+    Asserts against the raw TEXT, because that is where the difference is visible."""
+    import json as _json
+    _write_and_read(tmp_path, {
+        "response_received_count": 1,
+        "seeding/seeds_emitted": 1,
+        "seeding/robots_fetched": 1,
+        "seeding/start_urls_emitted": 1,
+        "robots_readability_outcome": "parsed",
+        "robots_max_delay_effective": float("inf"),
+        "robots_timeout_effective": 60,
+    }, reason="finished")
+    written = (tmp_path / "status.json").read_text()
+    assert "Infinity" not in written and "NaN" not in written, (
+        "a non-JSON-compliant float reached the status file; the API render will raise "
+        "and the corpus poll will abort the ingest"
+    )
+    _json.loads(written, parse_constant=_reject_constant)
+    # And the file must still EXIST and be complete. Refusing the write instead of sanitising
+    # would leave no status at all -- which since #98 reads as "the spider never started", so
+    # a cosmetic bad float would fail the crawl outright.
+    parsed = _json.loads(written)
+    assert parsed["restrictions"]["knobs"]["max_crawl_delay"]["effective"] is None
+    assert parsed["restrictions"]["knobs"]["robots_fetch_budget"]["effective"] == 60
+    assert parsed["urls_crawled"] == 1, "the rest of the payload survives intact"
+
+
+def _reject_constant(value):
+    raise AssertionError(f"non-JSON-compliant constant in the status file: {value}")

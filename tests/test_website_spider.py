@@ -3660,7 +3660,46 @@ class TestKnobStatsAreObservable:
         """#99 is about BOTH knobs; the crawl-delay cap was equally invisible."""
         v = self._published(monkeypatch, YOKO_CRAWL_MAX_ROBOTS_DELAY="20")
         assert v["robots_max_delay_effective"] == 20.0
-        assert v["robots_max_delay_disposition"] == "set"
+        assert v["robots_max_delay_disposition"] == "honoured"
+
+    def test_an_explicit_in_range_value_reports_honoured_not_default(self, monkeypatch):
+        """`default` must mean UNSET. Reporting it for an explicit value that was accepted
+        answers nothing -- and "did my setting take effect" is the one question this field
+        exists for (#99 review)."""
+        v = self._published(monkeypatch, YOKO_CRAWL_ROBOTS_TIMEOUT="60")
+        assert v["robots_timeout_effective"] == 60
+        assert v["robots_timeout_disposition"] == "honoured"
+        v = self._published(monkeypatch, YOKO_CRAWL_ROBOTS_TIMEOUT="600")
+        assert v["robots_timeout_disposition"] == "raised", "exactly the ceiling is honoured"
+
+    def test_a_non_finite_delay_cap_is_refused(self, monkeypatch):
+        """P1. `float()` accepts inf/nan, and a cap of infinity is not a cap -- it honours any
+        Crawl-delay a site asks. Harmless while it stayed in-process; #99 carries it OUT into
+        status.json as a bare `Infinity`, which is not valid JSON, and the API render then
+        raises so the corpus poll aborts the ingest. One env typo, every crawl un-ingestable."""
+        for raw in ("inf", "-inf", "nan", "1e400", "0", "-5"):
+            v = self._published(monkeypatch, YOKO_CRAWL_MAX_ROBOTS_DELAY=raw)
+            assert v["robots_max_delay_disposition"] == "invalid", raw
+            assert v["robots_max_delay_effective"] == \
+                WebsiteSpider.DEFAULT_MAX_ROBOTS_CRAWL_DELAY, raw
+
+    def test_seed_requests_publishes_so_both_entry_points_are_covered(self, monkeypatch):
+        """`start_requests()` (the legacy path) funnels through `_seed_requests` too and was
+        silently skipping publication -- invisible to all 764 tests (#99 review)."""
+        import types
+        monkeypatch.setenv("YOKO_CRAWL_ROBOTS_TIMEOUT", "5")
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        list(s.start_requests())
+        assert s.crawler.stats.values["robots_timeout_disposition"] == "floored"
+
+    def test_publishing_never_breaks_seeding(self, monkeypatch):
+        """It runs at the head of the crawl's ONLY seeding path."""
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        s._set_knob_stats = lambda stats: 1 / 0
+        assert list(s._seed_requests()), "seeding must survive a broken publisher"
 
     def test_the_sibling_knobs_silent_fallback_is_now_visible(self, monkeypatch):
         """It falls back silently on junk, unlike its sibling. That stays (mild consequence),
