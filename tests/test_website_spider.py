@@ -370,6 +370,45 @@ class TestIframeHostsEncoding:
         assert isinstance(row["internal_link_targets"], str)
         assert isinstance(json.loads(row["internal_link_targets"]), list)
 
+    def test_every_list_field_is_json_in_csv(self):
+        """`nav_link_targets` was added WITHOUT the `json.dumps` all four peers had (#111
+        review), so the one format a human opens in a spreadsheet carried a Python repr.
+        Derives the list from the field names rather than naming them, so the next list field
+        cannot repeat it."""
+        import json
+
+        spider = WebsiteSpider(domain="example.com", output_format="csv")
+        html = (b"<html><body><nav><a href='/about'>A</a></nav>"
+                b"<main><p>" + b"word " * 60 + b"</p><a href='/d'>d</a>"
+                b"<iframe src='https://public.tableau.com/x'></iframe></main></body></html>")
+        row = _emit_one(spider, _html_response(body=html))
+        plain = WebsiteSpider(domain="example.com")
+        plain_row = _emit_one(plain, _html_response(body=html))
+        for name, value in plain_row.items():
+            if isinstance(value, list):
+                assert isinstance(row[name], str), f"{name} is a raw list in CSV output"
+                assert json.loads(row[name]) == value, f"{name} did not round-trip"
+
+    def test_edge_endpoints_match_the_url_column_form(self):
+        """The graph has to JOIN. A link carrying tracking params was stored raw while that
+        page's own row has them stripped, so the edge pointed at a URL the corpus has never
+        seen (#111 review). Both edge lists, since they are the same graph."""
+        spider = WebsiteSpider(domain="example.com")
+        html = (b"<html><body>"
+                b"<nav><a href='/n?utm_source=ads&id=1'>n</a></nav>"
+                b"<main><p>" + b"word " * 60 + b"</p>"
+                b"<a href='/c?utm_source=ads&id=2'>c</a></main></body></html>")
+        row = _emit_one(spider, _html_response(body=html))
+        every = row["nav_link_targets"] + row["internal_link_targets"]
+        assert every, "fixture produced no edges"
+        for target in every:
+            assert "utm_source" not in target, (
+                f"{target} keeps a tracking param the url column strips, so it cannot join"
+            )
+            assert target == spider._emit_normalize(target), (
+                "an endpoint must already be in the row's own url form"
+            )
+
     def test_csv_with_emit_content_has_both_fields(self):
         spider = WebsiteSpider(
             domain="example.com", output_format="csv", emit_content=1

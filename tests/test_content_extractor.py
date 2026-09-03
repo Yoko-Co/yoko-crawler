@@ -1608,14 +1608,14 @@ class TestNavSignals:
     page's counts are dominated by the same menu. The cost was that nav membership, one of
     the two strongest promotion signals corpus#45 needs, became unanswerable."""
 
-    def _nav(self, body_html, page_url=PAGE_URL):
+    def _nav(self, body_html, page_url=PAGE_URL, normalize=None):
         # The trailing <p> keeps lxml from collapsing the wrapper to its only child: with a
         # single <nav> inside, `fromstring` returns the <nav> AS the root, and `.//nav` is a
         # descendant axis that then matches nothing. Production always passes the real
         # <body>, which has siblings -- this is a fixture artefact, not a shape the spider
         # can produce, so the fixture is what gets fixed.
         subtree = lxml_html.fromstring(f"<body>{body_html}<p>x</p></body>")
-        return nav_signals(subtree, page_url, is_internal=_internal)
+        return nav_signals(subtree, page_url, is_internal=_internal, normalize=normalize)
 
     def test_it_sees_what_the_content_counts_deliberately_discard(self):
         html = '<nav><a href="/about">About</a><a href="/work">Work</a></nav><main><p>hi</p></main>'
@@ -1645,10 +1645,49 @@ class TestNavSignals:
         assert len(nav["nav_link_targets"]) == 1
 
     def test_it_carries_the_same_truncation_discipline(self):
+        """Capped at 40, not 100: unlike the content edge list this is a PER-SITE CONSTANT
+        repeated on every row, and review measured it as ~1285 of the 1289 bytes this change
+        adds -- ~520MB to ~980MB on a full-cap crawl. 40 keeps a large mega-menu whole."""
         links = "".join(f'<a href="/n{i}">x</a>' for i in range(250))
         nav = self._nav(f"<nav>{links}</nav>")
-        assert len(nav["nav_link_targets"]) == 100
+        assert len(nav["nav_link_targets"]) == 40
         assert nav["nav_link_targets_total"] == 250
+
+    def test_a_div_soup_menu_is_found_too(self):
+        """THE blind spot (#111 review), and the opposite direction from the one first
+        guarded. On a theme built from plain divs the DE-CHROMER strips the menu from the
+        content counts, while `<nav>`-only detection returned 0/0 -- so nav links vanished
+        from the row entirely, indistinguishable from a page with no navigation. The feature
+        did not work on the sites it exists for."""
+        for markup in ('<div class="main-menu"><a href="/about">a</a></div>',
+                       '<div id="site-navigation"><a href="/about">a</a></div>',
+                       '<ul class="navbar"><li><a href="/about">a</a></li></ul>'):
+            nav = self._nav(markup)
+            assert len(nav["nav_link_targets"]) == 1, markup
+
+    def test_in_content_navs_are_not_promotion_edges(self):
+        """WordPress core emits `<nav class="post-navigation">` INSIDE the article, so a bare
+        `<nav>` match turns "the previous post" into a promotion edge -- the false positive
+        that would corrupt a ranking built on this."""
+        for markup in ('<nav class="post-navigation"><a href="/prev">p</a></nav>',
+                       '<nav class="comment-navigation"><a href="/c">c</a></nav>',
+                       '<nav class="pagination"><a href="/page/2">2</a></nav>'):
+            nav = self._nav(markup)
+            assert nav["nav_link_targets"] == [], markup
+
+    def test_a_member_login_cta_in_nav_is_not_an_edge(self):
+        """A gate, not navigation -- excluded here for the same reason the content edge list
+        excludes it (corpus#61), so the two edge sets agree on what a link is."""
+        nav = self._nav('<nav><a href="/wp-login.php">Log in</a><a href="/o">o</a></nav>')
+        assert len(nav["nav_link_targets"]) == 1
+
+    def test_endpoints_are_normalised_to_the_row_url_form(self):
+        """Without this the graph does not JOIN: a link carrying tracking params was stored
+        raw while that page's own row has them stripped, so the edge pointed at a URL the
+        corpus has never seen (#111 review)."""
+        nav = self._nav('<nav><a href="/p?utm_source=x&amp;id=2">p</a></nav>',
+                        normalize=lambda u: u.replace("?utm_source=x&id=2", "?id=2"))
+        assert nav["nav_link_targets"] == ["https://example.com/p?id=2"]
 
     def test_several_nav_regions_are_deduped_across_the_page(self):
         """A primary menu and a footer menu usually share links; the same target twice is
