@@ -6,6 +6,7 @@ The FastAPI parent process reads this file to serve GET /crawl/{id}.
 """
 
 import json
+import math
 import logging
 import os
 import time
@@ -15,6 +16,20 @@ from scrapy import signals
 from twisted.internet.task import LoopingCall
 
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(value):
+    """Replace non-JSON-compliant floats (inf/-inf/nan) with None, recursively (#99 review).
+
+    Returns the SAME object when nothing needed changing, so the common path allocates
+    nothing."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def _fail_on_seeding_incomplete() -> bool:
@@ -282,6 +297,29 @@ class ProgressWriter:
                 self.stats.get_value("robots_readability_rules_from_state", False)),
         }
 
+    def _knob_values(self):
+        """`{robots_fetch_budget, max_crawl_delay}` -- each `{effective, requested,
+        disposition}` (issue #99).
+
+        `requested` is the RAW string the operator set, deliberately: after `int(float(raw))`
+        a value of "59.9" prints as 59, and someone debugging why their setting did nothing
+        needs to see what they actually typed. None when unset.
+
+        Defaults to a fully-shaped `unknown` rather than missing keys, so a consumer never
+        needs a defensive lookup -- and so a crawl whose spider never reached `start()` is
+        distinguishable from one that ran with the defaults."""
+        def block(prefix, default_effective):
+            disposition = self.stats.get_value(f"{prefix}_disposition", None)
+            return {
+                "effective": self.stats.get_value(f"{prefix}_effective", default_effective),
+                "requested": self.stats.get_value(f"{prefix}_requested", None),
+                "disposition": disposition if disposition else "unknown",
+            }
+        return {
+            "robots_fetch_budget": block("robots_timeout", None),
+            "max_crawl_delay": block("robots_max_delay", None),
+        }
+
     def _status_counts(self):
         """HTTP status histogram ({"200": n, "403": n, ...}) from Scrapy's built-in
         `downloader/response_status_count/<code>` stats, so the operator can see the response
@@ -442,6 +480,17 @@ class ProgressWriter:
                 # `requested_seconds` is what the site asked for. They differ when the ask
                 # exceeded YOKO_CRAWL_MAX_ROBOTS_DELAY and we clamped -- which is the case
                 # where a crawl finalizes partial and the operator needs to know why.
+                # The operator knobs' RESOLVED values (issue #99). `crawl_delay` below
+                # reports what the SITE asked and what we honoured; this reports what the
+                # OPERATOR asked and what we honoured, which had no record anywhere but a
+                # log line -- in the Scrapy log of a hand-managed droplet, for exactly the
+                # scenario the knobs exist to serve.
+                #
+                # `disposition` is the load-bearing field, not the number: "floored" and
+                # "clamped" mean the operator's value was REFUSED, and without it a knob that
+                # silently did nothing looks identical to one that worked. "invalid" means it
+                # was not a number at all.
+                "knobs": self._knob_values(),
                 "crawl_delay": {
                     "applied": self.stats.get_value("robots_crawl_delay_applied", 0),
                     "honored_seconds": self.stats.get_value("robots_crawl_delay_honored", 0),
@@ -456,9 +505,26 @@ class ProgressWriter:
         tmp_path = self.status_file + ".tmp"
         try:
             with open(tmp_path, "w") as f:
-                json.dump(data, f)
+                # SANITISE rather than refuse (#99 review). `json.dump` writes bare
+                # `Infinity`/`NaN` by default, which is not valid JSON: Starlette renders
+                # GET /crawl/{id} with allow_nan=False and raises, and yoko-corpus's poll loop
+                # calls raise_for_status() uncaught -- so the ingest aborts while the spider
+                # crawls on. One env typo, every crawl on that host un-ingestable.
+                #
+                # The obvious fix, `allow_nan=False`, is WRONG here and a test caught it: the
+                # dump then raises, no status file is written at all, and since #98 an absent
+                # status means "the spider never started" -- so a cosmetic bad float would fail
+                # the crawl outright. Dropping the offending VALUE keeps the file valid and
+                # complete; nulling one field is a smaller lie than a missing file.
+                #
+                # The knob that could reach here non-finite is now rejected at the parse, so
+                # this is belt and braces -- but `crawl_delay` carries site-supplied floats
+                # through Protego, so it closes the class rather than the one instance found.
+                json.dump(_json_safe(data), f, allow_nan=False)
             os.replace(tmp_path, self.status_file)
-        except OSError:
-            # Disk full or permissions — LoopingCall survives,
-            # monitor task is the backstop for final status.
+        except (OSError, ValueError):
+            # OSError: disk full or permissions. ValueError: a non-JSON-compliant float caught
+            # by allow_nan=False above. Either way the LoopingCall survives and the monitor
+            # task is the backstop for final status -- a status write that cannot be made must
+            # never be the thing that stops the crawl.
             pass

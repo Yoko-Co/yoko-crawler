@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 
@@ -316,11 +317,34 @@ class WebsiteSpider(scrapy.Spider):
         # One platform observation per crawl (corpus #112) -- the platform is a site
         # property, so re-deriving it per page is waste.
         self._platform_recorded = False
+        self._max_delay_requested = os.environ.get("YOKO_CRAWL_MAX_ROBOTS_DELAY")
+        self._max_delay_disposition = (
+            "default" if self._max_delay_requested is None else "honoured")
         try:
-            self.max_robots_crawl_delay = float(
+            parsed_delay = float(
                 os.environ.get("YOKO_CRAWL_MAX_ROBOTS_DELAY", self.DEFAULT_MAX_ROBOTS_CRAWL_DELAY)
             )
-        except (TypeError, ValueError):
+            # `float()` accepts "inf"/"nan"/"1e400", and a cap of infinity is not a cap -- it
+            # honours any Crawl-delay a site asks for, which is what this knob exists to bound.
+            # Flagged as pre-existing during the #92 review and harmless while the value stayed
+            # inside the process; #99 is what carries it OUT, and that turned it into a P1.
+            #
+            # `json.dump` writes bare `Infinity`/`NaN`, which is not valid JSON. Starlette's
+            # JSONResponse renders with allow_nan=False, so `GET /crawl/{id}` raises, and
+            # yoko-corpus's poll loop calls raise_for_status() uncaught -- the first poll aborts
+            # the ingest while the spider crawls happily on. One env typo, every crawl on that
+            # host un-ingestable. Traced end to end in review.
+            #
+            # Non-positive is refused for the same reason it is refused everywhere else here:
+            # `0` reads as "no cap" in exactly the direction that removes the bound.
+            if not math.isfinite(parsed_delay) or parsed_delay <= 0:
+                raise ValueError(f"not a usable cap: {parsed_delay!r}")
+            self.max_robots_crawl_delay = parsed_delay
+        except (TypeError, ValueError, OverflowError):
+            # Falls back SILENTLY, unlike its sibling -- pre-existing, kept because the
+            # consequence is mild (the cap reverts to 10s). The disposition records it now, so
+            # an operator whose value did nothing can SEE that rather than guess (#99).
+            self._max_delay_disposition = "invalid"
             self.max_robots_crawl_delay = self.DEFAULT_MAX_ROBOTS_CRAWL_DELAY
         # Operator override for the robots.txt fetch budget (issue #92). Env-tunable like the
         # knob above, but do NOT read the two as symmetric -- they are bounded in opposite
@@ -895,6 +919,11 @@ class WebsiteSpider(scrapy.Spider):
         the seeding entry point, our method became unreachable, and nothing failed -- no
         exception, no test, no log line. A crawl seeded by Scrapy's default instead of this
         method reports 0 here, which `stats_extension` turns into a loud error."""
+        # Published HERE rather than in `start()`, because `start_requests()` (the legacy
+        # entry point) also funnels through this and was silently skipping it -- invisible to
+        # all 764 tests (#99 review). One funnel, so a future third entry point cannot
+        # reintroduce the gap.
+        self._publish_knob_stats()
         self._stat("seeding/seeds_emitted")
         yield scrapy.Request(
             urljoin(self.start_urls[0], "/robots.txt"),
@@ -953,9 +982,17 @@ class WebsiteSpider(scrapy.Spider):
         assigns `-a` spider arguments straight into `self.__dict__` -- reading the floor off
         the instance let `-a DEFAULT_ROBOTS_DOWNLOAD_TIMEOUT=1` shadow it and honour a 5s
         budget (#92 review). The floor is not defensive tidiness: this is the one constant
-        whose wrong value routes a slow site to `robots_failed` and crawls it allow-all."""
+        whose wrong value routes a slow site to `robots_failed` and crawls it allow-all.
+
+        Records the disposition on the INSTANCE, not as a stat, and that is not a style
+        choice: `Spider.from_crawler` calls `cls(*args, **kwargs)` and only then
+        `_set_crawler`, so during `__init__` there is no `self.crawler` and `_stat` drops
+        the write in silence (verified). `start()` republishes these as stats once the
+        crawler exists -- see `_publish_knob_stats` (issue #99)."""
         raw = os.environ.get("YOKO_CRAWL_ROBOTS_TIMEOUT")
+        self._robots_timeout_requested = raw
         if raw is None:
+            self._robots_timeout_disposition = "default"
             return _ROBOTS_TIMEOUT_FLOOR
         try:
             requested = int(float(raw))
@@ -971,6 +1008,7 @@ class WebsiteSpider(scrapy.Spider):
                 "YOKO_CRAWL_ROBOTS_TIMEOUT=%r is not a usable number (%s) -- using the %ds "
                 "default.", raw, type(exc).__name__, _ROBOTS_TIMEOUT_FLOOR,
             )
+            self._robots_timeout_disposition = "invalid"
             return _ROBOTS_TIMEOUT_FLOOR
         if requested < _ROBOTS_TIMEOUT_FLOOR:
             self.logger.warning(
@@ -981,6 +1019,7 @@ class WebsiteSpider(scrapy.Spider):
                 "it. (issue #92)",
                 raw, requested, _ROBOTS_TIMEOUT_FLOOR,
             )
+            self._robots_timeout_disposition = "floored"
             return _ROBOTS_TIMEOUT_FLOOR
         if requested > _ROBOTS_TIMEOUT_CEILING:
             self.logger.warning(
@@ -993,6 +1032,7 @@ class WebsiteSpider(scrapy.Spider):
                 raw, requested, _ROBOTS_TIMEOUT_CEILING,
                 self.ROBOTS_MAX_RETRY_TIMES + 1, _JOB_WATCHDOG_TIMEOUT,
             )
+            self._robots_timeout_disposition = "clamped"
             return _ROBOTS_TIMEOUT_CEILING
         if requested > _ROBOTS_TIMEOUT_FLOOR:
             self.logger.info(
@@ -1000,6 +1040,11 @@ class WebsiteSpider(scrapy.Spider):
                 "(default %ds, ceiling %ds).",
                 requested, _ROBOTS_TIMEOUT_FLOOR, _ROBOTS_TIMEOUT_CEILING,
             )
+        # "honoured", not "default": the operator DID set this, and it was accepted as-is.
+        # Reporting `default` for an explicit in-range value tells them nothing about whether
+        # it took effect, which is the single question this field exists to answer (#99 review).
+        self._robots_timeout_disposition = "raised" if requested > _ROBOTS_TIMEOUT_FLOOR \
+            else "honoured"
         return requested
 
     def _robots_budget_meta(self):
@@ -1173,6 +1218,39 @@ class WebsiteSpider(scrapy.Spider):
         """
         for request in self._seed_requests():
             yield request
+
+    def _publish_knob_stats(self):
+        """Republish the operator knobs' resolved values as stats (issue #99).
+
+        `__init__` resolves them, but Scrapy attaches `self.crawler` only AFTER `__init__`
+        returns, so a stat written there is dropped in silence. `start()` is the first point
+        that definitely has a crawler and runs exactly once per session, so it is where the
+        values become observable.
+
+        Until now the record of which budget was in force was a log line, in the Scrapy log
+        of a hand-managed droplet -- for the exact scenario the knob exists to serve, a slow
+        crawl an operator is debugging. For the delay cap's invalid case there was no record
+        at ALL: it falls back silently, so an unparseable value left no trace anywhere. The sibling crawl-delay knob has surfaced its
+        applied/honored/requested values in `restrictions` since #74; this brings the pair
+        into line rather than inventing a convention."""
+        stats = getattr(getattr(self, "crawler", None), "stats", None)
+        if stats is None:
+            return
+        # Wrapped for the same reason `_record_robots_readability` is: this now runs at the
+        # head of the crawl's ONLY seeding path, and observability must never be the thing
+        # that costs a crawl its seeds.
+        try:
+            self._set_knob_stats(stats)
+        except Exception:
+            self.logger.debug("publishing knob stats failed", exc_info=True)
+
+    def _set_knob_stats(self, stats):
+        stats.set_value("robots_timeout_effective", self.robots_download_timeout)
+        stats.set_value("robots_timeout_requested", self._robots_timeout_requested)
+        stats.set_value("robots_timeout_disposition", self._robots_timeout_disposition)
+        stats.set_value("robots_max_delay_effective", self.max_robots_crawl_delay)
+        stats.set_value("robots_max_delay_requested", self._max_delay_requested)
+        stats.set_value("robots_max_delay_disposition", self._max_delay_disposition)
 
     def start_requests(self):
         """Seed the crawl on Scrapy < 2.13, where `start()` does not exist.

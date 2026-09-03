@@ -387,7 +387,15 @@ class TestRestrictionsBlock:
             reason="finished",
         )
         assert set(data["restrictions"]) == {
-            "skipped", "crawl_delay", "robots_root_disallowed", "robots_readability"}
+            "skipped", "crawl_delay", "robots_root_disallowed", "robots_readability", "knobs"}
+        # A crawl whose spider never reached `start()` reports the knobs as unknown rather
+        # than asserting the defaults were in force (#99).
+        assert data["restrictions"]["knobs"] == {
+            "robots_fetch_budget": {
+                "effective": None, "requested": None, "disposition": "unknown"},
+            "max_crawl_delay": {
+                "effective": None, "requested": None, "disposition": "unknown"},
+        }
         assert data["restrictions"]["robots_readability"] == {
             "outcome": "parsed", "final_status": 200, "cf_wall": False,
             "rules_from_state": False}
@@ -514,28 +522,46 @@ class TestRobotsReadabilityReporting:
 
 def test_job_manager_restrictions_default_matches_the_status_file_shape(tmp_path):
     """Two producers, one contract. `job_manager.get_status_response` carries its own zeroed
-    `restrictions` literal for a crawl with no status file yet, and it silently omitted the
-    new key (#97 review) -- so a consumer saw a different shape depending on WHICH producer
-    answered, breaking the promise the code's own comment makes. Pinning both key sets
-    together is the only thing that stops them drifting again."""
-    import job_manager
+    `restrictions` literal for a crawl with no status file yet, and it has now silently
+    omitted a key TWICE (#97's readability block, #99's knobs) -- so a consumer saw a
+    different shape depending on WHICH producer answered.
+
+    Compares the real SHAPES, not the source text. The previous version grepped job_manager's
+    source for each key name, which cannot tell which block a key sits in: a typo in
+    `knobs.robots_fetch_budget.effective` was masked by `max_crawl_delay` still spelling it
+    correctly, and survived the whole suite (#99 review)."""
+    import asyncio
+    from unittest.mock import patch
+    import job_manager as jm_mod
+
     data = _write_and_read(
         tmp_path,
         {"response_received_count": 1, "seeding/seeds_emitted": 1,
-         "seeding/start_urls_emitted": 1},
+         "seeding/robots_fetched": 1, "seeding/start_urls_emitted": 1,
+         "robots_readability_outcome": "parsed"},
         reason="finished",
     )
-    import inspect
-    src = inspect.getsource(job_manager.JobManager.get_status_response)
-    marker = '"restrictions": status_data.get("restrictions") or {'
-    assert marker in src, "the fallback literal moved -- re-point this test"
-    for key in data["restrictions"]:
-        assert f'"{key}"' in src, (
-            f"job_manager's zeroed restrictions default is missing {key!r}, so "
-            f"GET /crawl/{{id}} returns a different shape than the status file"
-        )
-    for key in data["restrictions"]["robots_readability"]:
-        assert f'"{key}"' in src, f"readability sub-key {key!r} missing from the fallback"
+
+    async def fallback_shape():
+        manager = jm_mod.JobManager(max_concurrent=1)
+        proc = type("P", (), {"returncode": 0, "pid": 1})()
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await manager.start_job("example.com", resumable=False)
+        job.status_file.unlink(missing_ok=True)      # force the zeroed fallback
+        return (await manager.get_status_response(job))["restrictions"]
+
+    fallback = asyncio.run(fallback_shape())
+
+    def shape(node):
+        if isinstance(node, dict):
+            return {k: shape(v) for k, v in sorted(node.items())}
+        return None
+
+    assert shape(fallback) == shape(data["restrictions"]), (
+        "job_manager's zeroed restrictions default and the status file's disagree, so "
+        "GET /crawl/{id} returns a different shape depending on which produced it"
+    )
+
 
 
 class TestSeedingIncomplete:
@@ -668,3 +694,58 @@ class TestSeedingIncomplete:
         })
         assert data["status"] == "completed"
         assert data["failure_reason"] is None
+
+
+def test_each_knob_reads_its_own_stats(tmp_path):
+    """`_knob_values` maps an output key to a stat PREFIX, and swapping the two survived every
+    test that used similar values on both sides (#99 review). Distinguishing values, so a swap
+    cannot hide -- a knob reporting its sibling's budget is worse than reporting nothing."""
+    data = _write_and_read(tmp_path, {
+        "response_received_count": 1, "seeding/seeds_emitted": 1,
+        "seeding/robots_fetched": 1, "seeding/start_urls_emitted": 1,
+        "robots_timeout_effective": 180, "robots_timeout_requested": "180",
+        "robots_timeout_disposition": "raised",
+        "robots_max_delay_effective": 7.5, "robots_max_delay_requested": "7.5",
+        "robots_max_delay_disposition": "honoured",
+    }, reason="finished")
+    knobs = data["restrictions"]["knobs"]
+    assert knobs["robots_fetch_budget"] == {
+        "effective": 180, "requested": "180", "disposition": "raised"}
+    assert knobs["max_crawl_delay"] == {
+        "effective": 7.5, "requested": "7.5", "disposition": "honoured"}
+
+
+def test_the_status_file_is_strict_json(tmp_path):
+    """`json.dump` writes bare `Infinity`/`NaN` by default, and `json.load` reads them back --
+    so a round-trip test cannot see the problem. Starlette renders GET /crawl/{id} with
+    allow_nan=False and RAISES, and yoko-corpus's poll loop calls raise_for_status() uncaught,
+    so the ingest aborts while the spider crawls on (#99 review, traced end to end).
+
+    Asserts against the raw TEXT, because that is where the difference is visible."""
+    import json as _json
+    _write_and_read(tmp_path, {
+        "response_received_count": 1,
+        "seeding/seeds_emitted": 1,
+        "seeding/robots_fetched": 1,
+        "seeding/start_urls_emitted": 1,
+        "robots_readability_outcome": "parsed",
+        "robots_max_delay_effective": float("inf"),
+        "robots_timeout_effective": 60,
+    }, reason="finished")
+    written = (tmp_path / "status.json").read_text()
+    assert "Infinity" not in written and "NaN" not in written, (
+        "a non-JSON-compliant float reached the status file; the API render will raise "
+        "and the corpus poll will abort the ingest"
+    )
+    _json.loads(written, parse_constant=_reject_constant)
+    # And the file must still EXIST and be complete. Refusing the write instead of sanitising
+    # would leave no status at all -- which since #98 reads as "the spider never started", so
+    # a cosmetic bad float would fail the crawl outright.
+    parsed = _json.loads(written)
+    assert parsed["restrictions"]["knobs"]["max_crawl_delay"]["effective"] is None
+    assert parsed["restrictions"]["knobs"]["robots_fetch_budget"]["effective"] == 60
+    assert parsed["urls_crawled"] == 1, "the rest of the payload survives intact"
+
+
+def _reject_constant(value):
+    raise AssertionError(f"non-JSON-compliant constant in the status file: {value}")

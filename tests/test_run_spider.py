@@ -431,3 +431,68 @@ class TestStatusAlreadyAdvanced:
     def test_any_status_the_spider_wrote_counts_as_advanced(self, tmp_path):
         for status in ("running", "completed", "failed"):
             assert self._check(tmp_path, '{"status": "%s"}' % status) is True, status
+
+
+_ENV_SKIP_DIRS = {"tests", ".venv", "__pycache__", ".git", "docs"}
+
+
+def _env_vars_in_code(root):
+    import re
+    found = set()
+    for path in root.rglob("*.py"):
+        if _ENV_SKIP_DIRS & set(path.relative_to(root).parts):
+            continue
+        found |= set(re.findall(r"YOKO_[A-Z_]+", path.read_text()))
+    return found
+
+
+def _env_vars_in_readme_table(readme_text):
+    """Only the Configuration TABLE counts, not the whole file.
+
+    Grepping the whole README made this a silent pass: a var mentioned anywhere in prose --
+    a shell snippet, a deployment note -- satisfied it, so the actual table row could be
+    deleted and the suite stayed green. Demonstrated in review (#99)."""
+    import re
+    rows = [ln for ln in readme_text.splitlines() if ln.lstrip().startswith("| `YOKO_")]
+    return set(re.findall(r"YOKO_[A-Z_]+", "\n".join(rows)))
+
+
+def test_every_env_knob_is_documented_in_the_readme():
+    """The stale-table defect, made impossible rather than fixed again (#99).
+
+    Five of nine `YOKO_*` variables were undocumented when #99 was filed, and three separate
+    reviews in this series each found a stale list somewhere. A list nothing checks goes stale
+    by default; this is the check.
+
+    Deliberately one-directional: it fails on an env var the code reads and the README table
+    does not list, not on a table row without a matching read. Documenting something the code
+    stopped reading is a much smaller problem than the reverse, and a two-way check would
+    fight legitimate prose."""
+    from pathlib import Path
+    root = Path(_REPO_ROOT)
+    missing = sorted(_env_vars_in_code(root)
+                     - _env_vars_in_readme_table((root / "README.md").read_text()))
+    assert not missing, (
+        f"env variables read by the code but absent from README's Configuration TABLE: "
+        f"{missing}. An operator has no way to discover these; add a row rather than "
+        f"deleting this assertion."
+    )
+
+
+def test_the_documentation_tripwire_actually_bites():
+    """A tripwire with no self-test is a shape that looks like a check. Both of this one's
+    original blind spots -- whole-file grep, and a root-only glob -- passed while the gap they
+    exist to close was open, so the check itself needs checking (#99 review)."""
+    from pathlib import Path
+    root = Path(_REPO_ROOT)
+    readme = (root / "README.md").read_text()
+
+    # A var present in prose but NOT as a table row must not count as documented.
+    prose_only = readme.replace("| `YOKO_CRAWL_API_KEY`", "| `YOKO_SOMETHING_ELSE`")
+    assert "YOKO_CRAWL_API_KEY" in prose_only, "fixture assumption: it appears in prose too"
+    assert "YOKO_CRAWL_API_KEY" not in _env_vars_in_readme_table(prose_only), (
+        "prose mentions must not satisfy the table check -- that was the silent pass"
+    )
+
+    # And the code scan must reach beyond the top level.
+    assert _env_vars_in_code(root), "the code scan found nothing at all"
