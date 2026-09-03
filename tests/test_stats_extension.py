@@ -397,7 +397,7 @@ class TestRestrictionsBlock:
                 "effective": None, "requested": None, "disposition": "unknown"},
         }
         assert data["restrictions"]["robots_readability"] == {
-            "outcome": "parsed", "final_status": 200, "cf_wall": False,
+            "outcome": "parsed", "final_status": 200, "edge_wall": None,
             "rules_from_state": False}
         # Never parsed -> None, NOT False: "we could not read the rules" must stay
         # distinct from "the rules allow us".
@@ -474,12 +474,12 @@ class TestRobotsReadabilityReporting:
              "seeding/start_urls_emitted": 1,
              "robots_readability_outcome": "unreadable",
              "robots_readability_status": 403,
-             "robots_readability_cf_wall": True,
+             "robots_readability_edge_wall": "cloudflare",
              "robots_readability_rules_from_state": False},
             reason="finished",
         )
         assert data["restrictions"]["robots_readability"] == {
-            "outcome": "unreadable", "final_status": 403, "cf_wall": True,
+            "outcome": "unreadable", "final_status": 403, "edge_wall": "cloudflare",
             "rules_from_state": False}
 
     def test_a_parsed_crawl_reaches_the_status_file_intact(self, tmp_path):

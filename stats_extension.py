@@ -290,8 +290,11 @@ class ProgressWriter:
             "outcome": outcome,
             # None on a transport failure -- there was no response to have a status.
             "final_status": None if status is None else int(status),
-            # Cloudflare-specific by construction; see `_record_robots_readability`.
-            "cf_wall": bool(self.stats.get_value("robots_readability_cf_wall", False)),
+            # WHICH edge vendor refused us ("cloudflare"/"sucuri"/"imperva"/"akamai"/"aws"/
+            # "fastly"), or None for an origin refusal (#100). #97 shipped this as a
+            # Cloudflare-only boolean, which filed every other vendor's wall as an origin
+            # refusal -- in the exact field #97's own posture question turns on.
+            "edge_wall": self.stats.get_value("robots_readability_edge_wall", None) or None,
             # We hold rules from an earlier session even though THIS fetch was refused.
             "rules_from_state": bool(
                 self.stats.get_value("robots_readability_rules_from_state", False)),

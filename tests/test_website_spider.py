@@ -3496,17 +3496,89 @@ class TestRobotsReadability:
             s = self._drive(self._robots_response(status=status, body=b"busy"))
             assert s.crawler.stats.values["robots_readability_outcome"] == "unreadable", status
 
-    def test_a_cloudflare_wall_is_separated_from_an_origin_refusal(self):
-        """The distinction #97's posture call turns on: "a WAF would not let us ask" is not
-        "the site said no". Reuses the spider's existing `_is_waf_challenge`."""
+    def test_an_edge_wall_is_separated_from_an_origin_refusal(self):
+        """The distinction #97's posture call turns on: "an edge would not let us ask" is not
+        "the site said no". #97 could only recognise Cloudflare, so every other vendor's wall
+        was filed as an origin refusal -- biasing the field in the same direction as the two
+        under-counts review found there (#100)."""
         wall = self._drive(self._robots_response(
             status=403, body=b"blocked", headers={"cf-mitigated": "challenge"}))
-        assert wall.crawler.stats.values["robots_readability_cf_wall"] is True
-        assert wall.crawler.stats.values.get("seeding/robots_unreadable_cf") == 1
+        assert wall.crawler.stats.values["robots_readability_edge_wall"] == "cloudflare"
+        assert wall.crawler.stats.values.get("seeding/robots_unreadable_cloudflare") == 1
 
         origin = self._drive(self._robots_response(status=403, body=b"Forbidden"))
-        assert origin.crawler.stats.values["robots_readability_cf_wall"] is False
-        assert origin.crawler.stats.values.get("seeding/robots_unreadable_not_cf") == 1
+        assert origin.crawler.stats.values["robots_readability_edge_wall"] is None
+        assert origin.crawler.stats.values.get("seeding/robots_unreadable_origin") == 1
+
+    def test_every_supported_vendor_is_recognised(self):
+        """The whole point of #100: these all read as ORIGIN refusals before it."""
+        cases = {
+            "sucuri": {"x-sucuri-id": "17023", "Server": "Sucuri/Cloudproxy"},
+            "imperva": {"x-iinfo": "9-12345-12346 NNNN CT(1 1 0)"},
+            "akamai": {"Server": "AkamaiGHost"},
+            "aws": {"x-amzn-errortype": "AccessDeniedException"},
+            "fastly": {"fastly-restarts": "1", "Server": "Fastly"},
+        }
+        for vendor, headers in cases.items():
+            s = self._drive(self._robots_response(
+                status=403, body=b"blocked", headers=headers))
+            assert s.crawler.stats.values["robots_readability_edge_wall"] == vendor, headers
+            assert s.crawler.stats.values.get(
+                f"seeding/robots_unreadable_{vendor}") == 1, vendor
+
+    def test_a_proxied_origin_403_is_not_claimed_as_a_vendor_wall(self):
+        """The conservative direction, and the reason `_has_origin_fingerprint` exists: a
+        fronting header rides on EVERY response the vendor proxies, including an ordinary
+        member-restricted 403. Claiming those as walls would tell an operator a site blocked
+        us when it merely answered."""
+        for headers in (
+            {"x-iinfo": "9-1-2", "x-powered-by": "PHP/8.2"},
+            {"Server": "AkamaiGHost", "x-drupal-cache": "HIT"},
+            {"x-sucuri-id": "17023", "Set-Cookie": "PHPSESSID=abc; path=/"},
+        ):
+            s = self._drive(self._robots_response(
+                status=403, body=b"members only", headers=headers))
+            assert s.crawler.stats.values["robots_readability_edge_wall"] is None, headers
+
+    def test_a_vendors_own_cookie_does_not_read_as_the_origin(self):
+        """`_has_origin_fingerprint` treats any non-edge Set-Cookie as the origin's, so a
+        vendor missing from the edge-cookie set has its OWN cookie suppress its wall verdict
+        -- silently, and in the under-detecting direction (#100)."""
+        s = self._drive(self._robots_response(
+            status=403, body=b"blocked",
+            headers={"x-iinfo": "9-1-2", "Set-Cookie": "visid_incap_123=xyz; path=/"}))
+        assert s.crawler.stats.values["robots_readability_edge_wall"] == "imperva"
+
+    def test_a_generated_signal_beats_an_origin_fingerprint(self):
+        """A header the edge stamps only on responses IT produced is decisive -- an origin
+        header alongside it is the proxied upstream's, not evidence the origin wrote THIS."""
+        s = self._drive(self._robots_response(
+            status=403, body=b"blocked",
+            headers={"cf-mitigated": "challenge", "x-powered-by": "PHP/8.2"}))
+        assert s.crawler.stats.values["robots_readability_edge_wall"] == "cloudflare"
+
+    def test_a_non_challenge_status_is_never_a_wall(self):
+        for status in (200, 404, 500):
+            s = self._drive(self._robots_response(
+                status=status, body=b"x", headers={"cf-mitigated": "challenge"}))
+            assert s.crawler.stats.values.get("robots_readability_edge_wall") is None, status
+
+    def test_the_retry_trigger_is_deliberately_untouched(self):
+        """`_is_waf_challenge` drives `waf_challenge_count`, which yoko-corpus uses to fire an
+        impersonation/proxy retry. Widening it would change client crawl BEHAVIOUR, not just a
+        measurement, so #100 leaves it Cloudflare-only on purpose. This pins that split so a
+        later edit cannot merge them without noticing."""
+        import types
+        s = WebsiteSpider(domain="example.com")
+        s.crawler = types.SimpleNamespace(stats=_FakeStats())
+        sucuri = Response(
+            url="https://example.com/x", status=403, body=b"blocked",
+            headers={"x-sucuri-id": "17023", "Server": "Sucuri/Cloudproxy"},
+            request=Request("https://example.com/x"))
+        assert s._edge_wall_vendor(sucuri) == "sucuri"
+        assert s._is_waf_challenge(sucuri) is False, (
+            "widening the retry trigger is a separate, behaviour-changing decision"
+        )
 
     def test_a_200_we_could_not_parse_is_unreadable_not_parsed(self):
         """`parsed` must mean rules we HOLD, not merely a 200. A binary body reaches the

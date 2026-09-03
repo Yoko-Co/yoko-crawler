@@ -1430,34 +1430,39 @@ class WebsiteSpider(scrapy.Spider):
         a measurement; it must never be the thing that breaks the crawl it measures."""
         try:
             if response is None:                  # transport failure -- robots_failed
-                outcome, status, cf_wall = "unreadable", None, False
+                outcome, status, edge_wall = "unreadable", None, None
             elif parsed_now:                      # Protego parsed THIS session's body
-                outcome, status, cf_wall = "parsed", int(response.status), False
+                outcome, status, edge_wall = "parsed", int(response.status), None
             elif int(response.status) in self.ROBOTS_ABSENT_STATUSES:
-                outcome, status, cf_wall = "absent", int(response.status), False
+                outcome, status, edge_wall = "absent", int(response.status), None
             else:
                 # Non-200, an undecodable 200, or a body Protego refused.
                 #
-                # `cf_wall` is CLOUDFLARE-SPECIFIC and named for it deliberately (#97
-                # review). `_is_waf_challenge` keys on cf-mitigated / cf-ray + Server, so
-                # Sucuri, Akamai, AWS WAF and Imperva walls all land in the not-CF bucket.
-                # Calling the field `waf_wall` would have overclaimed exactly the split the
-                # posture call turns on -- read `cf_wall: true` as a FLOOR on edge refusals,
-                # never as the whole of them. Vendor-agnostic detection is issue #100.
+                # WHICH edge refused us, or None for an origin refusal (#100). #97 shipped
+                # this as a Cloudflare-only boolean and said so honestly -- a FLOOR on edge
+                # refusals rather than the whole of them -- because `_is_waf_challenge` keys
+                # on cf-mitigated / cf-ray + Server and files every Sucuri, Akamai, Imperva
+                # and AWS wall as an ORIGIN refusal. That is the exact split #97's posture
+                # question turns on, biased in the same direction as the two under-counts
+                # review already found there.
+                #
+                # `_is_waf_challenge` itself is untouched: it drives `waf_challenge_count`,
+                # which yoko-corpus uses to trigger an impersonation/proxy retry, so widening
+                # it changes client crawl BEHAVIOUR rather than a measurement. Filed separately.
                 outcome, status = "unreadable", int(response.status)
-                cf_wall = self._is_waf_challenge(response)
+                edge_wall = self._edge_wall_vendor(response)
             rules_from_state = self._robots is not None and not parsed_now
 
             self._stat(f"seeding/robots_{outcome}")
             if outcome == "unreadable":
-                self._stat("seeding/robots_unreadable_cf" if cf_wall
-                           else "seeding/robots_unreadable_not_cf")
+                self._stat(f"seeding/robots_unreadable_{edge_wall}" if edge_wall
+                           else "seeding/robots_unreadable_origin")
                 self.logger.warning(
                     "robots.txt was NOT READ (HTTP %s%s) -- proceeding allow-all%s. This is "
                     "not the same as a site with no robots.txt: rules may exist and we could "
                     "not see them. (issue #97)",
                     status if status is not None else "-",
-                    ", Cloudflare wall" if cf_wall else "",
+                    f", {edge_wall} wall" if edge_wall else "",
                     " for anything not covered by rules carried over from an earlier session"
                     if rules_from_state else
                     "; Crawl-delay and Disallow are unknown for this crawl",
@@ -1467,7 +1472,7 @@ class WebsiteSpider(scrapy.Spider):
             if stats is not None:
                 stats.set_value("robots_readability_outcome", outcome)
                 stats.set_value("robots_readability_status", status)
-                stats.set_value("robots_readability_cf_wall", cf_wall)
+                stats.set_value("robots_readability_edge_wall", edge_wall)
                 stats.set_value("robots_readability_rules_from_state", rules_from_state)
         except Exception:
             self.logger.debug("recording robots.txt readability failed", exc_info=True)
@@ -1872,23 +1877,108 @@ class WebsiteSpider(scrapy.Spider):
     )
     # Set-Cookie names an origin stack sets (session/affinity), as opposed to Cloudflare's
     # own `cf_*` / `__cf_*` cookies. A non-CF Set-Cookie on a 403 is an origin fingerprint.
-    _CF_COOKIE_PREFIXES = ("cf_", "__cf")
+    _CF_COOKIE_PREFIXES = ("cf_", "__cf")   # kept: `_is_waf_challenge` is Cloudflare-only
 
-    def _has_origin_fingerprint(self, response) -> bool:
+    def _has_origin_fingerprint(self, response, cookie_prefixes=None) -> bool:
         """True when a response carries a header only the origin application sets -- proof
         it was generated by the origin and merely proxied through Cloudflare, not by CF
         itself. Used to keep a proxied origin 403 (member-restricted content) from being
         miscounted as a bot-wall challenge on Cloudflare-fronted sites (where every response
-        also carries `cf-ray`/`server: cloudflare`)."""
+        also carries `cf-ray`/`server: cloudflare`).
+
+        `cookie_prefixes` widens the set of cookies treated as the EDGE's rather than the
+        origin's (issue #100). It defaults to Cloudflare's, so `_is_waf_challenge` behaves
+        exactly as before; `_edge_wall_vendor` passes the multi-vendor set, because an
+        Incapsula or Akamai cookie read as "the origin wrote this" would suppress that
+        vendor's wall verdict."""
         headers = response.headers
         if any(headers.get(h) for h in self._ORIGIN_HEADER_FINGERPRINTS):
             return True
         # A Set-Cookie whose name isn't one of Cloudflare's own cookies is the origin's.
         for raw in headers.getlist("Set-Cookie"):
             name = raw.decode("latin-1").split("=", 1)[0].strip().lower()
-            if name and not name.startswith(self._CF_COOKIE_PREFIXES):
+            if name and not name.startswith(cookie_prefixes or self._CF_COOKIE_PREFIXES):
                 return True
         return False
+
+    # Edge/WAF vendors, and how to recognise a wall THEY generated (issue #100).
+    #
+    # Two tiers, because the two carry very different evidence:
+    #
+    #   GENERATED  -- a header the edge stamps ONLY on a response it produced itself. High
+    #                 precision, needs no further corroboration.
+    #   FRONTING   -- a header present on EVERY response the vendor proxies, including a
+    #                 perfectly ordinary origin 403. On its own it proves only "this site sits
+    #                 behind X", so it counts as a wall only when nothing indicates the origin
+    #                 wrote the body. That is exactly the guard `_is_waf_challenge` already
+    #                 applies to Cloudflare, generalised rather than reinvented.
+    #
+    # Deliberately NOT included: a bare `x-amzn-requestid` (ordinary on healthy API Gateway
+    # responses), and `x-cache`/`x-served-by`/`via` (present on any CDN-cached response,
+    # vendor-neutral, and a challenge status alone is not evidence the CDN authored the body).
+    # Both would trade this bucket's precision for coverage in the direction that misleads.
+    _EDGE_GENERATED_SIGNALS = (
+        ("cloudflare", ("cf-mitigated",)),
+        ("aws", ("x-amzn-errortype", "x-amzn-waf-action")),
+        ("imperva", ("x-cdn-forward-err",)),
+    )
+    _EDGE_FRONTING_SIGNALS = (
+        ("cloudflare", ("cf-ray",), ("cloudflare",)),
+        ("sucuri", ("x-sucuri-id", "x-sucuri-cache", "x-sucuri-block"), ("sucuri",)),
+        ("imperva", ("x-iinfo", "x-cdn"), ("imperva", "incapsula")),
+        ("akamai", ("x-akamai-transformed", "akamai-grn"), ("akamaighost", "akamai")),
+        ("aws", (), ("awselb", "cloudfront")),
+        ("fastly", ("fastly-restarts",), ("fastly",)),
+    )
+    # Cookie prefixes belonging to an EDGE rather than the origin. `_has_origin_fingerprint`
+    # treats any non-edge Set-Cookie as the origin's, so a vendor missing from this tuple has
+    # its own cookie read as origin evidence -- which SUPPRESSES the wall verdict. The failure
+    # direction is therefore under-detection, which is the safe one for a field that says "the
+    # site refused us" (#100).
+    _EDGE_COOKIE_PREFIXES = (
+        "cf_", "__cf",                      # Cloudflare
+        "visid_incap", "incap_ses", "nlbi_",  # Imperva/Incapsula
+        "sucuri-", "sucuri_",               # Sucuri
+        "ak_bmsc", "bm_sv", "bm_sz", "_abck",  # Akamai Bot Manager
+        "awsalb", "awsalbcors",             # AWS ALB
+    )
+
+    def _edge_wall_vendor(self, response):
+        """Which edge vendor refused us, or None when this is not an edge wall (issue #100).
+
+        `_is_waf_challenge` answers a narrower question -- "is this a CLOUDFLARE wall" -- and
+        drives `waf_challenge_count`, which yoko-corpus uses to decide whether to retry a
+        crawl through impersonation or a proxy. That is deliberately left alone here: widening
+        it would make more client crawls trigger a retry, which is a behaviour change and a
+        separate decision from fixing a measurement.
+
+        This exists because #97's robots readability field asked a question the Cloudflare-only
+        check cannot answer. The split that field reports -- "an edge would not let us ask" vs
+        "the origin said no" -- is the one #97's posture question turns on, and filing every
+        Sucuri, Akamai, Imperva and AWS wall as an ORIGIN refusal biases it in the same
+        direction as the two under-counts review already found there.
+
+        Conservative in the same direction as its sibling: when in doubt, NOT a wall. A missed
+        wall understates edge refusals; a false one would tell an operator a site blocked us
+        when it merely answered."""
+        try:
+            if int(response.status) not in self.WAF_CHALLENGE_STATUSES:
+                return None
+            headers = response.headers
+            for vendor, generated in self._EDGE_GENERATED_SIGNALS:
+                if any(headers.get(h) for h in generated):
+                    return vendor
+            server = (headers.get("Server") or b"").decode("latin-1").lower()
+            for vendor, header_names, server_marks in self._EDGE_FRONTING_SIGNALS:
+                present = any(headers.get(h) for h in header_names) or any(
+                    mark in server for mark in server_marks)
+                if present and not self._has_origin_fingerprint(
+                        response, self._EDGE_COOKIE_PREFIXES):
+                    return vendor
+            return None
+        except Exception:
+            self.logger.debug("edge-wall vendor detection failed", exc_info=True)
+            return None
 
     def _is_waf_challenge(self, response) -> bool:
         """True when a response is a Cloudflare-generated bot-wall challenge or block page,
