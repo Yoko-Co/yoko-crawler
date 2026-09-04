@@ -14,6 +14,7 @@ import sys
 import traceback
 import time
 
+from scrapy import signals as scrapy_signals
 from scrapy.crawler import CrawlerProcess
 
 from urllib.parse import urlparse
@@ -128,6 +129,80 @@ def reset_incompatible_jobdir(jobdir, *, disk_queue: str) -> bool:
     )
     shutil.rmtree(jobdir, ignore_errors=True)
     return True
+
+
+# Written into a JOBDIR whose frontier already stopped a spider from OPENING once. Its only
+# job is to make the next attempt discard that frontier instead of re-reading it forever.
+_JOBDIR_STALL_MARKER = ".spider_never_opened"
+
+
+def strike_jobdir(jobdir) -> str:
+    """Record that this frontier was in play when the spider failed to OPEN; discard it on the
+    SECOND consecutive strike. Returns "none", "marked" or "discarded" (#103 review).
+
+    `job_manager` keeps the JOBDIR when a run ends `spider_init_error`, on the reasoning that a
+    spider which never constructed cannot have touched the frontier. That reasoning is not
+    sound by itself: `Scheduler.open()` runs INSIDE `ExecutionEngine.open_spider_async`, whose
+    only `except` is for `CloseSpider`, and `Crawler.crawl` re-raises -- so a frontier Scrapy
+    cannot READ errbacks the crawl Deferred and is reported as `spider_init_error`, the very
+    token that preserves it. Measured against Scrapy 2.18 with two shapes that reach the
+    scheduler unscreened: a truncated `active.json` (JSONDecodeError out of `_read_dqs_state`)
+    and an `active.json` written by a different SCHEDULER_PRIORITY_QUEUE (ValueError).
+    `reset_incompatible_jobdir` misses both because it compares the DISK queue's slot layout and
+    skips `active.json` -- it DOES catch a slot-layout mismatch, which an earlier draft of this
+    docstring wrongly claimed it did not.
+
+    Rather than enumerate every way a frontier can be unreadable, refuse to trust one twice.
+    Striking on the FAILURE path rather than discarding on the next run's pre-flight is what
+    makes `clear_jobdir_stall_marker` load-bearing: a first strike leaves the frontier intact,
+    so an init failure with an INNOCENT jobdir (a bad proxy setting, a rejected impersonation
+    profile) costs nothing once the next run opens and clears the mark. Only a second
+    consecutive failure to open -- the shape a bad frontier actually produces -- discards it.
+    Both strikes fail before any page is fetched, so the bounded cost is two fast failures and
+    one crawl from the seed, the same trade `reset_incompatible_jobdir` already makes.
+
+    An earlier draft ran this as a pre-flight in `build_settings`, which deleted the frontier
+    before `spider_opened` could clear the mark: the innocent case still lost its frontier, one
+    session later, and every test of the clear path passed because none of them ran the
+    pre-flight first."""
+    if not jobdir:
+        return "none"
+    marker = os.path.join(jobdir, _JOBDIR_STALL_MARKER)
+    if os.path.exists(marker):
+        print(
+            f"JOBDIR {jobdir} was in play for a SECOND consecutive run that failed before the "
+            "spider opened; discarding it so the next attempt starts this domain from the seed "
+            "rather than re-reading a frontier that is probably the cause (issue #103).",
+            file=sys.stderr,
+        )
+        shutil.rmtree(jobdir, ignore_errors=True)
+        return "discarded"
+    try:
+        with open(marker, "w") as f:
+            f.write(str(time.time()))
+    except OSError as exc:
+        # Without a recorded strike the next run cannot know to stop trusting this frontier,
+        # so the retry loop would be unbounded. Fail SAFE: drop it now. A re-crawl from the
+        # seed is recoverable; a domain that fails identically forever is not.
+        print(
+            f"Could not mark JOBDIR {jobdir} ({exc}); discarding it rather than leave a "
+            "frontier that may fail every future run with nothing recording it (issue #103).",
+            file=sys.stderr,
+        )
+        shutil.rmtree(jobdir, ignore_errors=True)
+        return "discarded"
+    return "marked"
+
+
+def clear_jobdir_stall_marker(jobdir) -> None:
+    """Drop the strike once a spider actually OPENS against this frontier -- that is the proof
+    it is readable, so the failure it recorded was not the JOBDIR's fault."""
+    if not jobdir:
+        return
+    try:
+        os.remove(os.path.join(jobdir, _JOBDIR_STALL_MARKER))
+    except OSError:
+        pass
 
 
 # Accepted forward-proxy URL schemes -- must match main.py's CrawlRequest validator so a value
@@ -474,6 +549,11 @@ def main():
             f"Spider failed to start: {error}",
             failure_reason="spider_init_error",
         )
+        # job_manager KEEPS the JOBDIR on this token, so record the one fact that makes that
+        # safe: this frontier was in play when the spider failed to open. A first strike leaves
+        # it intact (the failure may have nothing to do with it); a second discards it, which is
+        # what stops a frontier Scrapy cannot read from failing every future run (#103 review).
+        strike_jobdir(getattr(args, "jobdir", None))
         sys.exit(1)
 
     # Everything from settings construction to `crawl()` can raise SYNCHRONOUSLY, before any
@@ -530,6 +610,25 @@ def main():
         return None      # handled -- do not re-raise into the reactor
 
     deferred.addErrback(_spider_never_started)
+
+    # Opening is the proof the frontier is readable, so an earlier marker was recording an
+    # innocent JOBDIR (a bad proxy setting, a rejected impersonation profile) and must not
+    # cost this domain its frontier. Connected per-crawler because `spider_opened` is the
+    # earliest point at which `Scheduler.open()` is known to have succeeded.
+    #
+    # `weak=False` is load-bearing: pydispatch holds receivers WEAKLY by default, so a
+    # closure with no other reference is collected before the signal ever fires and the
+    # marker is silently never cleared -- costing an innocent frontier on the next run.
+    # Caught by `test_a_spider_that_opens_clears_the_marker_end_to_end`, which failed
+    # against exactly this code with a bare lambda.
+    def _clear_marker_on_open(*_a, **_kw):
+        clear_jobdir_stall_marker(getattr(args, "jobdir", None))
+
+    for _crawler in process.crawlers:
+        _crawler.signals.connect(
+            _clear_marker_on_open, signal=scrapy_signals.spider_opened, weak=False
+        )
+
     process.start()
 
     if startup_failure:

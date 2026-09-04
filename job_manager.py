@@ -430,7 +430,38 @@ class JobManager:
             #    far already persist in the corpus, so no fetched work is lost.
             if job.resumable and job.jobdir is not None:
                 close_reason = status_data.get("close_reason") if status_data else None
-                if close_reason == "finished" or close_reason is None:
+                # A spider that never opened usually never touched the frontier, so deleting
+                # it discards a good multi-session crawl over a failure that never came near
+                # it (#103). Keep it -- but note what this token does NOT prove.
+                #
+                # An earlier draft of this claimed a corrupt frontier could not raise
+                # `spider_init_error`. That was WRONG, and measured wrong against Scrapy 2.18:
+                # `Scheduler.open()` runs inside `ExecutionEngine.open_spider_async`, whose only
+                # `except` is for `CloseSpider`, and `Crawler.crawl` re-raises -- so a frontier
+                # Scrapy cannot read errbacks the crawl Deferred and arrives here as exactly
+                # this token. Keeping it on that alone would re-read the same bad frontier every
+                # session and permanently brick the domain, which is the hazard
+                # `reset_incompatible_jobdir`'s docstring describes.
+                #
+                # What makes the keep safe is on the run_spider side: `strike_jobdir` records a
+                # strike against any frontier in play when the spider failed to open, and
+                # DISCARDS it on the second consecutive strike. The first strike leaves the
+                # frontier intact -- which is the whole point of #103, since the failure usually
+                # has nothing to do with it -- and a spider that opens clears the strike. So the
+                # retry loop is bounded at two fast pre-open failures, both of which fetch
+                # nothing.
+                #
+                # Still deliberately NOT generalised to "failed": that would keep frontiers
+                # after failures the marker never sees, reopening the same hazard by a wider
+                # door.
+                never_opened = (status_data or {}).get("failure_reason") == "spider_init_error"
+                if never_opened:
+                    logger.info(
+                        "Keeping JOBDIR for %s: the spider never opened, so this run cannot "
+                        "judge the frontier. run_spider has struck it and will discard it "
+                        "before the next attempt reads it if it fails to open again.", job_id,
+                    )
+                elif close_reason == "finished" or close_reason is None:
                     shutil.rmtree(job.jobdir, ignore_errors=True)
 
             now = time.time()

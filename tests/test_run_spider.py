@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+import run_spider
 from run_spider import build_settings
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -261,36 +262,60 @@ class TestSpiderStartupFailure:
     running the real `run_spider.py`: before the fix, exit 0 and no status file written; after,
     exit 1 and a `failed` status carrying `failure_reason: spider_init_error`."""
 
-    def _run_main(self, tmp_path, spider_exc, status_file=None):
+    def _run_main(self, tmp_path, spider_exc, status_file=None, jobdir=None):
         """Drive the real `main()` with a CrawlerProcess whose spider blows up on construct."""
         status_file = status_file or (tmp_path / "status.json")
         argv = ["run_spider.py", "--domain", "example.com",
                 "--status-file", str(status_file), "--output", str(tmp_path / "o.jsonl")]
+        if jobdir is not None:
+            argv += ["--jobdir", str(jobdir)]
 
         real_process = None
+
+        class _Crawler:
+            """Carries a REAL SignalManager so the spider_opened connect main() performs is
+            the one under test -- including whether its receiver survives garbage collection."""
+
+            def __init__(self):
+                from scrapy.signalmanager import SignalManager
+                # `SignalManager(self)` mirrors the real Crawler (scrapy/crawler.py). The bare
+                # `SignalManager()` defaults to `dispatcher.Anonymous`, a PROCESS-GLOBAL
+                # bucket: `getReceivers` then returns receivers connected by unrelated tests,
+                # and the weak=False assertion below passes on someone else's registration
+                # depending on collection order.
+                self.signals = SignalManager(self)
 
         class _Process:
             def __init__(self, settings=None):
                 nonlocal real_process
                 real_process = self
                 self._deferred = None
+                # Real CrawlerProcess exposes the crawlers it is running; run_spider connects
+                # spider_opened on each to clear the JOBDIR stall marker.
+                # `test_crawler_process_really_exposes_crawlers` pins the real attribute.
+                self.crawlers = []
 
             def crawl(self, *a, **kw):
                 from twisted.internet.defer import Deferred, fail
                 from twisted.python.failure import Failure
+                # Populated HERE, not in __init__, because CrawlerRunner._crawl adds the
+                # crawler when crawl() is called. main() must connect spider_opened after
+                # process.crawl(); a fake that is pre-populated would hide that ordering.
+                self.crawlers.append(_Crawler())
                 return fail(Failure(spider_exc)) if spider_exc else Deferred()
 
             def start(self):
                 pass
 
-        import run_spider
         with patch.object(run_spider, "CrawlerProcess", _Process), \
                 patch.object(run_spider, "check_resolution_sync", lambda d: None), \
                 patch.object(sys, "argv", argv):
             try:
                 run_spider.main()
             except SystemExit as exc:
+                self._last_process = real_process
                 return exc.code, status_file
+        self._last_process = real_process
         return 0, status_file
 
     def test_a_spider_that_cannot_construct_exits_nonzero(self, tmp_path):
@@ -331,6 +356,92 @@ class TestSpiderStartupFailure:
             "the spider's own report of what it actually did outranks a late handler's guess"
         )
         assert "failure_reason" not in data
+
+    def test_mains_spider_opened_receiver_is_registered_STRONGLY(self, tmp_path):
+        """pydispatch stores receivers WEAKLY by default, so `signals.connect(fn)` on a
+        function with no other reference is collected before `spider_opened` ever fires: the
+        stall marker is silently never cleared, and the next run discards an innocent frontier.
+        A first draft of this change had exactly that bug.
+
+        Asserting on the REGISTRY rather than on garbage collection is deliberate. The obvious
+        test -- call main(), gc.collect(), fire the signal -- passes either way, because pytest
+        keeps main()'s frame alive and with it the closure. It looked like a real test and
+        proved nothing; this one fails the moment `weak=False` is dropped."""
+        import weakref
+        from pydispatch import dispatcher
+        from scrapy import signals as scrapy_signals
+
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        self._run_main(tmp_path, None, jobdir=jobdir)
+        crawler = self._last_process.crawlers[0]
+
+        receivers = list(dispatcher.getReceivers(
+            crawler.signals.sender, scrapy_signals.spider_opened
+        ))
+        # Name the receiver rather than trusting the bucket to be ours: a shared sender would
+        # otherwise let an unrelated test's strong registration satisfy this assertion.
+        ours = [r for r in receivers
+                if getattr(r, "__name__", None) == "_clear_marker_on_open"]
+        assert ours, (
+            "main() did not connect its own _clear_marker_on_open to spider_opened "
+            f"(receivers seen: {receivers!r})"
+        )
+        assert not any(isinstance(r, weakref.ref) for r in ours), (
+            "main() connected its spider_opened receiver WEAKLY. Nothing else holds that "
+            "closure, so it dies before the signal fires and the JOBDIR stall marker is never "
+            "cleared -- a spider that opened fine still costs its domain the frontier. "
+            "Pass weak=False."
+        )
+
+    def test_failing_to_start_MARKS_the_jobdir_that_was_in_play(self, tmp_path):
+        """The middle of the chain. `strike_jobdir` being correct proves nothing
+        unless the failure path actually calls it -- without this, job_manager keeps the
+        JOBDIR and nothing ever records that it was implicated."""
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        (jobdir / "requests.seen").write_text("frontier")
+
+        code, _ = self._run_main(tmp_path, ValueError("construction exploded"), jobdir=jobdir)
+
+        assert code == 1
+        assert (jobdir / "requests.seen").exists(), (
+            "a FIRST failure to open discarded the frontier -- that is the multi-session crawl "
+            "#103 exists to preserve"
+        )
+        assert run_spider.strike_jobdir(str(jobdir)) == "discarded", (
+            "the run left no strike on the frontier it was holding, so the next attempt trusts "
+            "it again -- and if that frontier is why the spider could not open, every attempt "
+            "fails identically forever"
+        )
+
+    def test_a_weak_connect_really_does_drop_the_receiver(self):
+        """Why `weak=False` above is load-bearing, pinned against pydispatch itself rather
+        than asserted in a comment. If this ever fails, the default became safe and the
+        registry assertion above can be relaxed."""
+        import gc
+        from scrapy import signals as scrapy_signals
+        from scrapy.signalmanager import SignalManager
+
+        def _build(weak):
+            fired = []
+
+            def _receiver(*_a, **_kw):
+                fired.append(1)
+
+            mgr = SignalManager()
+            kwargs = {} if weak else {"weak": False}
+            mgr.connect(_receiver, signal=scrapy_signals.spider_opened, **kwargs)
+            return mgr, fired
+
+        weak_mgr, weak_fired = _build(weak=True)
+        strong_mgr, strong_fired = _build(weak=False)
+        gc.collect()
+        weak_mgr.send_catch_log(signal=scrapy_signals.spider_opened)
+        strong_mgr.send_catch_log(signal=scrapy_signals.spider_opened)
+
+        assert not weak_fired, "a weakly-connected local function unexpectedly survived"
+        assert strong_fired, "weak=False failed to keep the receiver alive"
 
     def test_a_healthy_start_neither_exits_nor_writes_a_failure(self, tmp_path):
         """The guard must not fire on the ordinary path."""
@@ -496,3 +607,109 @@ def test_the_documentation_tripwire_actually_bites():
 
     # And the code scan must reach beyond the top level.
     assert _env_vars_in_code(root), "the code scan found nothing at all"
+
+
+class TestUnopenableJobdirSelfHeals:
+    """#103 review. `job_manager` keeps the JOBDIR on `spider_init_error`. A frontier Scrapy
+    cannot READ produces that same token -- `Scheduler.open()` runs inside `open_spider_async`,
+    whose only `except` is `CloseSpider`, and `Crawler.crawl` re-raises -- so without a bound
+    the keep would re-read the bad frontier every session forever."""
+
+    def test_the_first_strike_LEAVES_the_frontier_intact(self, tmp_path):
+        """The whole point of #103: a spider that never opened usually never touched the
+        frontier, so one failure must not cost a multi-session crawl."""
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        (jobdir / "requests.seen").write_text("frontier")
+
+        assert run_spider.strike_jobdir(str(jobdir)) == "marked"
+        assert (jobdir / "requests.seen").exists()
+
+    def test_the_second_consecutive_strike_DISCARDS_it(self, tmp_path):
+        """Two failures to open against the same frontier is the shape a bad frontier makes.
+        Without this the keep re-reads it forever and the domain is bricked."""
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        (jobdir / "requests.seen").write_text("frontier")
+
+        run_spider.strike_jobdir(str(jobdir))
+        assert run_spider.strike_jobdir(str(jobdir)) == "discarded"
+        assert not jobdir.exists()
+
+    def test_opening_the_spider_RESETS_the_count(self, tmp_path):
+        """An init failure with an INNOCENT jobdir (bad proxy, rejected impersonation profile)
+        must not put the domain one strike from losing its frontier forever."""
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        (jobdir / "requests.seen").write_text("frontier")
+
+        run_spider.strike_jobdir(str(jobdir))
+        run_spider.clear_jobdir_stall_marker(str(jobdir))
+
+        assert run_spider.strike_jobdir(str(jobdir)) == "marked", (
+            "a strike survived a successful open, so two unrelated failures a month apart "
+            "would discard a healthy frontier"
+        )
+        assert (jobdir / "requests.seen").exists()
+
+    def test_a_frontier_that_cannot_be_MARKED_is_discarded_instead(self, tmp_path):
+        """The one hole in the bounded-loop argument. If the strike cannot be recorded (full
+        or read-only disk) the next run cannot know to stop trusting this frontier, so the loop
+        would be unbounded and silent. Failing safe costs a re-crawl; the alternative costs the
+        domain permanently."""
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        (jobdir / "requests.seen").write_text("frontier")
+        jobdir.chmod(0o500)                      # readable, not writable
+        try:
+            result = run_spider.strike_jobdir(str(jobdir))
+        finally:
+            jobdir.chmod(0o700)
+
+        assert result == "discarded", (
+            "an unrecordable strike left the frontier in place, so nothing bounds the retry "
+            "loop and the domain can fail identically forever with no trace of why"
+        )
+
+    def test_striking_a_missing_or_absent_jobdir_does_not_raise(self, tmp_path):
+        """Best-effort by design: this runs on the failure path and must never turn a
+        reportable failure into a crash."""
+        assert run_spider.strike_jobdir(None) == "none"
+        assert run_spider.strike_jobdir("") == "none"
+        run_spider.strike_jobdir(str(tmp_path / "does-not-exist"))
+        run_spider.clear_jobdir_stall_marker(None)
+        run_spider.clear_jobdir_stall_marker(str(tmp_path / "does-not-exist"))
+
+    def test_the_marker_is_not_mistaken_for_a_queue_slot(self, tmp_path):
+        """`reset_incompatible_jobdir` lists `requests.queue/` and judges the format from its
+        entries. The marker lives one level up, in the JOBDIR itself, so the two cannot
+        interfere -- but pin it, because a marker written into the queue dir would make every
+        resumable crawl look format-incompatible."""
+        jobdir = tmp_path / "job"
+        (jobdir / "requests.queue").mkdir(parents=True)
+        (jobdir / "requests.queue" / "0").mkdir()
+        run_spider.strike_jobdir(str(jobdir))
+
+        assert run_spider.reset_incompatible_jobdir(
+            str(jobdir), disk_queue="scrapy.squeues.PickleFifoDiskQueue"
+        ) is False
+        assert jobdir.exists()
+
+    def test_build_settings_does_NOT_discard_a_struck_frontier(self, tmp_path):
+        """The production ordering, and the bug this replaced. An earlier draft ran the discard
+        as a pre-flight here -- which is BEFORE main() connects `spider_opened`, so a struck
+        frontier was deleted before it could ever be cleared and the innocent case still lost
+        its crawl. Every test of the clear path passed anyway, because none of them ran the
+        pre-flight first."""
+        jobdir = tmp_path / "job"
+        jobdir.mkdir()
+        (jobdir / "requests.seen").write_text("frontier")
+        run_spider.strike_jobdir(str(jobdir))
+
+        settings = build_settings(make_args(jobdir=str(jobdir)))
+
+        assert settings["JOBDIR"] == str(jobdir)
+        assert (jobdir / "requests.seen").exists(), (
+            "build_settings destroyed a struck frontier, so a spider that opens fine can "
+            "never clear the strike and #103 preserves nothing"
+        )
