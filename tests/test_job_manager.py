@@ -165,11 +165,14 @@ class TestJobManager:
         assert (job.jobdir / "requests.seen").exists()
 
     async def test_jobdir_survives_a_spider_that_never_constructed(self):
-        """#103. A spider that never CONSTRUCTED cannot have touched the frontier, so
-        deleting it discards a good multi-session crawl over a failure that never came near
-        it. Safe for this token specifically: `__init__` does not open the JOBDIR, and #100
-        measured that a scheduler-open failure does not reach the errback that produces it --
-        so a corrupt frontier cannot raise `spider_init_error`."""
+        """#103. A spider that never opened usually never touched the frontier, so deleting it
+        discards a good multi-session crawl over a failure that never came near it.
+
+        The token does NOT prove the frontier is innocent -- a frontier Scrapy cannot READ
+        errbacks the crawl Deferred and arrives as exactly this token
+        (tests/test_corrupt_jobdir_reaches_errback.py pins that). What bounds the resulting
+        retry loop is `strike_jobdir` on the run_spider side, covered by
+        TestUnopenableJobdirSelfHeals; this test covers only the keep itself."""
         jm = JobManager(max_concurrent=3)
         proc = make_fake_process(returncode=1)
         with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
