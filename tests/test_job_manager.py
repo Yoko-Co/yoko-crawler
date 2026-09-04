@@ -164,6 +164,42 @@ class TestJobManager:
         # Paused at the session cap -> keep the JOBDIR so the next session resumes.
         assert (job.jobdir / "requests.seen").exists()
 
+    async def test_jobdir_survives_a_spider_that_never_constructed(self):
+        """#103. A spider that never CONSTRUCTED cannot have touched the frontier, so
+        deleting it discards a good multi-session crawl over a failure that never came near
+        it. Safe for this token specifically: `__init__` does not open the JOBDIR, and #100
+        measured that a scheduler-open failure does not reach the errback that produces it --
+        so a corrupt frontier cannot raise `spider_init_error`."""
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process(returncode=1)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("example.com", resumable=True)
+        job.jobdir.mkdir(parents=True, exist_ok=True)
+        (job.jobdir / "requests.seen").write_text("frontier")
+        job.status_file.write_text(json.dumps(
+            {"status": "failed", "failure_reason": "spider_init_error"}))
+        await jm._monitor(job.job_id)
+        assert (job.jobdir / "requests.seen").exists(), (
+            "the frontier is untouched by a spider that never opened; the next session "
+            "should resume it rather than re-crawl from scratch"
+        )
+
+    async def test_a_different_failure_still_drops_the_frontier(self):
+        """NOT generalised to "failed". A corrupt JOBDIR is itself a cause of not-starting,
+        so refusing to delete on any failure would make every retry fail identically and
+        permanently brick the domain -- the exact hazard `reset_incompatible_jobdir` warns
+        about."""
+        jm = JobManager(max_concurrent=3)
+        proc = make_fake_process(returncode=1)
+        with patch("job_manager.asyncio.create_subprocess_exec", return_value=proc):
+            job = await jm.start_job("example.com", resumable=True)
+        job.jobdir.mkdir(parents=True, exist_ok=True)
+        (job.jobdir / "requests.seen").write_text("frontier")
+        job.status_file.write_text(json.dumps(
+            {"status": "failed", "failure_reason": "crawl_error"}))
+        await jm._monitor(job.job_id)
+        assert not job.jobdir.exists(), "a half-written frontier must still be dropped"
+
     async def test_monitor_deletes_jobdir_on_nongraceful_close(self):
         # No close_reason (killed/OOM/crash before the spider flushed) -> the frontier
         # may be half-written, so drop it rather than resume a corrupt JOBDIR.

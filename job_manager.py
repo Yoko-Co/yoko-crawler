@@ -430,7 +430,24 @@ class JobManager:
             #    far already persist in the corpus, so no fetched work is lost.
             if job.resumable and job.jobdir is not None:
                 close_reason = status_data.get("close_reason") if status_data else None
-                if close_reason == "finished" or close_reason is None:
+                # A spider that never CONSTRUCTED cannot have touched the frontier, so
+                # deleting it discards a perfectly good multi-session crawl over a failure
+                # that never came near it (#103). Keeping it is safe here and ONLY here:
+                # `__init__` does not open the JOBDIR, and #100's review measured that a
+                # scheduler-open failure does not reach the crawl Deferred's errback -- so
+                # this token cannot be raised BY a corrupt frontier.
+                #
+                # Deliberately NOT generalised to "failed". A corrupt JOBDIR IS a cause of
+                # not-starting in general, and refusing to delete on any failure would make
+                # every retry fail identically -- permanently bricking the domain, which is
+                # exactly what `reset_incompatible_jobdir`'s docstring warns about.
+                never_opened = (status_data or {}).get("failure_reason") == "spider_init_error"
+                if never_opened:
+                    logger.info(
+                        "Keeping JOBDIR for %s: the spider never started, so the frontier "
+                        "is untouched and the next session can resume it.", job_id,
+                    )
+                elif close_reason == "finished" or close_reason is None:
                     shutil.rmtree(job.jobdir, ignore_errors=True)
 
             now = time.time()
